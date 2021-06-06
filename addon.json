@@ -1,0 +1,11 @@
+{
+  "src": "<url to the .zip file created by the release script>",
+  "name": "My Process",
+  "raw_name": "score-addon-my-process",
+  "version": "1.0",
+  "kind": "addon",
+  "short": "Test process add-on",
+  "long": "This addon provides an example process",
+  "small": "https://raw.githubusercontent.com/OSSIA/score-addon-tutorial/master/Deployment/icon.png",
+  "key": "00000000-0000-0000-0000-000000000000"
+}
