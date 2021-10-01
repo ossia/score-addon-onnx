@@ -3,13 +3,13 @@
 shopt -s globstar
 
 # Check script options
-if [[ "$#" -ne 1 ]]; then
-    echo "Usage: ./init.sh MyAddonName"
+if [[ "$#" -lt 1 ]]; then
+    echo "Usage: ./init.sh MyAddonName [folder]"
     exit 1
 fi
 
 if [[ $(echo "$1" | head -c 1) == "-" ]]; then
-    echo "Usage: ./init.sh MyAddonName"
+    echo "Usage: ./init.sh MyAddonName [folder]"
     exit 1
 fi
 
@@ -46,6 +46,16 @@ ADDON_LC=$(echo $ADDON | $PERL -ne 'print lc')
 ADDON_LC_DASHES=$(echo $ADDON_LC | sed 's/_/-/g')
 
 ADDON_DIR="$PWD"
+
+if [[ "x$2" != "x" ]]; then
+  TARGET_FOLDER="$2"
+  mkdir -p "$TARGET_FOLDER"
+  cp -rf * "$TARGET_FOLDER/"
+  cd "$TARGET_FOLDER"
+else
+  TARGET_FOLDER="$PWD"
+fi
+
 mv "MyProcess" "$ADDON"
 $RENAME "s/my_process/$ADDON_LC/" **/*.{hpp,cpp,txt}
 $RENAME "s/MyProcess/$ADDON/" **/*.{hpp,cpp,txt}
