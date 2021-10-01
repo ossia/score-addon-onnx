@@ -1,4 +1,8 @@
 #include "CommandFactory.hpp"
+#include <MyProcess/Process.hpp>
+
+#include <score/model/path/PathSerialization.hpp>
+
 #include <QDebug>
 
 namespace MyProcess

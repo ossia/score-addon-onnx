@@ -1,5 +1,6 @@
 #pragma once
 #include <score/command/Command.hpp>
+#include <score/model/path/Path.hpp>
 
 namespace MyProcess
 {
@@ -28,6 +29,6 @@ protected:
   void deserializeImpl(DataStreamOutput&) override;
 
 private:
-  Path<ProcessModel> m_path;
+  Path<Model> m_path;
 };
 }

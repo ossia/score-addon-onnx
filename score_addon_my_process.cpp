@@ -4,9 +4,7 @@
 
 #include <MyProcess/CommandFactory.hpp>
 #include <MyProcess/Executor.hpp>
-#include <MyProcess/Inspector.hpp>
 #include <MyProcess/Layer.hpp>
-#include <MyProcess/LocalTree.hpp>
 #include <MyProcess/Process.hpp>
 #include <score_addon_my_process_commands_files.hpp>
 
