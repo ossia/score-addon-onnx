@@ -23,11 +23,7 @@ score_addon_my_process::factories(
       score::ApplicationContext,
       FW<Process::ProcessModelFactory, MyProcess::ProcessFactory>,
       FW<Process::LayerFactory, MyProcess::LayerFactory>,
-      FW<Process::InspectorWidgetDelegateFactory, MyProcess::InspectorFactory>,
-      FW<Execution::ProcessComponentFactory,
-         MyProcess::ProcessExecutorComponentFactory>,
-      FW<LocalTree::ProcessComponentFactory,
-         MyProcess::LocalTreeProcessComponentFactory>>(ctx, key);
+      FW<Execution::ProcessComponentFactory, MyProcess::ProcessExecutorComponentFactory>>(ctx, key);
 }
 
 std::pair<const CommandGroupKey, CommandGeneratorMap>

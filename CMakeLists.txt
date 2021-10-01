@@ -12,8 +12,6 @@ score_common_setup()
 # Creation of the library
 add_library(score_addon_my_process
     MyProcess/Executor.hpp
-    MyProcess/Inspector.hpp
-    MyProcess/LocalTree.hpp
     MyProcess/Metadata.hpp
     MyProcess/Presenter.hpp
     MyProcess/Process.hpp
@@ -24,13 +22,20 @@ add_library(score_addon_my_process
     score_addon_my_process.hpp
 
     MyProcess/Executor.cpp
-    MyProcess/Inspector.cpp
-    MyProcess/LocalTree.cpp
     MyProcess/Presenter.cpp
     MyProcess/Process.cpp
     MyProcess/View.cpp
+    MyProcess/CommandFactory.cpp
 
     score_addon_my_process.cpp
+)
+
+# Scan for commands which creates necessary files
+# Second argument must be a CMake list of all headers containing commands 
+
+score_generate_command_list_file(
+  score_addon_my_process
+  "MyProcess/CommandFactory.hpp" 
 )
 
 # Link
