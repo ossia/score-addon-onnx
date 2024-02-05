@@ -24,7 +24,7 @@ public:
   ~score_addon_my_process() override;
 
 private:
-  std::vector<std::unique_ptr<score::InterfaceBase>> factories(
+  std::vector<score::InterfaceBase*> factories(
       const score::ApplicationContext& ctx,
       const score::InterfaceKey& key) const override;
 

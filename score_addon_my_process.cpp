@@ -12,7 +12,7 @@ score_addon_my_process::score_addon_my_process() { }
 
 score_addon_my_process::~score_addon_my_process() { }
 
-std::vector<std::unique_ptr<score::InterfaceBase>>
+std::vector<score::InterfaceBase*>
 score_addon_my_process::factories(
     const score::ApplicationContext& ctx,
     const score::InterfaceKey& key) const
