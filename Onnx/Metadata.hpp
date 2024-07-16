@@ -1,17 +1,17 @@
 #pragma once
 #include <Process/ProcessMetadata.hpp>
 
-namespace MyProcess
+namespace Onnx
 {
 class Model;
 }
 
 PROCESS_METADATA(
     ,
-    MyProcess::Model,
-    "00000000-0000-0000-0000-000000000000",
-    "MyProcess",                                  // Internal name
-    "MyProcess",                                  // Pretty name
+    Onnx::Model,
+    "3b2e1535-51ad-444f-b095-a1c0cc39538c",
+    "Onnx",                                  // Internal name
+    "Onnx",                                  // Pretty name
     Process::ProcessCategory::Other,              // Category
     "Other",                                      // Category
     "Description",                                // Description

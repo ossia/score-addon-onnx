@@ -4,8 +4,8 @@
 
 #include <ossia/dataflow/port.hpp>
 
-#include <MyProcess/Process.hpp>
-namespace MyProcess
+#include <Onnx/Process.hpp>
+namespace Onnx
 {
 class node final : public ossia::nonowning_graph_node
 {
@@ -18,18 +18,18 @@ public:
   {
   }
 
-  std::string label() const noexcept override { return "my_process"; }
+  std::string label() const noexcept override { return "onnx"; }
 
 private:
 };
 
 ProcessExecutorComponent::ProcessExecutorComponent(
-    MyProcess::Model& element,
+    Onnx::Model& element,
     const Execution::Context& ctx,
     QObject* parent)
-    : ProcessComponent_T{element, ctx, "MyProcessExecutorComponent", parent}
+    : ProcessComponent_T{element, ctx, "OnnxExecutorComponent", parent}
 {
-  auto n = std::make_shared<MyProcess::node>();
+  auto n = std::make_shared<Onnx::node>();
   this->node = n;
   m_ossia_process = std::make_shared<ossia::node_process>(n);
 
@@ -39,7 +39,7 @@ ProcessExecutorComponent::ProcessExecutorComponent(
    * connect(&element.metadata(), &score::ModelMetadata::ColorChanged,
    *         this, [=] (const QColor& c) {
    *
-   *   in_exec([c,n=std::dynamic_pointer_cast<MyProcess::node>(this->node)] {
+   *   in_exec([c,n=std::dynamic_pointer_cast<Onnx::node>(this->node)] {
    *     n->set_color(c);
    *   });
    *

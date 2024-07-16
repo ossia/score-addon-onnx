@@ -2,14 +2,14 @@
 #include <Process/GenericProcessFactory.hpp>
 #include <Process/Process.hpp>
 
-#include <MyProcess/Metadata.hpp>
+#include <Onnx/Metadata.hpp>
 
-namespace MyProcess
+namespace Onnx
 {
 class Model final : public Process::ProcessModel
 {
   SCORE_SERIALIZE_FRIENDS
-  PROCESS_METADATA_IMPL(MyProcess::Model)
+  PROCESS_METADATA_IMPL(Onnx::Model)
   W_OBJECT(Model)
 
 public:
@@ -35,5 +35,5 @@ private:
   void setDurationAndShrink(const TimeVal& newDuration) noexcept override;
 };
 
-using ProcessFactory = Process::ProcessFactory_T<MyProcess::Model>;
+using ProcessFactory = Process::ProcessFactory_T<Onnx::Model>;
 }

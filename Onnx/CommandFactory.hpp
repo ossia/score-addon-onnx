@@ -2,11 +2,11 @@
 #include <score/command/Command.hpp>
 #include <score/model/path/Path.hpp>
 
-namespace MyProcess
+namespace Onnx
 {
 inline const CommandGroupKey& CommandFactoryName()
 {
-  static const CommandGroupKey key{"MyProcess"};
+  static const CommandGroupKey key{"Onnx"};
   return key;
 }
 

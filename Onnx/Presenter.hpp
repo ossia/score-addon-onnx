@@ -5,7 +5,7 @@
 
 #include <score/model/Identifier.hpp>
 
-namespace MyProcess
+namespace Onnx
 {
 class Model;
 class View;

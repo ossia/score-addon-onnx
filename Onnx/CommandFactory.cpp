@@ -1,11 +1,11 @@
 #include "CommandFactory.hpp"
-#include <MyProcess/Process.hpp>
+#include <Onnx/Process.hpp>
 
 #include <score/model/path/PathSerialization.hpp>
 
 #include <QDebug>
 
-namespace MyProcess
+namespace Onnx
 {
 MyUndoRedoCommand::MyUndoRedoCommand(const Model& process)
     : m_path{process}

@@ -3,7 +3,7 @@
 #include <Process/Style/ScenarioStyle.hpp>
 
 #include <QPainter>
-namespace MyProcess
+namespace Onnx
 {
 
 View::View(QGraphicsItem* parent)

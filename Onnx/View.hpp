@@ -1,7 +1,7 @@
 #pragma once
 #include <Process/LayerView.hpp>
 
-namespace MyProcess
+namespace Onnx
 {
 class View final : public Process::LayerView
 {

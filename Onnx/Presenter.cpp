@@ -1,10 +1,10 @@
 #include <score/command/Dispatchers/CommandDispatcher.hpp>
 
-#include <MyProcess/Presenter.hpp>
-#include <MyProcess/Process.hpp>
-#include <MyProcess/View.hpp>
+#include <Onnx/Presenter.hpp>
+#include <Onnx/Process.hpp>
+#include <Onnx/View.hpp>
 
-namespace MyProcess
+namespace Onnx
 {
 Presenter::Presenter(
     const Model& layer,
