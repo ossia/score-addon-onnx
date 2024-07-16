@@ -22,6 +22,10 @@ fi
 
 RENAME=$(command -v perl-rename)
 if [[ ! -x "$RENAME" ]] ; then
+  RENAME=$(command -v prename)
+fi
+
+if [[ ! -x "$RENAME" ]] ; then
   RENAME=$(command -v rename)
 fi
 
