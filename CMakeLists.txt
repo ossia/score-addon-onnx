@@ -39,7 +39,7 @@ score_generate_command_list_file(
 )
 
 # Link
-target_link_libraries(score_addon_onnx PUBLIC score_plugin_engine)
-
+target_link_libraries(score_addon_onnx PUBLIC score_plugin_engine onnxruntime)
+target_include_directories(score_addon_onnx PUBLIC /usr/include/onnxruntime)
 # Target-specific options
 setup_score_plugin(score_addon_onnx)
