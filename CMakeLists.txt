@@ -6,6 +6,16 @@ endif()
 
 project(score_addon_onnx LANGUAGES CXX)
 
+find_library(ONNXRUNTIME_LIBRARY onnxruntime)
+find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h)
+if(NOT ONNXRUNTIME_LIBRARY)
+    message(FATAL_ERROR "ONNXRUNTIME_LIBRARY not found")
+endif()
+if(NOT ONNXRUNTIME_INCLUDE_DIR)
+    message(FATAL_ERROR "ONNXRUNTIME_INCLUDE_DIR not found")
+endif()
+
+find_package(OpenCV REQUIRED)
 # General initialization
 score_common_setup()
 
@@ -39,7 +49,18 @@ score_generate_command_list_file(
 )
 
 # Link
-target_link_libraries(score_addon_onnx PUBLIC score_plugin_engine onnxruntime)
-target_include_directories(score_addon_onnx PUBLIC /usr/include/onnxruntime)
+
+target_link_libraries(score_addon_onnx
+    PUBLIC
+     score_plugin_engine
+     "${ONNXRUNTIME_LIBRARY}"
+
+     opencv_dnn
+     opencv_imgproc
+     opencv_core
+     opencv_imgcodecs
+     opencv_highgui
+ )
+target_include_directories(score_addon_onnx PUBLIC "${ONNXRUNTIME_INCLUDE_DIR}")
 # Target-specific options
 setup_score_plugin(score_addon_onnx)
