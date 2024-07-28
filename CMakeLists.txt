@@ -7,7 +7,12 @@ endif()
 project(score_addon_onnx LANGUAGES CXX)
 
 find_library(ONNXRUNTIME_LIBRARY onnxruntime)
-find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h)
+find_path(ONNXRUNTIME_INCLUDE_DIR
+  onnxruntime_cxx_api.h
+  PATH_SUFFIXES
+    onnxruntime
+)
+
 if(NOT ONNXRUNTIME_LIBRARY)
     message(FATAL_ERROR "ONNXRUNTIME_LIBRARY not found")
 endif()
@@ -38,6 +43,7 @@ add_library(score_addon_onnx
     Onnx/CommandFactory.cpp
 
     score_addon_onnx.cpp
+
 )
 
 # Scan for commands which creates necessary files
@@ -47,6 +53,67 @@ score_generate_command_list_file(
   score_addon_onnx
   "Onnx/CommandFactory.hpp" 
 )
+
+avnd_score_plugin_init(BASE_TARGET score_addon_onnx_models)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/YOLO-blob.hpp
+    OnnxModels/YOLO-blob.cpp
+  TARGET
+    yolo-blob
+  MAIN_CLASS
+    YOLOBlobDetector
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/Resnet.hpp
+    OnnxModels/Resnet.cpp
+  TARGET
+    resnet
+  MAIN_CLASS
+    ResnetDetector
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/YOLO-pose.hpp
+    OnnxModels/YOLO-pose.cpp
+  TARGET
+    yolo-pose
+  MAIN_CLASS
+    YOLOPoseDetector
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/BlazePose.hpp
+    OnnxModels/BlazePose.cpp
+  TARGET
+    blazepose
+  MAIN_CLASS
+    BlazePoseDetector
+  NAMESPACE
+    OnnxModels
+)
+target_link_libraries(score_addon_onnx_models PRIVATE score_addon_onnx)
+avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
+                           PLUGIN_UUID "24a98f5b-700f-401c-ab89-8c1173bda73f")
 
 # Link
 
