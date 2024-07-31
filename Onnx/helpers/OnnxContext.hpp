@@ -18,7 +18,28 @@ namespace Onnx
 struct OnnxRunContext
 {
   Ort::Env env;
-  Ort::SessionOptions session_options;
+
+  Ort::SessionOptions session_options = []
+  {
+    Ort::SessionOptions session_options;
+    const auto& api = Ort::GetApi();
+    Ort::ThrowOnError(
+        OrtSessionOptionsAppendExecutionProvider_CUDA(session_options, 0));
+
+    // https://onnxruntime.ai/docs/execution-providers/TensorRT-ExecutionProvider.html#shape-inference-for-tensorrt-subgraphs
+    /*
+    OrtTensorRTProviderOptionsV2* tensorrt_options;
+    Ort::ThrowOnError(api.CreateTensorRTProviderOptions(&tensorrt_options));
+    std::unique_ptr<
+        OrtTensorRTProviderOptionsV2,
+        decltype(api.ReleaseTensorRTProviderOptions)>
+        rel_trt_options(tensorrt_options, api.ReleaseTensorRTProviderOptions);
+    Ort::ThrowOnError(api.SessionOptionsAppendExecutionProvider_TensorRT_V2(
+        static_cast<OrtSessionOptions*>(session_options),
+        rel_trt_options.get()));
+*/
+    return session_options;
+  }();
   Ort::Session session;
 
   // print name/shape of inputs
@@ -28,10 +49,6 @@ struct OnnxRunContext
       : env(ORT_LOGGING_LEVEL_WARNING, "example")
       , session(env, name.data(), session_options)
   {
-    //     Ort::ThrowOnError(
-    //         OrtSessionOptionsAppendExecutionProvider_CUDA(session_options, 0));
-    // Assume model has 1 input node and 1 output node.
-    // assert(input_names.size() == 1 && output_names.size() == 1);
   }
 
   ModelSpec readModelSpec()
