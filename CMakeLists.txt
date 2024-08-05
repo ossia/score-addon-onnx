@@ -20,30 +20,22 @@ if(NOT ONNXRUNTIME_INCLUDE_DIR)
     message(FATAL_ERROR "ONNXRUNTIME_INCLUDE_DIR not found")
 endif()
 
-find_package(OpenCV REQUIRED)
 # General initialization
 score_common_setup()
 
 # Creation of the library
 add_library(score_addon_onnx
     Onnx/Executor.hpp
-    Onnx/Metadata.hpp
-    Onnx/Presenter.hpp
-    Onnx/Process.hpp
-    Onnx/View.hpp
-    Onnx/Layer.hpp
-    Onnx/CommandFactory.hpp
-
-    score_addon_onnx.hpp
-
     Onnx/Executor.cpp
-    Onnx/Presenter.cpp
+    Onnx/Metadata.hpp
+    Onnx/Process.hpp
     Onnx/Process.cpp
-    Onnx/View.cpp
+    Onnx/CommandFactory.hpp
     Onnx/CommandFactory.cpp
 
-    score_addon_onnx.cpp
 
+    score_addon_onnx.hpp
+    score_addon_onnx.cpp
 )
 
 # Scan for commands which creates necessary files
@@ -111,6 +103,7 @@ avnd_score_plugin_add(
   NAMESPACE
     OnnxModels
 )
+
 target_link_libraries(score_addon_onnx_models PRIVATE score_addon_onnx)
 avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
                            PLUGIN_UUID "24a98f5b-700f-401c-ab89-8c1173bda73f")
@@ -122,11 +115,6 @@ target_link_libraries(score_addon_onnx
      score_plugin_engine
      "${ONNXRUNTIME_LIBRARY}"
 
-     opencv_dnn
-     opencv_imgproc
-     opencv_core
-     opencv_imgcodecs
-     opencv_highgui
  )
 target_include_directories(score_addon_onnx PUBLIC "${ONNXRUNTIME_INCLUDE_DIR}")
 # Target-specific options

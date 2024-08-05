@@ -68,10 +68,3 @@ QString EffectProcessFactory_T<Onnx::Model>::customConstructionData() const noex
 template<>
 Process::Descriptor EffectProcessFactory_T<Onnx::Model>::descriptor(QString d) const noexcept;
 } // namespace Process
-
-class QPlainTextEdit;
-namespace Onnx {
-
-using BytebeatEffectFactory = Process::EffectProcessFactory_T<Onnx::Model>;
-using BytebeatLayerFactory = Process::EffectLayerFactory_T<Onnx::Model, Process::DefaultEffectItem>;
-} // namespace Onnx

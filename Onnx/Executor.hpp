@@ -10,7 +10,7 @@ class ProcessExecutorComponent final
     : public Execution::
           ProcessComponent_T<Onnx::Model, ossia::node_process>
 {
-  COMPONENT_METADATA("642fde65-33ad-4f23-a225-5e94eb9f3ede")
+  COMPONENT_METADATA("77262c15-17c7-4d69-ac13-ff858aa9fd8b")
 public:
   ProcessExecutorComponent(
       Model& element,
