@@ -42,11 +42,11 @@ void YOLOBlobDetector::operator()()
   Ort::Value out_tt[1]{Ort::Value{nullptr}};
   ctx.infer(spec, tt, out_tt);
 
-  static const YOLO_blob blob;
+  static const Yolo::YOLO_blob blob;
   blob.processOutput(
       spec,
       out_tt,
-      reinterpret_cast<std::vector<YOLO_blob::blob_type>&>(
+      reinterpret_cast<std::vector<Yolo::YOLO_blob::blob_type>&>(
           outputs.detection.value));
 
   auto img = Onnx::drawRects(

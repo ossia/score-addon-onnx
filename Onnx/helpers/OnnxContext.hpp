@@ -18,8 +18,8 @@ namespace Onnx
 {
 struct Options
 {
-  std::string provider;
-  int device_id;
+  std::string provider = "tensorrt";
+  int device_id = 0;
 };
 
 static Ort::SessionOptions create_session_options(const Options& opts)
@@ -27,8 +27,16 @@ static Ort::SessionOptions create_session_options(const Options& opts)
   Ort::SessionOptions session_options;
 
   const OrtApi& api = Ort::GetApi();
-  const auto& p = Ort::GetAvailableProviders();
-  if (opts.provider == "CUDA" && ossia::contains(p, "CUDA"))
+  auto p = Ort::GetAvailableProviders();
+  for (std::string& s : p)
+  {
+    if (s.ends_with("ExecutionProvider"))
+      s.resize(s.size() - strlen("ExecutionProvider"));
+    for (char& c : s)
+      c = std::tolower(c);
+  }
+
+  if (opts.provider == "cuda" && ossia::contains(p, "cuda"))
   {
     using namespace Ort;
 
@@ -60,7 +68,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
     session_options.AppendExecutionProvider_CUDA_V2(*cuda_option_v2);
   }
 
-  if (opts.provider == "TensorRT" && ossia::contains(p, "TensorRT"))
+  if (opts.provider == "tensorrt" && ossia::contains(p, "tensorrt"))
   {
     using namespace Ort;
     const std::vector keys{
@@ -79,7 +87,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
     // FIXME release options
   }
 
-  if (opts.provider == "ROCM" && ossia::contains(p, "ROCM"))
+  if (opts.provider == "rocm" && ossia::contains(p, "rocm"))
   {
     using namespace Ort;
     OrtROCMProviderOptions* options{};
@@ -89,7 +97,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
     // FIXME release options
   }
 
-  if (opts.provider == "OpenVINO" && ossia::contains(p, "OpenVINO"))
+  if (opts.provider == "openvino" && ossia::contains(p, "openvino"))
   {
     using namespace Ort;
 
@@ -103,7 +111,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
   }
 
 #if _WIN32
-  if (opts.provider == "DirectML" && ossia::contains(p, "DML"))
+  if (opts.provider == "dml" && ossia::contains(p, "dml"))
   {
     using namespace Ort;
 
@@ -113,7 +121,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
 #endif
 
 #if __APPLE__
-  if (opts.provider == "CoreML" && ossia::contains(p, "CoreML"))
+  if (opts.provider == "coreml" && ossia::contains(p, "coreml"))
   {
     using namespace Ort;
 

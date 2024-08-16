@@ -1,8 +1,10 @@
 #pragma once
+#include <ossia/detail/pod_vector.hpp>
+
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 
-namespace OnnxModels
+namespace OnnxModels::Yolo
 {
 
 struct YOLO_blob
@@ -148,19 +150,22 @@ struct YOLO_pose
         // 1. Grab the pose indiceswith global confidence > minimum
         const float* data = outputTensor.front().GetTensorData<float>();
         const float* recog = data + 4 * 8400;
-        thread_local std::vector<int> idx;
+        thread_local ossia::pod_vector<int> idx;
         idx.clear();
+        idx.resize(8400, boost::container::default_init);
+
+        int k = 0;
 #pragma omp simd
         for (int i = 0; i < 8400; i++)
         {
           if (recog[i] > min_confidence)
-            idx.push_back(i);
+            idx[k++] = i;
         }
 
         // 2. Sort the resulting array. First element will be index of pose with highest confidence.
         std::stable_sort(
-            idx.begin(),
-            idx.end(),
+            idx.data(),
+            idx.data() + k,
             [&](int i1, int i2) { return recog[i1] > recog[i2]; });
 
         // 3. Add the pose to the list and process the keypoints

@@ -36,8 +36,8 @@ void BlazePoseDetector::operator()()
       Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr}};
   ctx.infer(spec, tt, out_tt);
 
-  std::optional<BlazePose_fullbody::pose_data> out;
-  BlazePose_fullbody::processOutput(spec, out_tt, out);
+  std::optional<Blazepose::BlazePose_fullbody::pose_data> out;
+  Blazepose::BlazePose_fullbody::processOutput(spec, out_tt, out);
 
   if (out)
   {

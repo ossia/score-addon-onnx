@@ -12,7 +12,7 @@ namespace Onnx
 struct OnnxRunContext;
 }
 
-namespace OnnxModels
+namespace OnnxModels::Yolo
 {
 struct Keypoint
 {
@@ -30,8 +30,7 @@ struct DetectedYoloPose
 
   halp_field_names(name, geometry, probability, keypoints);
 };
-
-struct YOLOPoseDetector
+struct PoseDetector
 {
 public:
   halp_meta(name, "YOLO Pose");
@@ -61,8 +60,8 @@ public:
     } detection;
   } outputs;
 
-  YOLOPoseDetector() noexcept;
-  ~YOLOPoseDetector();
+  PoseDetector() noexcept;
+  ~PoseDetector();
 
   void operator()();
 

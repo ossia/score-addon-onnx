@@ -2,7 +2,7 @@
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 
-namespace OnnxModels
+namespace OnnxModels::Blazepose
 {
 
 struct BlazePose_fullbody

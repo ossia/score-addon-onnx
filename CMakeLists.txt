@@ -85,9 +85,9 @@ avnd_score_plugin_add(
   TARGET
     yolo-pose
   MAIN_CLASS
-    YOLOPoseDetector
+    PoseDetector
   NAMESPACE
-    OnnxModels
+    OnnxModels::Yolo
 )
 
 avnd_score_plugin_add(

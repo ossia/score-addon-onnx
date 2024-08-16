@@ -4,16 +4,16 @@
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <Onnx/helpers/Yolo.hpp>
 
-namespace OnnxModels
+namespace OnnxModels::Yolo
 {
-YOLOPoseDetector::YOLOPoseDetector() noexcept
+PoseDetector::PoseDetector() noexcept
 {
   inputs.image.request_height = 640;
   inputs.image.request_width = 640;
 }
-YOLOPoseDetector::~YOLOPoseDetector() = default;
+PoseDetector::~PoseDetector() = default;
 
-void YOLOPoseDetector::operator()()
+void PoseDetector::operator()()
 {
   auto& in_tex = inputs.image.texture;
 
@@ -41,11 +41,11 @@ void YOLOPoseDetector::operator()()
   Ort::Value out_tt[1]{Ort::Value{nullptr}};
   ctx.infer(spec, tt, out_tt);
 
-  static const YOLO_pose pose;
+  static const Yolo::YOLO_pose pose;
   pose.processOutput(
       spec,
       out_tt,
-      reinterpret_cast<std::vector<YOLO_pose::pose_type>&>(
+      reinterpret_cast<std::vector<Yolo::YOLO_pose::pose_type>&>(
           outputs.detection.value));
 
   auto img = Onnx::drawRects(
