@@ -29,22 +29,36 @@ void BlazePoseDetector::operator()()
   auto spec = ctx.readModelSpec();
   auto t = nhwc_rgb_tensorFromRGBA(
       spec.inputs[0], in_tex.bytes, in_tex.width, in_tex.height, 256, 256);
-  Ort::Value tt[1] = {std::move(t.value)};
+  Ort::Value tensor_inputs[1] = {std::move(t.value)};
 
-  assert(1 <= spec.output_names_char.size());
-  Ort::Value out_tt[3]{
-      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr}};
-  ctx.infer(spec, tt, out_tt);
+  assert(
+      1 <= spec.output_names_char.size()
+      && spec.output_names_char.size() <= 5);
+
+  Ort::Value tensor_outputs[5]{
+      Ort::Value{nullptr},
+      Ort::Value{nullptr},
+      Ort::Value{nullptr},
+      Ort::Value{nullptr},
+      Ort::Value{nullptr}};
+  ctx.infer(
+      spec,
+      tensor_inputs,
+      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
 
   std::optional<Blazepose::BlazePose_fullbody::pose_data> out;
-  Blazepose::BlazePose_fullbody::processOutput(spec, out_tt, out);
+  Blazepose::BlazePose_fullbody::processOutput(spec, tensor_outputs, out);
 
   if (out)
   {
+    static_assert(sizeof(*out) == sizeof(*outputs.detection.value));
+    outputs.detection.value.emplace();
+    memcpy((void*)&*outputs.detection.value, (void*)&*out, sizeof(*out));
     auto img = Onnx::drawKeypoints(
         inputs.image.texture.bytes,
         in_tex.width,
         in_tex.height,
+        std::pow(inputs.min_confidence, 6),
         out->keypoints);
 
     outputs.image.create(in_tex.width, in_tex.height);

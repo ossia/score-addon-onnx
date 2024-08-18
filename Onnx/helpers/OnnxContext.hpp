@@ -26,6 +26,10 @@ static Ort::SessionOptions create_session_options(const Options& opts)
 {
   Ort::SessionOptions session_options;
 
+  static constexpr const char* device_ids[10]
+      = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
+
+  const char* device_id_str = device_ids[std::clamp(opts.device_id, 0, 8)];
   const OrtApi& api = Ort::GetApi();
   auto p = Ort::GetAvailableProviders();
   for (std::string& s : p)
@@ -53,7 +57,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
         "enable_cuda_graph",
         "enable_skip_layer_norm_strict_mode"};
     const std::vector values{
-        "0",
+        device_id_str,
         "2147483648",
         "kNextPowerOfTwo",
         "EXHAUSTIVE",
@@ -76,7 +80,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
         "trt_engine_cache_enable",
         "trt_timing_cache_enable",
     };
-    const std::vector values{"0", "1", "1"};
+    const std::vector values{device_id_str, "1", "1"};
 
     // https://onnxruntime.ai/docs/execution-providers/TensorRT-ExecutionProvider.html#shape-inference-for-tensorrt-subgraphs
     OrtTensorRTProviderOptionsV2* options{};
@@ -92,7 +96,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
     using namespace Ort;
     OrtROCMProviderOptions* options{};
     Ort::ThrowOnError(api.CreateROCMProviderOptions(&options));
-    options->device_id = 0;
+    options->device_id = opts.device_id;
     session_options.AppendExecutionProvider_ROCM(*options);
     // FIXME release options
   }

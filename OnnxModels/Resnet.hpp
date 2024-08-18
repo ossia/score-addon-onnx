@@ -26,7 +26,7 @@ struct ResnetDetector
 public:
   halp_meta(name, "Resnet detector");
   halp_meta(c_name, "resnet");
-  halp_meta(category, "Visuals/Computer Vision");
+  halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "Resnet authors, Onnxruntime");
   halp_meta(description, "Resnet recognizer using DNN.");
   halp_meta(uuid, "9f4b7448-5bb5-4db6-8c96-57d53896208b");

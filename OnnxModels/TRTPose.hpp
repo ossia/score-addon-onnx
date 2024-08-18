@@ -36,7 +36,7 @@ struct TRTPoseDetector
 public:
   halp_meta(name, "TRT Pose");
   halp_meta(c_name, "trt_pose");
-  halp_meta(category, "Visuals/Computer Vision");
+  halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "TRT authors, Onnxruntime, TensorRT");
   halp_meta(description, "TRT pose recognizer using DNN.");
   halp_meta(uuid, "18889004-3d30-4d19-b7ec-cfc6a00bb9d8");

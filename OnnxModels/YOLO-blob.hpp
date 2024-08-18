@@ -28,10 +28,10 @@ struct YOLOBlobDetector
 public:
   halp_meta(name, "YOLO Blob");
   halp_meta(c_name, "yolo_blob");
-  halp_meta(category, "Visuals/Computer Vision");
+  halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "YOLO authors, Onnxruntime, TensorRT");
   halp_meta(description, "YOLO blob recognizer using DNN.");
-  halp_meta(uuid, "c97ca988-0ba4-46d1-8739-ba11f7a212aa");
+  halp_meta(uuid, "3303df15-5774-4abc-b636-b51c9bb6d1fb");
 
   struct
   {

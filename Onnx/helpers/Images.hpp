@@ -212,8 +212,12 @@ inline QImage drawRects(const unsigned char* input, int w, int h, auto& rects)
   return img;
 }
 
-inline QImage
-drawKeypoints(const unsigned char* input, int w, int h, const auto& keypoints)
+inline QImage drawKeypoints(
+    const unsigned char* input,
+    int w,
+    int h,
+    float min_confidence,
+    const auto& keypoints)
 {
   QImage img(input, w, h, QImage::Format_RGBA8888);
 
@@ -225,7 +229,8 @@ drawKeypoints(const unsigned char* input, int w, int h, const auto& keypoints)
     p.setBrush(Qt::NoBrush);
     for (const auto& kp : keypoints)
     {
-      p.drawEllipse(QPoint(kp.x, kp.y), 5, 5);
+      if (kp.confidence() >= min_confidence)
+        p.drawEllipse(QPoint(kp.x, kp.y), 5, 5);
     }
   }
 

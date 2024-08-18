@@ -14,6 +14,7 @@ struct BlazePose_fullbody
     float x, y, z;
     float visibility;
     float presence;
+    float confidence() const noexcept { return visibility; }
   };
 
   struct pose_data
@@ -21,36 +22,44 @@ struct BlazePose_fullbody
     keypoint keypoints[NUM_KPS]{};
   };
 
-  static void processOutput(
+  static bool processOutput(
       const Onnx::ModelSpec& spec,
       std::span<Ort::Value> outputTensor,
-      std::optional<pose_data>& out,
-      int max_detect = 100,
-      float min_confidence = 0.75,
-      int image_x = 0,
-      int image_y = 0,
-      int image_w = 640,
-      int image_h = 640,
-      int model_w = 640,
-      int model_h = 640)
+      std::optional<pose_data>& out)
   {
-    const int src_cols = image_w;
-    const int src_rows = image_h;
     out.reset();
-    if (outputTensor.size() > 0)
-    {
-      const int Nfloats
-          = outputTensor.front().GetTensorTypeAndShapeInfo().GetElementCount();
-      if (Nfloats == 195)
-      {
-        const float* data = outputTensor.front().GetTensorData<float>();
-        // data layout xxxx... yyyy... zzzz...
-        auto kps = reinterpret_cast<const keypoint*>(data);
+    if (outputTensor.size() == 0)
+      return false;
 
-        out = pose_data{};
-        std::copy_n(data, 195, reinterpret_cast<float*>(&out->keypoints[0]));
-      }
+    const int Nfloats
+        = outputTensor.front().GetTensorTypeAndShapeInfo().GetElementCount();
+    if (Nfloats != 195)
+      return false;
+
+    const float* data = outputTensor.front().GetTensorData<float>();
+    out = pose_data{};
+    std::copy_n(
+        data, NUM_KPS * 5, reinterpret_cast<float*>(&out->keypoints[0]));
+
+    float probas_visibility[NUM_KPS];
+    float probas_presence[NUM_KPS];
+    static thread_local std::vector<float> probas_out_presence;
+    static thread_local std::vector<float> probas_out_visibility;
+    for (int i = 0; i < NUM_KPS; i++)
+    {
+      probas_visibility[i] = (*out).keypoints[i].visibility;
+      probas_presence[i] = (*out).keypoints[i].presence;
     }
+    Onnx::softmax(probas_visibility, probas_out_visibility);
+    Onnx::softmax(probas_presence, probas_out_presence);
+    auto& kps = out->keypoints;
+    for (int i = 0; i < NUM_KPS; i++)
+    {
+      kps[i].visibility = probas_out_visibility[i];
+      kps[i].presence = probas_out_presence[i];
+    }
+
+    return true;
   }
 };
 }

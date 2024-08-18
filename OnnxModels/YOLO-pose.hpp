@@ -35,10 +35,10 @@ struct PoseDetector
 public:
   halp_meta(name, "YOLO Pose");
   halp_meta(c_name, "yolov8_pose");
-  halp_meta(category, "Visuals/Computer Vision");
+  halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "YOLOv8 authors, Onnxruntime, TensorRT");
   halp_meta(description, "YOLO pose recognizer using DNN.");
-  halp_meta(uuid, "115e2f43-2ec5-477f-bbe8-bc1c592850c7");
+  halp_meta(uuid, "942d0486-c4d1-482c-bc80-81f6b2949037");
 
   struct
   {
