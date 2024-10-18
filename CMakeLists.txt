@@ -1,36 +1,12 @@
 cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
-
+#return()
 if(NOT TARGET score_lib_base)
   include("${SCORE_SOURCE_DIR}/cmake/ScoreExternalAddon.cmake")
 endif()
 
 project(score_addon_onnx LANGUAGES CXX)
 
-# Find onnxruntime
-find_library(ONNXRUNTIME_LIBRARY onnxruntime)
-find_path(ONNXRUNTIME_INCLUDE_DIR
-  onnxruntime_cxx_api.h
-  PATH_SUFFIXES
-    onnxruntime
-)
-
-if(NOT ONNXRUNTIME_LIBRARY)
-    message(FATAL_ERROR "ONNXRUNTIME_LIBRARY not found")
-endif()
-if(NOT ONNXRUNTIME_INCLUDE_DIR)
-    message(FATAL_ERROR "ONNXRUNTIME_INCLUDE_DIR not found")
-endif()
-
-add_library(onnxruntime INTERFACE)
-
-target_link_libraries(onnxruntime
-  INTERFACE
-     "${ONNXRUNTIME_LIBRARY}"
-)
-target_include_directories(onnxruntime
-  INTERFACE
-    "${ONNXRUNTIME_INCLUDE_DIR}"
-)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
 
 # General initialization
 score_common_setup()
@@ -131,3 +107,4 @@ target_link_libraries(score_addon_onnx_models
     PUBLIC
       onnxruntime
  )
+
