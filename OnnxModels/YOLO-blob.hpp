@@ -32,8 +32,11 @@ public:
   halp_meta(author, "YOLO authors, Onnxruntime, TensorRT");
   halp_meta(description, "YOLO blob recognizer using DNN.");
   halp_meta(uuid, "3303df15-5774-4abc-b636-b51c9bb6d1fb");
+  halp_meta(
+      manual_url,
+      "https://ossia.io/score-docs/processes/ai-recognition.html#yolo-blob")
 
-  struct
+      struct
   {
     halp::fixed_texture_input<"In"> image;
     halp::lineedit<"Model", ""> model;

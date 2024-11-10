@@ -43,8 +43,11 @@ public:
   halp_meta(author, "BlazePose authors, Onnxruntime");
   halp_meta(description, "BlazePose recognizer using DNN.");
   halp_meta(uuid, "236d610b-cc61-4e4a-80f1-dccd08f8b2b0");
+  halp_meta(
+      manual_url,
+      "https://ossia.io/score-docs/processes/ai-recognition.html#blazepose")
 
-  struct
+      struct
   {
     halp::fixed_texture_input<"In"> image;
     halp::lineedit<"Model", ""> model;

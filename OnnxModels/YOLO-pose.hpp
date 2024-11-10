@@ -39,8 +39,11 @@ public:
   halp_meta(author, "YOLOv8 authors, Onnxruntime, TensorRT");
   halp_meta(description, "YOLO pose recognizer using DNN.");
   halp_meta(uuid, "942d0486-c4d1-482c-bc80-81f6b2949037");
+  halp_meta(
+      manual_url,
+      "https://ossia.io/score-docs/processes/ai-recognition.html#yolo-pose")
 
-  struct
+      struct
   {
     halp::fixed_texture_input<"In"> image;
     halp::lineedit<"Model", ""> model;

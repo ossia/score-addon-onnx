@@ -40,8 +40,11 @@ public:
   halp_meta(author, "TRT authors, Onnxruntime, TensorRT");
   halp_meta(description, "TRT pose recognizer using DNN.");
   halp_meta(uuid, "18889004-3d30-4d19-b7ec-cfc6a00bb9d8");
+  halp_meta(
+      manual_url,
+      "https://ossia.io/score-docs/processes/ai-recognition.html#trt-pose")
 
-  struct
+      struct
   {
     halp::fixed_texture_input<"In"> image;
     halp::lineedit<"Model", ""> model;
