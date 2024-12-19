@@ -229,7 +229,7 @@ inline QImage drawKeypoints(
     p.setBrush(Qt::NoBrush);
     for (const auto& kp : keypoints)
     {
-      if (kp.confidence() >= min_confidence)
+      //if (kp.confidence() >= min_confidence)
         p.drawEllipse(QPoint(kp.x, kp.y), 5, 5);
     }
   }

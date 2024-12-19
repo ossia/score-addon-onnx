@@ -34,6 +34,7 @@ static Ort::SessionOptions create_session_options(const Options& opts)
   auto p = Ort::GetAvailableProviders();
   for (std::string& s : p)
   {
+    qDebug() << "Available provider: " << s;
     if (s.ends_with("ExecutionProvider"))
       s.resize(s.size() - strlen("ExecutionProvider"));
     for (char& c : s)
