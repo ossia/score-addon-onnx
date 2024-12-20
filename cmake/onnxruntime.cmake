@@ -54,8 +54,13 @@ find_library(onnxruntime_LIBRARY
     PATHS "${onnxruntime_SOURCE_DIR}/lib"
     NO_DEFAULT_PATH
 )
+
 if(NOT onnxruntime_LIBRARY)
-  message(FATAL_ERROR "Could not find onnxruntime library")
+  if(OSSIA_SDK AND LINUX)
+    set(onnxruntime_LIBRARY "${onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so")
+  else()
+    message(FATAL_ERROR "Could not find onnxruntime library")
+  endif()
 endif()
 
 if(WIN32)
@@ -73,7 +78,11 @@ find_path(onnxruntime_INCLUDE_DIRS
     NO_DEFAULT_PATH
 )
 if(NOT onnxruntime_INCLUDE_DIRS)
-  message(FATAL_ERROR "Could not find onnxruntime headers")
+  if(OSSIA_SDK AND LINUX)
+    set(onnxruntime_INCLUDE_DIRS "${onnxruntime_SOURCE_DIR}/include")
+  else()
+    message(FATAL_ERROR "Could not find onnxruntime headers")
+  endif()
 endif()
 
 # Create an onnxruntime CMake target which will propagate these variables to the targets
