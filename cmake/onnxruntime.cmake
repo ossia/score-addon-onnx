@@ -40,6 +40,7 @@ else()
   endif()
 endif()
 
+message("${CMAKE_SYSTEM_PROCESSOR} ::: ${ONNXRUNTIME_URL}")
 # Ask CMake to download it
 include(FetchContent)
 FetchContent_Declare(onnxruntime
