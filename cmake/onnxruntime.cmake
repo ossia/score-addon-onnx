@@ -116,7 +116,7 @@ target_include_directories(onnxruntime INTERFACE "${onnxruntime_INCLUDE_DIRS}")
 add_library(onnxruntime::onnxruntime ALIAS onnxruntime)
 
 
-if(SCORE_DEPLOYMENT_BUILD)
+if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES)
     if(APPLE)
         file(GLOB ONNXRUNTIME_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dylib")
     elseif(WIN32)
@@ -124,20 +124,21 @@ if(SCORE_DEPLOYMENT_BUILD)
     else()
         file(GLOB ONNXRUNTIME_FILES "${onnxruntime_SOURCE_DIR}/lib/*.so*")
     endif()
-#  if(APPLE)
-#    install(
-#      FILES ${onnxruntime_SOURCE_DIR}
-#      DESTINATION "ossia score.app/Contents/MacOS"
-#      COMPONENT OssiaScore)
-#  elseif(WIN32)
-#    install(
-#      TARGETS ossia-score-vst3puppet
-#      RUNTIME DESTINATION "${SCORE_BIN_INSTALL_DIR}"
-#      COMPONENT OssiaScore)
-#  else()
-#    install(
-#      TARGETS ossia-score-vst3puppet
-#      RUNTIME DESTINATION bin
-#      COMPONENT OssiaScore)
-#  endif()
+
+  if(APPLE)
+    install(
+      FILES ${ONNXRUNTIME_FILES}
+      DESTINATION "ossia score.app/Frameworks"
+      COMPONENT OssiaScore)
+  elseif(WIN32)
+    install(
+      FILES ${ONNXRUNTIME_FILES}
+      DESTINATION "${SCORE_BIN_INSTALL_DIR}"
+      COMPONENT OssiaScore)
+  else()
+    install(
+      FILES ${ONNXRUNTIME_FILES}
+      DESTINATION lib
+      COMPONENT OssiaScore)
+  endif()
 endif()
