@@ -4,7 +4,7 @@
 
 #include <score/tools/File.hpp>
 
-#include <onnxruntime_cxx_api.h>
+#include <Onnx/helpers/OnnxBase.hpp>
 #include <wobjectimpl.h>
 
 #include <cassert>

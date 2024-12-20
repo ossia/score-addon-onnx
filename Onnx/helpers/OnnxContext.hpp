@@ -6,8 +6,8 @@
 
 #include <Onnx/helpers/Debug.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
+#include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/Utilities.hpp>
-#include <onnxruntime_cxx_api.h>
 
 #include <cstddef>
 #include <cstdint>

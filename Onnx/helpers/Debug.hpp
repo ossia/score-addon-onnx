@@ -1,7 +1,7 @@
 #pragma once
 #include <QDebug>
 
-#include <onnxruntime_cxx_api.h>
+#include <Onnx/helpers/OnnxBase.hpp>
 
 inline QDebug operator<<(QDebug s, ONNXType t)
 {

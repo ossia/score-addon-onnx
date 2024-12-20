@@ -1,5 +1,5 @@
 #pragma once
-#include <onnxruntime_cxx_api.h>
+#include <Onnx/helpers/OnnxBase.hpp>
 
 #include <array>
 #include <cstdint>
