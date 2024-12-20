@@ -23,6 +23,7 @@ struct Options
 };
 
 static Ort::SessionOptions create_session_options(const Options& opts)
+try
 {
   Ort::SessionOptions session_options;
 
@@ -137,6 +138,18 @@ static Ort::SessionOptions create_session_options(const Options& opts)
 #endif
   return session_options;
 }
+catch(const std::exception& e)
+{
+  qDebug() << "Onnxruntime: falling back to CPU: " << e.what();
+  return create_session_options(Options{.provider = "cpu", .device_id = 0});
+}
+catch(...)
+{
+  qDebug() << "OnnxRuntime: falling back to CPU: unknown error";
+  return create_session_options(Options{.provider = "cpu", .device_id = 0});
+}
+
+
 struct OnnxRunContext
 {
   Options opts;
