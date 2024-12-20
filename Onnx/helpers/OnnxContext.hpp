@@ -158,13 +158,13 @@ struct OnnxRunContext
   Ort::SessionOptions session_options;
   Ort::Session session;
 
-  // print name/shape of inputs
   Ort::AllocatorWithDefaultOptions allocator;
 
-  explicit OnnxRunContext(std::string_view name)
-      : env(ORT_LOGGING_LEVEL_WARNING, "example")
+  // bytes is not the filename, it is the raw model binary data
+  explicit OnnxRunContext(std::string_view bytes)
+      : env(ORT_LOGGING_LEVEL_WARNING, "ossia")
       , session_options(create_session_options(opts))
-      , session(env, name.data(), session_options)
+      , session(env, bytes.data(), bytes.size(), session_options)
   {
   }
 
@@ -250,24 +250,5 @@ struct OnnxRunContext
       exit(-1);
     }
   }
-  /*
-  // processOutput_resnet(spec, output_tensors);
-  processOutput_yolo(spec, output_tensors);
-  // double-check the dimensions of the output tensors
-  // NOTE: the number of output tensors is equal to the number of output nodes specifed in the Run() call
-  assert(
-      output_tensors.size() == spec.output_names.size()
-      && output_tensors[0].IsTensor());
-
-  auto info = output_tensors[0].GetTypeInfo();
-  qDebug() << info;
-} catch (const Ort::Exception& exception)
-{
-  std::cout << "ERROR running model inference: " << exception.what()
-            << std::endl;
-  exit(-1);
-}
-}
-*/
 };
 }

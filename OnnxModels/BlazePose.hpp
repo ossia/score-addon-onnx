@@ -1,11 +1,12 @@
 #pragma once
-
+#include <OnnxModels/Utils.hpp>
 #include <cmath>
 #include <halp/controls.hpp>
 #include <halp/geometry.hpp>
 #include <halp/meta.hpp>
 #include <halp/sample_accurate_controls.hpp>
 #include <halp/texture.hpp>
+#include <halp/file_port.hpp>
 
 #include <optional>
 
@@ -50,7 +51,7 @@ public:
       struct
   {
     halp::fixed_texture_input<"In"> image;
-    halp::lineedit<"Model", ""> model;
+    ModelPort model;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 256}>
         resolution;
     halp::hslider_f32<"Minimum confidence", halp::range{0., 1., 0.5}>

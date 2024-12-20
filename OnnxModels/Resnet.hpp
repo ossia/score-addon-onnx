@@ -1,4 +1,5 @@
 #pragma once
+#include <OnnxModels/Utils.hpp>
 
 #include <cmath>
 #include <halp/controls.hpp>
@@ -37,7 +38,7 @@ public:
       struct
   {
     halp::fixed_texture_input<"In"> image;
-    halp::lineedit<"Model", ""> model;
+    ModelPort model;
     halp::lineedit<"Classes", ""> classes;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 224}>
         resolution;

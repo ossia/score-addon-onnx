@@ -24,7 +24,7 @@ void YOLOBlobDetector::operator()()
   if (!this->ctx)
   {
     this->ctx
-        = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.value);
+        = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
   }
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
