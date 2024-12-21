@@ -7,10 +7,12 @@ if(OSSIA_USE_SYSTEM_LIBRARIES)
   )
 
   if(NOT ONNXRUNTIME_LIBRARY)
-      message(FATAL_ERROR "ONNXRUNTIME_LIBRARY not found")
+    message("ONNXRUNTIME_LIBRARY not found")
+    return()
   endif()
   if(NOT ONNXRUNTIME_INCLUDE_DIR)
-      message(FATAL_ERROR "ONNXRUNTIME_INCLUDE_DIR not found")
+    message("ONNXRUNTIME_INCLUDE_DIR not found")
+    return()
   endif()
 
   add_library(onnxruntime INTERFACE)
@@ -40,7 +42,6 @@ else()
   endif()
 endif()
 
-message("${CMAKE_SYSTEM_PROCESSOR} ::: ${ONNXRUNTIME_URL}")
 # Ask CMake to download it
 include(FetchContent)
 FetchContent_Declare(onnxruntime

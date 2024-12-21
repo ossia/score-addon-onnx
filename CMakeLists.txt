@@ -11,7 +11,9 @@ endif()
 project(score_addon_onnx LANGUAGES CXX)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
-
+if(NOT TARGET onnxruntime::onnxruntime)
+  return()
+endif()
 # General initialization
 score_common_setup()
 
@@ -109,6 +111,6 @@ avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
 
 target_link_libraries(score_addon_onnx_models
     PUBLIC
-      onnxruntime
+      onnxruntime::onnxruntime
  )
 
