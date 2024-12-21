@@ -105,8 +105,7 @@ struct YOLO_pose
     std::vector<pos> keypoints;
   };
 
-  static constexpr bool
-  similar(pose_type::rect lhs, pose_type::rect rhs) noexcept
+  static bool similar(pose_type::rect lhs, pose_type::rect rhs) noexcept
   {
     const float epsilon = std::min(0.1 * lhs.w, 0.1 * lhs.h);
     return std::abs(rhs.x - lhs.x) < epsilon
@@ -115,7 +114,7 @@ struct YOLO_pose
            && std::abs(rhs.h - lhs.h) < epsilon;
   }
 
-  static constexpr bool
+  static bool
   hasSimilarRect(pose_type::rect r, std::span<pose_type> poses) noexcept
   {
     for (const auto& p : poses)
