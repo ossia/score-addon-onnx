@@ -129,7 +129,7 @@ if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES)
   if(APPLE)
     install(
       FILES ${ONNXRUNTIME_FILES}
-      DESTINATION "ossia score.app/Frameworks"
+      DESTINATION "ossia score.app/Contents/Frameworks"
       COMPONENT OssiaScore)
   elseif(WIN32)
     install(
