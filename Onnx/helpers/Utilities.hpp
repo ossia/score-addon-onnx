@@ -74,4 +74,9 @@ inline void softmax(std::span<const float> in, std::vector<float>& out)
     out[k] /= esum;
   }
 }
+
+inline auto sigmoid(std::floating_point auto v)
+{
+  return 1. / (1. + std::exp(-v));
+}
 }

@@ -24,14 +24,17 @@ struct DetectedYoloBlob
   halp_field_names(name, geometry, probability);
 };
 
-struct YOLOBlobDetector
+struct YOLO7BlobDetector
 {
 public:
-  halp_meta(name, "YOLO Blob");
-  halp_meta(c_name, "yolo_blob");
+  halp_meta(name, "YOLOv7 Blob");
+  halp_meta(c_name, "yolov7_blob");
   halp_meta(category, "AI/Computer Vision");
-  halp_meta(author, "YOLO authors, Onnxruntime, TensorRT");
-  halp_meta(description, "YOLO blob recognizer using DNN.");
+  halp_meta(author, "YOLO authors, Kin-Yiu Wong, Onnxruntime");
+  halp_meta(
+      description,
+      "YOLOv7 blob recognizer using DNN.\nRequires ONNX model from "
+      "https://github.com/WongKinYiu/yolov7");
   halp_meta(uuid, "3303df15-5774-4abc-b636-b51c9bb6d1fb");
   halp_meta(
       manual_url,
@@ -41,7 +44,10 @@ public:
   {
     halp::fixed_texture_input<"In"> image;
     ModelPort model;
-    halp::lineedit<"Classes", ""> classes;
+    struct : halp::file_port<"Classes">
+    {
+      void update(YOLO7BlobDetector& self) { self.loadClasses(); }
+    } classes;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 640}>
         resolution;
   } inputs;
@@ -57,12 +63,15 @@ public:
     } detection;
   } outputs;
 
-  YOLOBlobDetector() noexcept;
-  ~YOLOBlobDetector();
+  YOLO7BlobDetector() noexcept;
+  ~YOLO7BlobDetector();
 
   void operator()();
 
+  void loadClasses();
+
 private:
   std::unique_ptr<Onnx::OnnxRunContext> ctx;
+  std::vector<std::string> classes;
 };
 }

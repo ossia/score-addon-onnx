@@ -3,16 +3,13 @@
 
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
+#include <Onnx/helpers/Utilities.hpp>
 
 namespace OnnxModels::Yolo
 {
 
 struct YOLO_blob
 {
-  QList<QByteArray> classes;
-
-  void loadClasses(QByteArray class_data) { classes = class_data.split('\n'); }
-
   struct blob_type
   {
     std::string name;
@@ -23,7 +20,8 @@ struct YOLO_blob
     float confidence{};
   };
 
-  void processOutput(
+  static void processOutput_v7(
+      std::span<std::string> classes,
       const Onnx::ModelSpec& spec,
       std::span<Ort::Value> outputTensor,
       std::vector<blob_type>& out,
@@ -32,8 +30,9 @@ struct YOLO_blob
       int image_w = 640,
       int image_h = 640,
       int model_w = 640,
-      int model_h = 640) const
+      int model_h = 640)
   {
+    // Note: made for https://github.com/WongKinYiu/yolov7
     out.clear();
     if (outputTensor.size() > 0)
     {
@@ -43,30 +42,36 @@ struct YOLO_blob
           = outputTensor.front().GetTensorTypeAndShapeInfo().GetElementCount();
       const int Nblobs = Nfloats / 7;
       const float* arr = outputTensor.front().GetTensorData<float>();
+      // If yolov8: https://github.com/ultralytics/ultralytics/issues/14131
+      //      boxes = output[..., :4]           scores = output[..., 4:5]          class_probs = output[..., 5:]
       for (int i = 0; i < Nblobs; i += 7)
       {
         const int class_type = static_cast<int>(arr[i + 5]);
         if (class_type < 0)
           continue;
+
         const float confidence = (arr[i + 0]);
         const float accuracy = (arr[i + 6]);
         const int original_cols = image_w;
         const int original_rows = image_h;
+        //  qDebug() << class_type;
 
         // clang-format off
-        const float x = arr[i + 1] / (float)model_w * original_cols;
-        const float y = arr[i + 2] / (float)model_h * original_rows;
+        const float x =  arr[i + 1]               / (float)model_w * (float)original_cols;
+        const float y =  arr[i + 2]               / (float)model_h * (float)original_rows;
         const float w = (arr[i + 3] - arr[i + 1]) / (float)model_w * (float)original_cols;
         const float h = (arr[i + 4] - arr[i + 2]) / (float)model_h * (float)original_rows;
         // clang-format on
 
-        std::string class_name = class_type < classes.size()
-                                     ? classes[class_type].toStdString()
-                                     : "unclassified";
-        out.push_back(blob_type{
-            .name = class_name,
-            .geometry = {.x = x, .y = y, .w = w, .h = h},
-            .confidence = confidence});
+        {
+          std::string class_name = class_type < classes.size()
+                                       ? classes[class_type]
+                                       : "unclassified";
+          out.push_back(blob_type{
+              .name = class_name,
+              .geometry = {.x = x, .y = y, .w = w, .h = h},
+              .confidence = confidence});
+        }
       }
     }
   }
@@ -75,10 +80,6 @@ struct YOLO_blob
 struct YOLO_pose
 {
   static constexpr int NUM_KPS = 17;
-  QList<QByteArray> classes;
-
-  void loadClasses(QByteArray class_data) { classes = class_data.split('\n'); }
-
   struct pose_data
   {
     struct rect

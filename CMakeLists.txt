@@ -56,7 +56,7 @@ avnd_score_plugin_add(
   TARGET
     yolo-blob
   MAIN_CLASS
-    YOLOBlobDetector
+    YOLO7BlobDetector
   NAMESPACE
     OnnxModels
 )

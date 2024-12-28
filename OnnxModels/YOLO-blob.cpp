@@ -1,5 +1,7 @@
 #include "YOLO-blob.hpp"
 
+#include <boost/algorithm/string.hpp>
+
 #include <QPainter>
 
 #include <Onnx/helpers/Images.hpp>
@@ -8,14 +10,21 @@
 namespace OnnxModels
 {
 
-YOLOBlobDetector::YOLOBlobDetector() noexcept
+YOLO7BlobDetector::YOLO7BlobDetector() noexcept
 {
   inputs.image.request_height = 640;
   inputs.image.request_width = 640;
 }
-YOLOBlobDetector::~YOLOBlobDetector() = default;
+YOLO7BlobDetector::~YOLO7BlobDetector() = default;
 
-void YOLOBlobDetector::operator()()
+void YOLO7BlobDetector::loadClasses()
+{
+  classes.clear();
+  boost::split(
+      classes, this->inputs.classes.file.bytes, boost::is_any_of("\n"));
+}
+
+void YOLO7BlobDetector::operator()()
 {
   auto& in_tex = inputs.image.texture;
   if (!in_tex.changed)
@@ -42,8 +51,8 @@ void YOLOBlobDetector::operator()()
   Ort::Value out_tt[1]{Ort::Value{nullptr}};
   ctx.infer(spec, tt, out_tt);
 
-  static const Yolo::YOLO_blob blob;
-  blob.processOutput(
+  Yolo::YOLO_blob::processOutput_v7(
+      classes,
       spec,
       out_tt,
       reinterpret_cast<std::vector<Yolo::YOLO_blob::blob_type>&>(

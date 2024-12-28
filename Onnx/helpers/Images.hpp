@@ -200,6 +200,14 @@ inline QImage drawRects(const unsigned char* input, int w, int h, auto& rects)
     {
       p.drawRect(
           rect.geometry.x, rect.geometry.y, rect.geometry.w, rect.geometry.h);
+      if constexpr (requires { rect.name; })
+      {
+        p.drawText(
+            rect.geometry.x,
+            rect.geometry.y,
+            QString::fromStdString(rect.name));
+      }
+
       if constexpr (requires { rect.keypoints; })
       {
         for (auto [i, x, y] : rect.keypoints)
