@@ -39,7 +39,7 @@ public:
   halp_meta(c_name, "trt_pose");
   halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "TRT authors, Onnxruntime, TensorRT");
-  halp_meta(description, "TRT pose recognizer using DNN.");
+  halp_meta(description, "Estimates human pose using a TRT model.");
   halp_meta(uuid, "18889004-3d30-4d19-b7ec-cfc6a00bb9d8");
   halp_meta(
       manual_url,

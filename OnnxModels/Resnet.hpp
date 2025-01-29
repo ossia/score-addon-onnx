@@ -29,7 +29,7 @@ public:
   halp_meta(c_name, "resnet");
   halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "Resnet authors, Onnxruntime");
-  halp_meta(description, "Resnet recognizer using DNN.");
+  halp_meta(description, "Resnet recognizer using a DNN model.");
   halp_meta(uuid, "9f4b7448-5bb5-4db6-8c96-57d53896208b");
   halp_meta(
       manual_url,

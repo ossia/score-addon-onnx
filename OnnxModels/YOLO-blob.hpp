@@ -31,10 +31,7 @@ public:
   halp_meta(c_name, "yolov7_blob");
   halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "YOLO authors, Kin-Yiu Wong, Onnxruntime");
-  halp_meta(
-      description,
-      "YOLOv7 blob recognizer using DNN.\nRequires ONNX model from "
-      "https://github.com/WongKinYiu/yolov7");
+  halp_meta(description, "Identifies objects using a YOLOv7 blob model.");
   halp_meta(uuid, "3303df15-5774-4abc-b636-b51c9bb6d1fb");
   halp_meta(
       manual_url,
