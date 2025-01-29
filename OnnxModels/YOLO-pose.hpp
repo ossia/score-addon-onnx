@@ -38,7 +38,7 @@ public:
   halp_meta(c_name, "yolov8_pose");
   halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "YOLOv8 authors, Onnxruntime, TensorRT");
-  halp_meta(description, "YOLO pose recognizer using DNN.");
+  halp_meta(description, "Estimates human pose using a YOLO-based DNN model.");
   halp_meta(uuid, "942d0486-c4d1-482c-bc80-81f6b2949037");
   halp_meta(
       manual_url,
