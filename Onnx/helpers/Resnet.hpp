@@ -9,11 +9,13 @@ struct Resnet
 {
   // Output format: 1000 float values representing the Imagenet classes.
   QList<QByteArray> classes;
-  Resnet()
+  Resnet() { }
+
+  void loadClasses(std::string_view filePath)
   {
-    QFile f("/opt/models/imagenet_classes.txt");
-    f.open(QIODevice::ReadOnly);
-    classes = f.readAll().split('\n');
+    QFile f(QString::fromUtf8(filePath.data(), filePath.size()));
+    if (f.open(QIODevice::ReadOnly))
+      classes = f.readAll().split('\n');
   }
 
   struct recognition_type
@@ -27,6 +29,12 @@ struct Resnet
       std::span<Ort::Value> output_tensors,
       std::vector<recognition_type>& out) const
   {
+    if (classes.empty())
+    {
+      [[unlikely]];
+      return;
+    }
+
     for (const Ort::Value& ot : output_tensors)
     {
       const int N = ot.GetTensorTypeAndShapeInfo().GetElementCount();
@@ -47,9 +55,12 @@ struct Resnet
       for (int i = 0; i < 5; i++)
       {
         int the_class = idx[i];
-        float value = recog[the_class];
+        if (the_class >= 0 && the_class < classes.size())
+        {
+          float value = recog[the_class];
 
-        out.push_back({classes[the_class].toStdString(), value});
+          out.push_back({classes[the_class].toStdString(), value});
+        }
       }
     }
   }

@@ -42,9 +42,8 @@ void ResnetDetector::operator()()
   Ort::Value out_tt[1]{Ort::Value{nullptr}};
   ctx.infer(spec, tt, out_tt);
 
-  static const Resnet r;
   outputs.detection.value.clear();
-  r.processOutput(
+  resnet.processOutput(
       spec,
       out_tt,
       reinterpret_cast<std::vector<OnnxModels::Resnet::recognition_type>&>(

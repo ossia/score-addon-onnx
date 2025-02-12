@@ -1,6 +1,6 @@
 #pragma once
 #include <OnnxModels/Utils.hpp>
-
+#include <Onnx/helpers/Resnet.hpp>
 #include <cmath>
 #include <halp/controls.hpp>
 #include <halp/geometry.hpp>
@@ -39,7 +39,13 @@ public:
   {
     halp::fixed_texture_input<"In"> image;
     ModelPort model;
-    halp::lineedit<"Classes", ""> classes;
+    struct : halp::lineedit<"Classes", "">
+    {
+      void update(ResnetDetector& self)
+      {
+        self.resnet.loadClasses(this->value);
+      }
+    } classes;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 224}>
         resolution;
   } inputs;
@@ -62,5 +68,7 @@ public:
 
 private:
   std::unique_ptr<Onnx::OnnxRunContext> ctx;
+
+  Resnet resnet;
 };
 }
