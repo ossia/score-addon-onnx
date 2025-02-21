@@ -37,6 +37,7 @@ struct DetectedRTMPose
   halp_field_names(keypoints);
 };
 
+// detector class
 struct RTMPoseDetector
 {
 public:
@@ -45,9 +46,7 @@ public:
   halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "RTMPose authors, Onnxruntime");
   halp_meta(description, "RTMPose recognizer using DNN.");
-  halp_meta(
-      uuid,
-      "00000000-0000-0000-0000-000000000000"); // TODO: Replace with a unique UUID
+  halp_meta(uuid, "676202f7-1a6c-4bde-a389-f36835a14d7c");
   halp_meta(
       manual_url,
       "https://ossia.io/score-docs/processes/ai-recognition.html#rtmpose");
