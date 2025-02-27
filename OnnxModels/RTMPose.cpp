@@ -37,10 +37,9 @@ void RTMPoseDetector::operator()()
   auto t = tensorFromARGB(
       spec.inputs[0], in_tex.bytes, in_tex.width, in_tex.height, 192, 256);
 
-  auto t = Onnx::tensorFromARGB(
-      spec.inputs[0], in_tex.bytes, in_tex.width, in_tex.height, 256, 192);
   Ort::Value tensor_inputs[1] = {std::move(t.value)};
 
+  // Prepare two output tensors (simcc_x and simcc_y).
   Ort::Value tensor_outputs[2]{Ort::Value{nullptr}, Ort::Value{nullptr}};
 
   // run inference
@@ -52,12 +51,29 @@ void RTMPoseDetector::operator()()
   outputs.image.create(in_tex.width, in_tex.height);
   outputs.image.texture.changed = true;
 
-  //get_simcc_maximum(simcc_x, simcc_y)
+  std::optional<RTMPose::RTMPose_fullbody::pose_data> out;
 
-  //draw on img
-  for (auto b = outputs.image.texture.bytes;
-       b != outputs.image.texture.bytes + outputs.image.texture.bytesize();
-       b++)
-    *b = rand();
+  //call decode() and pass it the tensor_output[]
+  RTMPose::RTMPose_fullbody::decode(
+      std::span<Ort::Value>(tensor_outputs, 2), out);
+
+  if (out)
+  {
+    // static_assert(sizeof(*out) == sizeof(*outputs.detection.value));
+    outputs.detection.value.emplace();
+    memcpy((void*)&*outputs.detection.value, (void*)&*out, sizeof(*out));
+
+    auto img = Onnx::drawKeypoints(
+        in_tex.bytes, in_tex.width, in_tex.height, 0.5, out->keypoints);
+
+    outputs.image.create(in_tex.width, in_tex.height);
+    memcpy(
+        outputs.image.texture.bytes,
+        img.constBits(),
+        in_tex.width * in_tex.height * 4);
+
+    outputs.image.texture.changed = true;
+  }
 }
+
 }
