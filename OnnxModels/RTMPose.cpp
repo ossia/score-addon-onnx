@@ -34,6 +34,8 @@ void RTMPoseDetector::operator()()
   auto spec = ctx.readModelSpec();
 
   // create input tensor from image
+  auto t = tensorFromARGB(
+      spec.inputs[0], in_tex.bytes, in_tex.width, in_tex.height, 192, 256);
 
   auto t = Onnx::tensorFromARGB(
       spec.inputs[0], in_tex.bytes, in_tex.width, in_tex.height, 256, 192);
@@ -43,6 +45,8 @@ void RTMPoseDetector::operator()()
 
   // run inference
   ctx.infer(spec, tensor_inputs, tensor_outputs);
+
+  static const RTMPose::RTMPose_fullbody pose;
 
   // process output to obtain keypoints
   outputs.image.create(in_tex.width, in_tex.height);
