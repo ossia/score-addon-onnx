@@ -32,7 +32,7 @@ static_assert(sizeof(Keypoint) == 5 * sizeof(float));
 
 struct DetectedRTMPose
 {
-  std::array<Keypoint, 39> keypoints;
+  std::array<Keypoint, 26> keypoints;
 
   halp_field_names(keypoints);
 };
