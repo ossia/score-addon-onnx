@@ -103,6 +103,20 @@ avnd_score_plugin_add(
     OnnxModels
 )
 
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/RTMPose.hpp
+    OnnxModels/RTMPose.cpp
+  TARGET
+    rtmpose
+  MAIN_CLASS
+    RTMPoseDetector
+  NAMESPACE
+    OnnxModels
+)
+
 # target_link_libraries(score_addon_onnx_models PRIVATE score_addon_onnx)
 avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
                            PLUGIN_UUID "24a98f5b-700f-401c-ab89-8c1173bda73f")

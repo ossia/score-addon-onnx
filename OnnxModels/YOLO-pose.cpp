@@ -27,7 +27,7 @@ void PoseDetector::operator()()
   }
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
-  auto t = tensorFromRGBA(
+  auto t = tensorFromRGBA( // TODO rename the function nchw_rgb_tensorFromFGBA
       spec.inputs[0],
       in_tex.bytes,
       in_tex.width,
