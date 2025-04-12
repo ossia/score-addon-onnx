@@ -29,7 +29,7 @@ if(OSSIA_USE_SYSTEM_LIBRARIES)
   return()
 endif()
 # URLs of the latest release
-set(ONNXRUNTIME_VERSION "1.20.1")
+set(ONNXRUNTIME_VERSION "1.21.0")
 if(WIN32)
   set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-win-x64-gpu-${ONNXRUNTIME_VERSION}.zip")
 elseif(APPLE)
