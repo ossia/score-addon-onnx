@@ -131,11 +131,20 @@ try
   {
     using namespace Ort;
 
-    uint32_t coreml_flags = 0;
-    Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CoreML(
-        session_options, coreml_flags));
+    std::unordered_map<std::string, std::string> options;
+
+    // Note: https://github.com/apple/coremltools/issues/2301
+    // options["ModelFormat"] = std::string("MLProgram");
+    options["MLComputeUnits"] = "ALL";
+    options["RequireStaticInputShapes"] = "0";
+    options["EnableOnSubgraphs"] = "1";
+    session_options.AppendExecutionProvider("CoreML", options);
   }
 #endif
+
+  // FIXME RKNPU
+  // FIXME ARMNN, etc.
+
   return session_options;
 }
 catch(const std::exception& e)
