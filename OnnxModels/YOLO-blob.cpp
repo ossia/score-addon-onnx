@@ -19,6 +19,9 @@ YOLO7BlobDetector::~YOLO7BlobDetector() = default;
 
 void YOLO7BlobDetector::loadClasses()
 {
+  if (!available)
+    return;
+
   classes.clear();
   boost::split(
       classes, this->inputs.classes.file.bytes, boost::is_any_of("\n"));

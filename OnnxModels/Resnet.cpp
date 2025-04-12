@@ -17,6 +17,9 @@ ResnetDetector::~ResnetDetector() = default;
 
 void ResnetDetector::operator()()
 {
+  if (!available)
+    return;
+
   auto& in_tex = inputs.image.texture;
   if (!in_tex.changed)
     return;
@@ -55,5 +58,4 @@ void ResnetDetector::operator()()
          .height = in_tex.height,
          .changed = true};
 }
-
 }

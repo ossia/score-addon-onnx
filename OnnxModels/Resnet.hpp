@@ -22,7 +22,7 @@ struct DetectedElement
   halp_field_names(name, probability);
 };
 
-struct ResnetDetector
+struct ResnetDetector : OnnxObject
 {
 public:
   halp_meta(name, "Resnet detector");

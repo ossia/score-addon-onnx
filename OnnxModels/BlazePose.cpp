@@ -15,6 +15,9 @@ BlazePoseDetector::~BlazePoseDetector() = default;
 
 void BlazePoseDetector::operator()()
 {
+  if (!available)
+    return;
+
   auto& in_tex = inputs.image.texture;
 
   if (!in_tex.changed)

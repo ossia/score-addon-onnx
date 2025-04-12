@@ -24,7 +24,7 @@ struct DetectedYoloBlob
   halp_field_names(name, geometry, probability);
 };
 
-struct YOLO7BlobDetector
+struct YOLO7BlobDetector : OnnxObject
 {
 public:
   halp_meta(name, "YOLOv7 Blob");

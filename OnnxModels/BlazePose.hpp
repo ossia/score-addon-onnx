@@ -35,7 +35,7 @@ struct DetectedBlazePose
   halp_field_names(keypoints);
 };
 
-struct BlazePoseDetector
+struct BlazePoseDetector : OnnxObject
 {
 public:
   halp_meta(name, "Blaze Pose");

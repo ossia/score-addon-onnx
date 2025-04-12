@@ -15,6 +15,9 @@ TRTPoseDetector::~TRTPoseDetector() = default;
 
 void TRTPoseDetector::operator()()
 {
+  if (!available)
+    return;
+
   auto& in_tex = inputs.image.texture;
 
   if (!in_tex.changed)
@@ -61,5 +64,4 @@ void TRTPoseDetector::operator()()
       in_tex.width * in_tex.height * 4);
   outputs.image.texture.changed = true;
 }
-
 }

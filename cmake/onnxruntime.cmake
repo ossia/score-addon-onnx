@@ -110,6 +110,7 @@ else()
   endforeach()
 endif()
 
+target_compile_definitions(onnxruntime INTERFACE ORT_API_MANUAL_INIT=1)
 target_include_directories(onnxruntime INTERFACE "${onnxruntime_INCLUDE_DIRS}")
 
 # Good practice: using an alias with :: in the name ensure that

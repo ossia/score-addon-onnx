@@ -31,7 +31,7 @@ struct DetectedYoloPose
 
   halp_field_names(name, geometry, probability, keypoints);
 };
-struct PoseDetector
+struct PoseDetector : OnnxObject
 {
 public:
   halp_meta(name, "YOLO Pose");

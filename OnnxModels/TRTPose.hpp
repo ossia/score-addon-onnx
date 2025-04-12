@@ -32,7 +32,7 @@ struct DetectedTRTPose
   halp_field_names(name, geometry, probability, keypoints);
 };
 
-struct TRTPoseDetector
+struct TRTPoseDetector : OnnxObject
 {
 public:
   halp_meta(name, "TRT Pose");
