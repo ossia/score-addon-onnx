@@ -37,6 +37,7 @@ void PoseDetector::operator()()
       in_tex.height,
       640,
       640,
+      storage,
       false);
   Ort::Value tt[1] = {std::move(t.value)};
 
@@ -63,5 +64,6 @@ void PoseDetector::operator()()
       img.constBits(),
       in_tex.width * in_tex.height * 4);
   outputs.image.texture.changed = true;
+  std::swap(storage, t.storage);
 }
 }

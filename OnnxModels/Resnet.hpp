@@ -70,5 +70,6 @@ private:
   std::unique_ptr<Onnx::OnnxRunContext> ctx;
 
   Resnet resnet;
+  boost::container::vector<float> storage;
 };
 }

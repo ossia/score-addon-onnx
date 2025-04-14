@@ -47,6 +47,7 @@ void YOLO7BlobDetector::operator()()
       in_tex.height,
       this->inputs.resolution.value.x,
       this->inputs.resolution.value.y,
+      storage,
       false);
   Ort::Value tt[1] = {std::move(t.value)};
 
@@ -72,6 +73,7 @@ void YOLO7BlobDetector::operator()()
       img.constBits(),
       in_tex.width * in_tex.height * 4);
   outputs.image.texture.changed = true;
+  std::swap(storage, t.storage);
 }
 
 }

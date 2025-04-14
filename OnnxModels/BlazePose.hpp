@@ -77,5 +77,6 @@ public:
 
 private:
   std::unique_ptr<Onnx::OnnxRunContext> ctx;
+  boost::container::vector<float> storage;
 };
 }

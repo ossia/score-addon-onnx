@@ -38,6 +38,7 @@ void ResnetDetector::operator()()
       in_tex.height,
       this->inputs.resolution.value.x,
       this->inputs.resolution.value.y,
+      storage,
       true);
   Ort::Value tt[1] = {std::move(t.value)};
 
@@ -57,5 +58,6 @@ void ResnetDetector::operator()()
          .width = in_tex.width,
          .height = in_tex.height,
          .changed = true};
+  std::swap(storage, t.storage);
 }
 }

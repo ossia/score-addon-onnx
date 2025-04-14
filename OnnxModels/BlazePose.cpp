@@ -1,5 +1,8 @@
 #include "BlazePose.hpp"
 
+#include <QApplication>
+#include <QImage>
+
 #include <Onnx/helpers/BlazePose.hpp>
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
@@ -31,7 +34,13 @@ void BlazePoseDetector::operator()()
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
   auto t = nhwc_rgb_tensorFromRGBA(
-      spec.inputs[0], in_tex.bytes, in_tex.width, in_tex.height, 256, 256);
+      spec.inputs[0],
+      in_tex.bytes,
+      in_tex.width,
+      in_tex.height,
+      256,
+      256,
+      storage);
   Ort::Value tensor_inputs[1] = {std::move(t.value)};
 
   assert(
@@ -70,6 +79,7 @@ void BlazePoseDetector::operator()()
         img.constBits(),
         in_tex.width * in_tex.height * 4);
     outputs.image.texture.changed = true;
+    std::swap(storage, t.storage);
   }
 }
 

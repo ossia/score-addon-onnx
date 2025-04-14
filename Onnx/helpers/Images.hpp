@@ -1,4 +1,6 @@
 #pragma once
+#include <boost/container/vector.hpp>
+
 #include <QDebug>
 #include <QImage>
 #include <QPainter>
@@ -15,7 +17,7 @@ namespace Onnx
 
 struct FloatTensor
 {
-  std::vector<float> storage;
+  boost::container::vector<float> storage;
   Ort::Value value;
 };
 
@@ -26,6 +28,7 @@ inline FloatTensor tensorFromARGB(
     int source_h,
     int model_w,
     int model_h,
+    boost::container::vector<float>& input_tensor_values,
     bool normalize_resnet = false)
 {
   auto& input_shape = port.shape;
@@ -38,11 +41,11 @@ inline FloatTensor tensorFromARGB(
   if (model_w != img.width() || model_h != img.width())
     img = img.copy(0, 0, model_w, model_h);
   img = img.rgbSwapped();
-  img = img.mirrored();
   img = img.convertToFormat(QImage::Format_RGB888);
 
   // FIXME pass storage as input instead
-  std::vector<float> input_tensor_values(3 * model_w * model_h);
+  input_tensor_values.resize(
+      3 * model_w * model_h, boost::container::default_init);
 
   auto ptr = (unsigned char*)img.constBits();
   auto dst = input_tensor_values.data();
@@ -91,6 +94,7 @@ inline FloatTensor tensorFromRGBA(
     int source_h,
     int model_w,
     int model_h,
+    boost::container::vector<float>& input_tensor_values,
     bool normalize_resnet = false)
 {
   auto& input_shape = port.shape;
@@ -103,11 +107,11 @@ inline FloatTensor tensorFromRGBA(
       Qt::SmoothTransformation);
   if (model_w != img.width() || model_h != img.width())
     img = img.copy(0, 0, model_w, model_h);
-  img = img.mirrored();
   img = img.convertToFormat(QImage::Format_RGB888);
 
   // FIXME pass storage as input instead
-  std::vector<float> input_tensor_values(3 * model_w * model_h);
+  input_tensor_values.resize(
+      3 * model_w * model_h, boost::container::default_init);
 
   auto ptr = (unsigned char*)img.constBits();
   auto dst = input_tensor_values.data();
@@ -155,7 +159,8 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
     int source_w,
     int source_h,
     int model_w,
-    int model_h)
+    int model_h,
+    boost::container::vector<float>& input_tensor_values)
 {
   auto& input_shape = port.shape;
   QImage img
@@ -167,18 +172,23 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
       Qt::SmoothTransformation);
   if (model_w != img.width() || model_h != img.width())
     img = img.copy(0, 0, model_w, model_h);
-  img = img.mirrored();
-  img = img.convertToFormat(QImage::Format_RGB888);
 
   // FIXME pass storage as input instead
-  std::vector<float> input_tensor_values(3 * model_w * model_h);
+  input_tensor_values.resize(
+      3 * model_w * model_h, boost::container::default_init);
 
   auto ptr = (unsigned char*)img.constBits();
   auto dst = input_tensor_values.data();
-  for (int i = 0; i < 3 * model_w * model_h; i++)
+  for (int src_i = 0, dst_i = 0; src_i < 3 * model_w * model_h;)
   {
-    dst[i] = ptr[i] / 255.f;
+    dst[dst_i] = ptr[src_i] / 255.f;
+    dst[dst_i + 1] = ptr[src_i + 1] / 255.f;
+    dst[dst_i + 2] = ptr[src_i + 2] / 255.f;
+
+    src_i += 4;
+    dst_i += 3;
   }
+
   FloatTensor f{
       .storage = {},
       .value = vec_to_tensor<float>(input_tensor_values, input_shape)};
@@ -192,8 +202,6 @@ inline QImage drawRects(const unsigned char* input, int w, int h, auto& rects)
 
   {
     QPainter p(&img);
-    p.translate(0, h);
-    p.scale(1., -1.);
     p.setPen(QPen(Qt::white, 4));
     p.setBrush(Qt::NoBrush);
     for (const auto& rect : rects)
@@ -231,8 +239,6 @@ inline QImage drawKeypoints(
 
   {
     QPainter p(&img);
-    p.translate(0, h);
-    p.scale(1., -1.);
     p.setPen(QPen(Qt::white, 4));
     p.setBrush(Qt::NoBrush);
     for (const auto& kp : keypoints)

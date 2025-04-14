@@ -70,5 +70,6 @@ public:
 private:
   std::unique_ptr<Onnx::OnnxRunContext> ctx;
   std::vector<std::string> classes;
+  boost::container::vector<float> storage;
 };
 }

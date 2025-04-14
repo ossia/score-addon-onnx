@@ -1,4 +1,5 @@
 #pragma once
+
 #include <Onnx/helpers/OnnxBase.hpp>
 
 #include <array>
@@ -47,7 +48,7 @@ void nhwc_to_nchw(
 
 template <typename T>
 Ort::Value
-vec_to_tensor(std::vector<T>& data, const std::vector<std::int64_t>& shape)
+vec_to_tensor(std::span<T> data, const std::vector<std::int64_t>& shape)
 {
   Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
       OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
