@@ -28,6 +28,12 @@ if(OSSIA_USE_SYSTEM_LIBRARIES)
   )
   return()
 endif()
+
+# Not found through package manager, let's look it up manually
+if(FETCHCONTENT_FULLY_DISCONNECTED)
+  return()
+endif()
+
 # URLs of the latest release
 set(ONNXRUNTIME_VERSION "1.21.0")
 if(WIN32)
