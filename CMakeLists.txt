@@ -18,6 +18,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
 if(NOT TARGET onnxruntime::onnxruntime)
   return()
 endif()
+
+add_subdirectory("${OSSIA_3RDPARTY_FOLDER}/pybind11" pybind11)
 # General initialization
 score_common_setup()
 
@@ -79,6 +81,19 @@ avnd_score_plugin_add(
     OnnxModels
 )
 
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    PythonModels/StreamDiffusion.hpp
+    PythonModels/StreamDiffusion.cpp
+  TARGET
+    streamdiffusion_img2img
+  MAIN_CLASS
+    StreamDiffusionImg2Img
+  NAMESPACE
+    PythonModels
+)
 avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
                            PLUGIN_UUID "24a98f5b-700f-401c-ab89-8c1173bda73f")
 
@@ -86,5 +101,6 @@ avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
 target_link_libraries(score_addon_onnx_models
     PUBLIC
       $<COMPILE_ONLY:onnxruntime::onnxruntime>
+      pybind11::pybind11 pybind11::embed
  )
 
