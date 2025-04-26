@@ -2,6 +2,25 @@
 
 #include <Onnx/helpers/Images.hpp>
 #include <pybind11/numpy.h>
+// // clang-format off
+// #include <c10/util/Exception.h>
+// #include <torch/csrc/autograd/python_variable.h>
+// #include <torch/torch.h>
+// // clang-format on
+// namespace c10::detail
+// {
+// void c10::detail::torchCheckFail(
+//     char const*,
+//     char const*,
+//     unsigned int,
+//     const std::string&)
+// {
+//   throw std::runtime_error("oh noes");
+// }
+//
+// }
+
+// OMP_NUM_THREADS=1
 namespace PythonModels
 {
 static auto& interp()
@@ -38,6 +57,68 @@ StreamDiffusionImg2Img::StreamDiffusionImg2Img() noexcept
 
 StreamDiffusionImg2Img::~StreamDiffusionImg2Img() { }
 
+void tensor_to_image(py::object tens)
+{
+#if 0
+  // Inference
+  py::object pytensor = py::eval(
+      "postprocess_image("
+      "  image=stream(input_image),"
+      "  output_type='pt'"
+      ")[0]",
+      py::globals(),
+      locals);
+
+  auto& image_tensor = THPVariable_Unpack(pytensor.ptr());
+  /*
+  TORCH_CHECK(image_tensor.dim() == 3, "Expected a 3D tensor");
+  TORCH_CHECK(image_tensor.size(0) == 3, "Expected tensor shape [3, H, W]");
+  TORCH_CHECK(
+      image_tensor.dtype() == torch::kUInt8, "Expected tensor dtype uint8");
+*/
+  at::Tensor contiguous_tensor
+      = image_tensor
+            .to(torch::kFloat32) // Convert to float32
+            .mul(255.0)          // Scale from [0,1] to [0,255]
+            .clamp(0, 255)       // Clamp values to valid byte range
+            .contiguous();       // Ensure memory layout is contiguous
+
+  auto content = contiguous_tensor.accessor<float, 3>();
+  const int ocol = contiguous_tensor.size(0);
+  const int oheight = contiguous_tensor.size(1);
+  const int owidth = contiguous_tensor.size(2);
+  SCORE_ASSERT(oheight == 512);
+  SCORE_ASSERT(owidth == 512);
+  SCORE_ASSERT(ocol == 3);
+  qDebug("A");
+  qDebug() << content[0][0][0];
+  qDebug("B");
+  //   std::string mode = image.attr("mode").cast<std::string>();
+  //   if (mode != "RGB")
+  //     return;
+
+  // Get our image back
+  //py::bytes raw_bytes = image.attr("tobytes")();
+
+  outputs.image.create(width, height);
+  float* p_i = content.data();
+
+  auto* p_o = outputs.image.texture.bytes;
+  for (int z = 0; z < height * width; ++z)
+  {
+    {
+      qDebug("X");
+      p_o[0] = content[0][0][0]; //p_i[0];
+      qDebug("X1");
+      p_o[1] = 0; //p_i[1];
+      p_o[2] = 0; //p_i[2];
+      p_o[3] = 255;
+      p_o += 4;
+      p_i += 3;
+    }
+  }
+#endif
+}
 void StreamDiffusionImg2Img::operator()()
 {
   static constexpr auto width = 512;
@@ -87,31 +168,45 @@ void StreamDiffusionImg2Img::operator()()
         fmt::format(
             R"(
 #Warmup >= len(t_index_list) x frame_buffer_size
-for _ in range(2):
+for _ in range(10):
     stream(input_image)
-)"),
+)",
+            inputs.tcount.value),
         py::globals(),
         locals);
     m_needsTrain = false;
   }
 
   // Inference
-  py::object image = py::eval(
-      "postprocess_image(stream(input_image))[0]", py::globals(), locals);
-  std::string mode = image.attr("mode").cast<std::string>();
-  if (mode != "RGB")
-    return;
+  py::bytes raw_bytes = py::eval(
+      "postprocess_image(stream(input_image))[0].tobytes()",
+      py::globals(),
+      locals);
 
+  /*
+  auto r = x.unchecked<3>();
+  auto p_i = r.data(0, 0, 0);
+
+  outputs.image.create(width, height);
+  auto* p_o = outputs.image.texture.bytes;
+  for (int pix = 0; pix < height * width; ++pix)
+  {
+    p_o[0] = p_i[0] * 255.f;
+    p_o[1] = p_i[1] * 255.f;
+    p_o[2] = p_i[2] * 255.f;
+    p_o[3] = 255;
+    p_i += 3;
+    p_o += 4;
+}
+*/
   // Get our image back
-  py::bytes raw_bytes = image.attr("tobytes")();
   std::string_view content{raw_bytes};
+  if (content.size() < width * height * 3)
+    return;
 
   outputs.image.create(width, height);
   auto* p_i = content.data();
   auto* p_o = outputs.image.texture.bytes;
-  if (content.size() < width * height * 3)
-    return;
-
   for (int pix = 0; pix < width * height; pix++)
   {
     p_o[0] = p_i[0];
@@ -145,12 +240,24 @@ void StreamDiffusionImg2Img::create()
   m_created = false;
   try
   {
+    std::string count;
+    count += std::to_string(inputs.t1.value);
+    if (inputs.tcount.value > 1)
+    {
+      count += ",";
+      count += std::to_string(inputs.t2.value);
+    }
+    if (inputs.tcount.value > 2)
+    {
+      count += ",";
+      count += std::to_string(inputs.t3.value);
+    }
     py::exec(fmt::format(
         R"(# Wrap the pipeline in StreamDiffusion
 stream = None
 stream = StreamDiffusion(
     pipe,
-    t_index_list=[ {}, {} ],
+    t_index_list=[ {} ],
     torch_dtype=torch.float16,
     cfg_type="self",
 )
@@ -160,18 +267,18 @@ stream = StreamDiffusion(
 # stream.pipe.set_adapters(["lcm", "qsdfqsdf"], adapter_weights=[1.0, 1.0])
 
 stream.load_lcm_lora("{}")
-stream.fuse_lora(True, True, 10.0, False)
+stream.fuse_lora(True, True, 1.0, False)
 
 stream.vae = AutoencoderTiny.from_pretrained("{}").to(device=pipe.device, dtype=pipe.dtype)
 
 stream = accelerate_with_tensorrt(
-    stream, "engines", max_batch_size=2,
+    stream, "engines", max_batch_size={},
 )
 )",
-        inputs.t1.value,
-        inputs.t2.value,
+        count,
         inputs.lcm.value,
-        inputs.vae.value));
+        inputs.vae.value,
+        inputs.tcount.value));
     m_needsCreate = false;
     m_created = true;
   }

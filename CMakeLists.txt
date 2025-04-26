@@ -102,5 +102,15 @@ target_link_libraries(score_addon_onnx_models
     PUBLIC
       $<COMPILE_ONLY:onnxruntime::onnxruntime>
       pybind11::pybind11 pybind11::embed
+      /home/jcelerier/projets/oss/StreamDiffusion-uv/.venv/lib/python3.12/site-packages/torch/lib/libtorch.so
+      /home/jcelerier/projets/oss/StreamDiffusion-uv/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so
+      /home/jcelerier/projets/oss/StreamDiffusion-uv/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so
+      /home/jcelerier/projets/oss/StreamDiffusion-uv/.venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so
+      /home/jcelerier/projets/oss/StreamDiffusion-uv/.venv/lib/python3.12/site-packages/torch/lib/libc10.so
  )
+target_include_directories(score_addon_onnx_models
+    PRIVATE
+    "/home/jcelerier/projets/oss//StreamDiffusion-uv/.venv/lib/python3.12/site-packages/torch/include/"
+    "/home/jcelerier/projets/oss//StreamDiffusion-uv/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include"
+)
 

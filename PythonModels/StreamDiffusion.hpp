@@ -72,7 +72,7 @@ public:
     {
       void update(StreamDiffusionImg2Img& self) { self.m_needsPrepare = true; }
     } guidance;
-    struct : halp::spinbox_i32<"T1", halp::range{1, 50, 15}>
+    struct : halp::spinbox_i32<"T1", halp::range{0, 50, 15}>
     {
       void update(StreamDiffusionImg2Img& self)
       {
@@ -90,12 +90,29 @@ public:
         self.m_needsPrepare = true;
       }
     } t2;
+    struct : halp::spinbox_i32<"T3", halp::range{1, 50, 45}>
+    {
+      void update(StreamDiffusionImg2Img& self)
+      {
+        self.m_needsModel = true;
+        self.m_needsCreate = true;
+        self.m_needsPrepare = true;
+      }
+    } t3;
+    struct : halp::spinbox_i32<"T count", halp::range{1, 3, 1}>
+    {
+      void update(StreamDiffusionImg2Img& self)
+      {
+        self.m_needsModel = true;
+        self.m_needsCreate = true;
+        self.m_needsPrepare = true;
+      }
+    } tcount;
   } inputs;
 
   struct
   {
     halp::texture_output<"Out"> image;
-
   } outputs;
 
   StreamDiffusionImg2Img() noexcept;
