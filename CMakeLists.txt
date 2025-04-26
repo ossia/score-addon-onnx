@@ -85,8 +85,8 @@ avnd_score_plugin_add(
   BASE_TARGET
     score_addon_onnx_models
   SOURCES
-    PythonModels/StreamDiffusion.hpp
-    PythonModels/StreamDiffusion.cpp
+    PythonModels/StreamDiffusion_img2img.hpp
+    PythonModels/StreamDiffusion_img2img.cpp
     PythonModels/StreamDiffusionWrapper.hpp
     PythonModels/StreamDiffusionWrapper.cpp
   TARGET
@@ -96,6 +96,23 @@ avnd_score_plugin_add(
   NAMESPACE
     PythonModels
 )
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    PythonModels/StreamDiffusion_txt2img.hpp
+    PythonModels/StreamDiffusion_txt2img.cpp
+    PythonModels/StreamDiffusionWrapper.hpp
+    PythonModels/StreamDiffusionWrapper.cpp
+  TARGET
+    streamdiffusion_txt2img
+  MAIN_CLASS
+    StreamDiffusionTxt2Img
+  NAMESPACE
+    PythonModels
+)
+
 avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
                            PLUGIN_UUID "24a98f5b-700f-401c-ab89-8c1173bda73f")
 

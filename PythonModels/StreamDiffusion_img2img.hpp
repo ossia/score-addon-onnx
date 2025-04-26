@@ -65,7 +65,7 @@ public:
         self.m_wrapper.set_seed(value);
       }
     } seed;
-    struct : halp::spinbox_i32<"Steps", halp::range{1, 100, 50}>
+    struct : halp::spinbox_i32<"Steps", halp::range{1, 50, 50}>
     {
       void update(StreamDiffusionImg2Img& self)
       {
@@ -138,6 +138,31 @@ public:
         self.m_wrapper.set_size(value.x, value.y);
       }
     } size;
+    struct : halp::lineedit<"Cfg", "self">
+    {
+      halp_meta(description, "none, self, full, initialize.") void update(
+          StreamDiffusionImg2Img& self)
+      {
+        self.m_wrapper.set_cfg(value);
+      }
+    } cfg;
+
+    struct : halp::toggle<"Add noise">
+    {
+      void update(StreamDiffusionImg2Img& self)
+      {
+        self.m_wrapper.set_add_noise(value);
+      }
+    } add_noise;
+    struct : halp::toggle<"Denoising batch">
+    {
+      void update(StreamDiffusionImg2Img& self)
+      {
+        self.m_wrapper.set_denoising_batch(value);
+      }
+    } denoise_batch;
+    halp::toggle<"Manual mode"> manual;
+    halp::val_port<"Manual trigger", std::optional<halp::impulse>> trigger;
     // TODO feed % last output, feed % last input
   } inputs;
 

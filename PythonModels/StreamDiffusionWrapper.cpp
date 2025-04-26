@@ -16,13 +16,15 @@ int python_interpreter_global_instance()
   return 1;
 }
 
-StreamDiffusionWrapper::StreamDiffusionWrapper()
+StreamDiffusionWrapper::StreamDiffusionWrapper() { }
+
+int StreamDiffusionWrapper::init()
 {
   static int guard = python_interpreter_global_instance();
   static int path = setup_path();
   static int imports = setup_imports();
+  return 1;
 }
-
 int StreamDiffusionWrapper::setup_path()
 {
 
@@ -88,6 +90,7 @@ void StreamDiffusionWrapper::create()
     return;
   try
   {
+    using namespace std::literals;
     std::string count;
     count += std::to_string(m_temps[0]);
     if (m_temps.size() > 1)
@@ -105,37 +108,39 @@ void StreamDiffusionWrapper::create()
 stream = None
 stream = StreamDiffusion(
     pipe,
-    t_index_list=[ {} ],
+    t_index_list=[ {0} ],
     torch_dtype=torch.float16,
-    cfg_type="self",
-    width={},
-    height={}
+    cfg_type="{1}",
+    do_add_noise={2},
+    width={3},
+    height={4},
+    use_denoising_batch={8}
 )
 
 # TODO:
 # stream.load_lora("/home/jcelerier/projets/oss/StreamDiffusion/models/LoRA/pixels.safetensors", adapter_name='qsdfqsdf')
 # stream.pipe.set_adapters(["lcm", "qsdfqsdf"], adapter_weights=[1.0, 1.0])
 
-stream.load_lcm_lora("{}")
-stream.fuse_lora(True, True, 1.0, False)
+if (len("{5}") > 0):
+  stream.load_lcm_lora("{5}")
+  stream.fuse_lora(True, True, 1.0, False)
 
-stream.vae = AutoencoderTiny.from_pretrained("{}").to(device=pipe.device, dtype=pipe.dtype)
+stream.vae = AutoencoderTiny.from_pretrained("{6}").to(device=pipe.device, dtype=pipe.dtype)
 
-resolutiondict = {{'engine_build_options' : {{ 'opt_image_width': {}, 'opt_image_height': {} }} }}
+resolutiondict = {{'engine_build_options' : {{ 'opt_image_width': {3}, 'opt_image_height': {4} }} }}
 stream = accelerate_with_tensorrt(
-    stream, "engines_{}_{}", max_batch_size={},engine_build_options=resolutiondict
+    stream, "engines_{3}_{4}", max_batch_size={7},engine_build_options=resolutiondict
 )
 )",
         count,
+        m_cfg,
+        m_add_noise ? "True"sv : "False"sv,
         m_width,
         m_height,
         m_lcm,
         m_vae,
-        m_width,
-        m_height,
-        m_width,
-        m_height,
-        m_temps.size()));
+        m_temps.size(),
+        m_denoising_batch ? "True"sv : "False"sv));
     m_needsCreate = false;
     m_created = true;
   }
@@ -157,14 +162,16 @@ stream.prepare(
   negative_prompt="{}",
   num_inference_steps={},
   guidance_scale={},
-  seed={}
+  seed={},
+  delta={}
 )
 )",
         m_prompt_positive,
         m_prompt_negative,
         m_steps,
         m_guidance,
-        m_seed));
+        m_seed,
+        m_delta));
     m_needsPrepare = false;
     m_needsTrain = true;
     m_prepared = true;
@@ -183,7 +190,6 @@ void StreamDiffusionWrapper::img2img(
 {
   try
   {
-
     using namespace py::literals;
     auto img = Onnx::rescaleImage(
         in_bytes,
@@ -208,13 +214,12 @@ void StreamDiffusionWrapper::img2img(
     // Make our image available in python
     auto locals = py::dict("input_image"_a = rgb_image);
 
-    // Warmup. TODO compute correct length.
+    // Warmup.
     if (m_needsTrain)
     {
       py::exec(
           fmt::format(
               R"(
-#Warmup >= len(t_index_list) x frame_buffer_size
 for _ in range({}):
     stream(input_image)
 )",
@@ -231,22 +236,41 @@ for _ in range({}):
         locals);
 
     // Get our image back
-    std::string_view content{raw_bytes};
+    read_image_pil(raw_bytes, out_bytes);
+  }
+  catch (const std::exception& e)
+  {
+    qDebug() << e.what();
+    m_prepared = false;
+  }
+}
 
-    auto* p_i = content.data();
-    auto* p_o = out_bytes;
-    if (std::ssize(content) < m_width * m_height * 3)
-      return;
+void StreamDiffusionWrapper::txt2img(unsigned char* out_bytes)
+{
+  try
+  {
+    using namespace py::literals;
 
-    for (int pix = 0; pix < m_width * m_height; pix++)
+    // Warmup.
+    if (m_needsTrain)
     {
-      p_o[0] = p_i[0];
-      p_o[1] = p_i[1];
-      p_o[2] = p_i[2];
-      p_o[3] = 255;
-      p_i += 3;
-      p_o += 4;
+      py::exec(
+          fmt::format(
+              R"(
+for _ in range({}):
+    stream()
+)",
+              this->m_temps.size()),
+          py::globals());
+      m_needsTrain = false;
     }
+
+    // Inference
+    py::bytes raw_bytes = py::eval(
+        "postprocess_image(stream.txt2img(1))[0].tobytes()", py::globals());
+
+    // Get our image back
+    read_image_pil(raw_bytes, out_bytes);
   }
   catch (const std::exception& e)
   {
@@ -257,6 +281,7 @@ for _ in range({}):
 
 bool StreamDiffusionWrapper::prepare_inference()
 {
+  std::lock_guard _{m_mtx};
   if (m_needsModel)
     this->load_model();
   if (!m_hasModel)
@@ -273,5 +298,25 @@ bool StreamDiffusionWrapper::prepare_inference()
     return false;
 
   return true;
+}
+
+void StreamDiffusionWrapper::read_image_pil(
+    std::string_view content,
+    unsigned char* out_bytes)
+{
+  auto* p_i = content.data();
+  auto* p_o = out_bytes;
+  if (std::ssize(content) < m_width * m_height * 3)
+    return;
+
+  for (int pix = 0; pix < m_width * m_height; pix++)
+  {
+    p_o[0] = p_i[0];
+    p_o[1] = p_i[1];
+    p_o[2] = p_i[2];
+    p_o[3] = 255;
+    p_i += 3;
+    p_o += 4;
+  }
 }
 }

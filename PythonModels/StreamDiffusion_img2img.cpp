@@ -1,14 +1,21 @@
-#include "StreamDiffusion.hpp"
+#include "StreamDiffusion_img2img.hpp"
 
 namespace PythonModels
 {
 
-StreamDiffusionImg2Img::StreamDiffusionImg2Img() noexcept { }
+StreamDiffusionImg2Img::StreamDiffusionImg2Img() noexcept
+{
+#if 1
+  m_wrapper.init();
+#endif
+}
 
 StreamDiffusionImg2Img::~StreamDiffusionImg2Img() { }
 
 void StreamDiffusionImg2Img::operator()()
 {
+  if (inputs.manual && !inputs.trigger.value.has_value())
+    return;
   auto& in_tex = inputs.image.texture;
   if (!in_tex.changed)
     return;
