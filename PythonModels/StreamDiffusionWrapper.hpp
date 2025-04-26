@@ -1,4 +1,7 @@
 #pragma once
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+
 #include <mutex>
 #include <string>
 #include <vector>
@@ -44,18 +47,41 @@ struct StreamDiffusionWrapper
   {
     std::lock_guard _{m_mtx};
     m_model = std::move(v);
+    m_sd_turbo = m_model.find("turbo") != std::string::npos;
     m_needsModel = true;
     m_needsCreate = true;
     m_needsPrepare = true;
   }
-  inline void set_lcm(std::string v)
+
+  inline void set_loras(std::string v)
   {
     std::lock_guard _{m_mtx};
-    m_lcm = std::move(v);
+
+    std::vector<std::string> loras;
+    m_loras.clear();
+    boost::split(loras, v, boost::is_any_of("\n"));
+    for (auto str : loras)
+    {
+      if (str.empty())
+        continue;
+      std::vector<std::string> lora;
+      boost::split(lora, str, boost::is_any_of("@"));
+      if (lora[0].empty())
+        continue;
+      if (lora.size() == 1)
+      {
+        m_loras.emplace_back(lora[0], "");
+      }
+      else if (lora.size() >= 2)
+      {
+        m_loras.emplace_back(lora[0], lora[1]);
+      }
+    }
     m_needsModel = true;
     m_needsCreate = true;
     m_needsPrepare = true;
   }
+
   inline void set_vae(std::string v)
   {
     std::lock_guard _{m_mtx};
@@ -138,10 +164,9 @@ struct StreamDiffusionWrapper
   std::string m_prompt_positive;
   std::string m_prompt_negative;
   std::string m_model;
-  std::string m_lcm;
   std::string m_vae;
   std::string m_cfg{"self"};
-  std::vector<std::string> m_loras;
+  std::vector<std::pair<std::string, std::string>> m_loras;
   std::vector<int> m_temps;
   int64_t m_seed{};
   int m_steps{};
@@ -151,6 +176,7 @@ struct StreamDiffusionWrapper
   float m_delta{};
   bool m_add_noise{true};
   bool m_denoising_batch{true};
+  bool m_sd_turbo{false};
 
   bool m_needsModel{true};
   bool m_needsCreate{true};

@@ -27,7 +27,6 @@ int StreamDiffusionWrapper::init()
 }
 int StreamDiffusionWrapper::setup_path()
 {
-
   py::module sys = py::module::import("sys");
   // FIXME
   sys.attr("path").attr("insert")(
@@ -67,9 +66,6 @@ pipe = StableDiffusionPipeline.from_pretrained("{}").to(
     device=torch.device("cuda"),
     dtype=torch.float16
 )
-# TODO:
-# pipe.load_lora_weights('FirstLast/RealisticVision-LoRA-libr-0.2', weight_name='pytorch_lora_weights.safetensors')
-# pipe.load_lora_weights('/home/jcelerier/projets/oss/StreamDiffusion/models/LoRA/pixels.safetensors')
 )",
         m_model));
     m_needsModel = false;
@@ -114,33 +110,54 @@ stream = StreamDiffusion(
     do_add_noise={2},
     width={3},
     height={4},
-    use_denoising_batch={8}
-)
-
-# TODO:
-# stream.load_lora("/home/jcelerier/projets/oss/StreamDiffusion/models/LoRA/pixels.safetensors", adapter_name='qsdfqsdf')
-# stream.pipe.set_adapters(["lcm", "qsdfqsdf"], adapter_weights=[1.0, 1.0])
-
-if (len("{5}") > 0):
-  stream.load_lcm_lora("{5}")
-  stream.fuse_lora(True, True, 1.0, False)
-
-stream.vae = AutoencoderTiny.from_pretrained("{6}").to(device=pipe.device, dtype=pipe.dtype)
-
-resolutiondict = {{'engine_build_options' : {{ 'opt_image_width': {3}, 'opt_image_height': {4} }} }}
-stream = accelerate_with_tensorrt(
-    stream, "engines_{3}_{4}", max_batch_size={7},engine_build_options=resolutiondict
-)
-)",
+    use_denoising_batch={5}
+))",
         count,
         m_cfg,
         m_add_noise ? "True"sv : "False"sv,
         m_width,
         m_height,
-        m_lcm,
-        m_vae,
-        m_temps.size(),
         m_denoising_batch ? "True"sv : "False"sv));
+
+    if (!m_sd_turbo)
+    {
+      for (const auto& [k, v] : m_loras)
+      {
+        if (!v.empty())
+        {
+          py::exec(fmt::format(
+              R"(
+stream.load_lora('{}',  weight_name='{}')
+stream.fuse_lora(True, True, 1.0, False)
+)",
+              k,
+              v));
+        }
+        else
+        {
+          py::exec(fmt::format(
+              R"(
+stream.load_lora('{}')
+stream.fuse_lora(True, True, 1.0, False)
+)",
+              k));
+        }
+      }
+    }
+
+    py::exec(fmt::format(
+        R"(
+stream.vae = AutoencoderTiny.from_pretrained("{2}").to(device=pipe.device, dtype=pipe.dtype)
+
+resolutiondict = {{'engine_build_options' : {{ 'opt_image_width': {0}, 'opt_image_height': {1} }} }}
+stream = accelerate_with_tensorrt(
+    stream, "engines_{0}_{1}", max_batch_size={3},engine_build_options=resolutiondict
+)
+)",
+        m_width,
+        m_height,
+        m_vae,
+        m_temps.size()));
     m_needsCreate = false;
     m_created = true;
   }
@@ -266,8 +283,18 @@ for _ in range({}):
     }
 
     // Inference
-    py::bytes raw_bytes = py::eval(
-        "postprocess_image(stream.txt2img(1))[0].tobytes()", py::globals());
+    py::bytes raw_bytes;
+    if (m_model.find("turbo") != std::string::npos)
+    {
+      raw_bytes = py::eval(
+          "postprocess_image(stream.txt2img_sd_turbo(1))[0].tobytes()",
+          py::globals());
+    }
+    else
+    {
+      raw_bytes = py::eval(
+          "postprocess_image(stream.txt2img(1))[0].tobytes()", py::globals());
+    }
 
     // Get our image back
     read_image_pil(raw_bytes, out_bytes);

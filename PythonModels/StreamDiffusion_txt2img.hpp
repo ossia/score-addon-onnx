@@ -27,6 +27,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_prompt_positive(value);
+        self.inputs.trigger.value.emplace();
       }
     } prompt;
     struct : halp::lineedit<"Prompt -", "anime">
@@ -34,6 +35,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_prompt_negative(value);
+        self.inputs.trigger.value.emplace();
       }
     } negative_prompt;
     struct : halp::lineedit<"Model", "SimianLuo/LCM_Dreamshaper_v7">
@@ -41,20 +43,23 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_model(value);
+        self.inputs.trigger.value.emplace();
       }
     } model;
-    struct : halp::lineedit<"LCM", "latent-consistency/lcm-lora-sdv1-5">
+    struct : halp::lineedit<"LoRAs", "latent-consistency/lcm-lora-sdv1-5">
     {
       void update(StreamDiffusionTxt2Img& self)
       {
-        self.m_wrapper.set_lcm(value);
+        self.m_wrapper.set_loras(value);
+        self.inputs.trigger.value.emplace();
       }
-    } lcm;
+    } loras;
     struct : halp::lineedit<"VAE", "madebyollin/taesd">
     {
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_vae(value);
+        self.inputs.trigger.value.emplace();
       }
     } vae;
     struct : halp::spinbox_i32<"Seed", halp::free_range_max<>>
@@ -62,6 +67,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_seed(value);
+        self.inputs.trigger.value.emplace();
       }
     } seed;
     struct : halp::spinbox_i32<"Steps", halp::range{1, 50, 50}>
@@ -69,6 +75,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_steps(value);
+        self.inputs.trigger.value.emplace();
       }
     } steps;
     struct : halp::knob_f32<"Guidance", halp::range{0.5, 1.5, 1.0}>
@@ -76,6 +83,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_guidance(value);
+        self.inputs.trigger.value.emplace();
       }
     } guidance;
     struct : halp::knob_f32<"Delta", halp::range{-200, 200, 1.0}>
@@ -83,6 +91,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_delta(value);
+        self.inputs.trigger.value.emplace();
       }
     } delta;
     struct : halp::spinbox_i32<"T1", halp::range{0, 50, 15}>
@@ -93,9 +102,8 @@ public:
         ts.push_back(self.inputs.t1);
         if (self.inputs.tcount > 1)
           ts.push_back(self.inputs.t2);
-        if (self.inputs.tcount > 2)
-          ts.push_back(self.inputs.t3);
         self.m_wrapper.set_temps(std::move(ts));
+        self.inputs.trigger.value.emplace();
       }
     } t1;
     struct : halp::spinbox_i32<"T2", halp::range{1, 50, 40}>
@@ -106,12 +114,11 @@ public:
         ts.push_back(self.inputs.t1);
         if (self.inputs.tcount > 1)
           ts.push_back(self.inputs.t2);
-        if (self.inputs.tcount > 2)
-          ts.push_back(self.inputs.t3);
         self.m_wrapper.set_temps(std::move(ts));
+        self.inputs.trigger.value.emplace();
       }
     } t2;
-    struct : halp::spinbox_i32<"T3", halp::range{1, 50, 40}>
+    struct : halp::spinbox_i32<"T count", halp::range{1, 2, 2}>
     {
       void update(StreamDiffusionTxt2Img& self)
       {
@@ -119,22 +126,8 @@ public:
         ts.push_back(self.inputs.t1);
         if (self.inputs.tcount > 1)
           ts.push_back(self.inputs.t2);
-        if (self.inputs.tcount > 2)
-          ts.push_back(self.inputs.t3);
         self.m_wrapper.set_temps(std::move(ts));
-      }
-    } t3;
-    struct : halp::spinbox_i32<"T count", halp::range{1, 3, 2}>
-    {
-      void update(StreamDiffusionTxt2Img& self)
-      {
-        std::vector<int> ts;
-        ts.push_back(self.inputs.t1);
-        if (self.inputs.tcount > 1)
-          ts.push_back(self.inputs.t2);
-        if (self.inputs.tcount > 2)
-          ts.push_back(self.inputs.t3);
-        self.m_wrapper.set_temps(std::move(ts));
+        self.inputs.trigger.value.emplace();
       }
     } tcount;
     struct : halp::xy_spinboxes_t<int, "Size", halp::range{1, 2048, 512}>
@@ -142,6 +135,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_size(value.x, value.y);
+        self.inputs.trigger.value.emplace();
       }
     } size;
 
@@ -150,6 +144,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_add_noise(value);
+        self.inputs.trigger.value.emplace();
       }
     } add_noise;
     struct : halp::toggle<"Denoising batch", halp::default_on_toggle>
@@ -157,6 +152,7 @@ public:
       void update(StreamDiffusionTxt2Img& self)
       {
         self.m_wrapper.set_denoising_batch(value);
+        self.inputs.trigger.value.emplace();
       }
     } denoise_batch;
     halp::toggle<"Manual mode"> manual;
