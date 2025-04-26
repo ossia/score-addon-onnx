@@ -87,6 +87,8 @@ avnd_score_plugin_add(
   SOURCES
     PythonModels/StreamDiffusion.hpp
     PythonModels/StreamDiffusion.cpp
+    PythonModels/StreamDiffusionWrapper.hpp
+    PythonModels/StreamDiffusionWrapper.cpp
   TARGET
     streamdiffusion_img2img
   MAIN_CLASS
