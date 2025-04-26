@@ -85,6 +85,19 @@ avnd_score_plugin_add(
   BASE_TARGET
     score_addon_onnx_models
   SOURCES
+    OnnxModels/RealESRGAN.hpp
+    OnnxModels/RealESRGAN.cpp
+  TARGET
+    realesrgan
+  MAIN_CLASS
+    RealESRGANScaler
+  NAMESPACE
+    OnnxModels
+)
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
     PythonModels/StreamDiffusion_img2img.hpp
     PythonModels/StreamDiffusion_img2img.cpp
     PythonModels/StreamDiffusionWrapper.hpp

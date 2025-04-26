@@ -45,7 +45,7 @@ inline QImage rescaleImage(
 }
 
 inline FloatTensor tensorFromARGB(
-    ModelSpec::Port& port,
+    std::vector<int64_t>& input_shape,
     const unsigned char* source_bits,
     int source_w,
     int source_h,
@@ -54,7 +54,6 @@ inline FloatTensor tensorFromARGB(
     boost::container::vector<float>& input_tensor_values,
     bool normalize_resnet = false)
 {
-  auto& input_shape = port.shape;
   QImage img = rescaleImage(
       source_bits,
       source_w,

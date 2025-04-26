@@ -60,7 +60,7 @@ try
         "enable_skip_layer_norm_strict_mode"};
     const std::vector values{
         device_id_str,
-        "2147483648",
+        "25769803776",
         "kNextPowerOfTwo",
         "EXHAUSTIVE",
         "1",
