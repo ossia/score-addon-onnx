@@ -22,6 +22,10 @@ void PoseDetector::operator()()
 
   if (!in_tex.changed)
     return;
+   if (!in_tex.bytes)
+     return;
+   if (in_tex.width != 640 || in_tex.height != 640)
+     return;
 
   if (!this->ctx)
   {
