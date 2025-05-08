@@ -161,6 +161,9 @@ struct YOLO_pose
           if (recog[i] > min_confidence)
             idx[k++] = i;
         }
+        if (k == 0)
+          return;
+        idx.resize(k);
 
         // 2. Sort the resulting array. First element will be index of pose with highest confidence.
         std::stable_sort(
