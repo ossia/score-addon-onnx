@@ -55,6 +55,20 @@ avnd_score_plugin_add(
   BASE_TARGET
     score_addon_onnx_models
   SOURCES
+    OnnxModels/ENet.hpp
+    OnnxModels/ENet.cpp
+  TARGET
+    enet
+  MAIN_CLASS
+    EmotionNetDetector
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
     OnnxModels/YOLO-pose.hpp
     OnnxModels/YOLO-pose.cpp
   TARGET
