@@ -1,14 +1,35 @@
 #include "StreamDiffusionWrapper.hpp"
 
+#include <Library/LibrarySettings.hpp>
+
+#include <ossia/detail/fmt.hpp>
+
+#include <QDir>
+#include <QProcess>
+
 #include <Onnx/helpers/Images.hpp>
 #include <pybind11/embed.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
-
 namespace py = pybind11;
 
 namespace PythonModels
 {
+
+QString uvPath()
+{
+  return score::AppContext()
+             .settings<Library::Settings::Model>()
+             .getPackagesPath()
+         + QDir::separator() + "uv";
+}
+QString StreamDiffusionPath()
+{
+  return score::AppContext()
+             .settings<Library::Settings::Model>()
+             .getPackagesPath()
+         + QDir::separator() + "streamdiffusion";
+}
 
 int python_interpreter_global_instance()
 {
@@ -23,19 +44,53 @@ int StreamDiffusionWrapper::init()
   static int guard = python_interpreter_global_instance();
   static int path = setup_path();
   static int imports = setup_imports();
+
   return 1;
 }
 int StreamDiffusionWrapper::setup_path()
 {
   py::module sys = py::module::import("sys");
   // FIXME
-  sys.attr("path").attr("insert")(
-      0, "/home/jcelerier/projets/oss/StreamDiffusion/src");
+  auto sd_path = StreamDiffusionPath();
+  if (QDir{sd_path}.isEmpty())
+    throw std::runtime_error("StreamDiffusion not downloaded!");
 
+  auto uv_path = uvPath();
+  if (QDir{uv_path}.isEmpty())
+    throw std::runtime_error("uv not downloaded!");
+
+  QProcessEnvironment penv = QProcessEnvironment::systemEnvironment();
+  auto path = penv.value("PATH");
+#if defined(_WIN32)
+#define PATH_SEPARATOR_CHAR ";"
+#else
+#define PATH_SEPARATOR_CHAR ":"
+#endif
+
+  path.prepend(uv_path + PATH_SEPARATOR_CHAR);
+  penv.insert("PATH", path);
+
+  // uv venv
+  // source .venv/bin/activate
+  // uv venv sync
+
+  QProcess uv_venv;
+  uv_venv.setProgram("uv");
+  uv_venv.setArguments({"venv", "--python", "3.13"});
+  uv_venv.setProcessEnvironment(penv);
+  uv_venv.setWorkingDirectory(sd_path);
+  uv_venv.start();
+
+  QProcess uv_sync;
+  uv_venv.setProgram("uv");
+  uv_venv.setArguments({"sync"});
+  uv_venv.setProcessEnvironment(penv);
+  uv_venv.setWorkingDirectory(sd_path);
+  uv_venv.start();
+
+  sys.attr("path").attr("insert")(0, sd_path + "/src");
   sys.attr("path").attr("insert")(
-      1,
-      "/home/jcelerier/projets/oss/StreamDiffusion/.venv/lib/python3.13/"
-      "site-packages");
+      1, sd_path + "/.venv/lib/python3.13/site-packages");
   return 1;
 }
 

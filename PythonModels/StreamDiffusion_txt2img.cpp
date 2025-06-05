@@ -2,6 +2,7 @@
 
 #include <ossia/detail/triple_buffer.hpp>
 
+#include <QDebug>
 #include <QElapsedTimer>
 
 #include <thread>

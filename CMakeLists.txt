@@ -14,12 +14,12 @@ endif()
 
 project(score_addon_onnx LANGUAGES CXX)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/python.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
 if(NOT TARGET onnxruntime::onnxruntime)
   return()
 endif()
 
-add_subdirectory("${OSSIA_3RDPARTY_FOLDER}/pybind11" pybind11)
 # General initialization
 score_common_setup()
 
