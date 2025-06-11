@@ -102,6 +102,8 @@ avnd_score_plugin_add(
     PythonModels/StreamDiffusion_img2img.cpp
     PythonModels/StreamDiffusionWrapper.hpp
     PythonModels/StreamDiffusionWrapper.cpp
+    PythonModels/PromptParser.hpp
+    PythonModels/PromptParser.cpp
   TARGET
     streamdiffusion_img2img
   MAIN_CLASS
@@ -116,8 +118,6 @@ avnd_score_plugin_add(
   SOURCES
     PythonModels/StreamDiffusion_txt2img.hpp
     PythonModels/StreamDiffusion_txt2img.cpp
-    PythonModels/StreamDiffusionWrapper.hpp
-    PythonModels/StreamDiffusionWrapper.cpp
   TARGET
     streamdiffusion_txt2img
   MAIN_CLASS

@@ -21,6 +21,7 @@ struct StreamDiffusionWrapper
   void load_model();
   void create();
   void prepare();
+  void update_prompt();
 
   void img2img(
       unsigned char* in_bytes,
@@ -35,7 +36,8 @@ struct StreamDiffusionWrapper
   {
     std::lock_guard _{m_mtx};
     m_prompt_positive = std::move(v);
-    m_needsPrepare = true;
+    if (!m_needsPrepare)
+      m_needsUpdatePrompt = true;
   }
   inline void set_prompt_negative(std::string v)
   {
@@ -181,6 +183,7 @@ struct StreamDiffusionWrapper
   bool m_needsModel{true};
   bool m_needsCreate{true};
   bool m_needsPrepare{true};
+  bool m_needsUpdatePrompt{true};
   bool m_needsTrain{true};
   bool m_hasModel{false};
   bool m_created{false};

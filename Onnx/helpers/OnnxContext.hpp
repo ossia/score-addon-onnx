@@ -18,7 +18,7 @@ namespace Onnx
 {
 struct Options
 {
-  std::string provider = "cuda";
+  std::string provider = "tensorrt";
   int device_id = 0;
 };
 

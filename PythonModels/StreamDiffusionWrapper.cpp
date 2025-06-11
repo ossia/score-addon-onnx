@@ -8,6 +8,7 @@
 #include <QProcess>
 
 #include <Onnx/helpers/Images.hpp>
+#include <PythonModels/PromptParser.hpp>
 #include <pybind11/embed.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -55,12 +56,15 @@ int StreamDiffusionWrapper::setup_path()
   if (QDir{sd_path}.isEmpty())
     throw std::runtime_error("StreamDiffusion not downloaded!");
 
-  auto uv_path = uvPath();
-  if (QDir{uv_path}.isEmpty())
-    throw std::runtime_error("uv not downloaded!");
-
   QProcessEnvironment penv = QProcessEnvironment::systemEnvironment();
-  auto path = penv.value("PATH");
+
+  if (!QFile::exists("/usr/bin/uv"))
+  {
+    auto uv_path = uvPath();
+    if (QDir{uv_path}.isEmpty())
+      throw std::runtime_error("uv not downloaded!");
+
+    auto path = penv.value("PATH");
 #if defined(_WIN32)
 #define PATH_SEPARATOR_CHAR ";"
 #else
@@ -69,6 +73,7 @@ int StreamDiffusionWrapper::setup_path()
 
   path.prepend(uv_path + PATH_SEPARATOR_CHAR);
   penv.insert("PATH", path);
+  }
 
   // uv venv
   // source .venv/bin/activate
@@ -88,9 +93,10 @@ int StreamDiffusionWrapper::setup_path()
   uv_venv.setWorkingDirectory(sd_path);
   uv_venv.start();
 
-  sys.attr("path").attr("insert")(0, sd_path + "/src");
+  sys.attr("path").attr("insert")(0, QString(sd_path + "/src").toStdString());
   sys.attr("path").attr("insert")(
-      1, sd_path + "/.venv/lib/python3.13/site-packages");
+      1,
+      QString(sd_path + "/.venv/lib/python3.13/site-packages").toStdString());
   return 1;
 }
 
@@ -246,7 +252,44 @@ stream.prepare(
         m_delta));
     m_needsPrepare = false;
     m_needsTrain = true;
+    m_needsUpdatePrompt = true;
     m_prepared = true;
+  }
+  catch (const std::exception& e)
+  {
+    qDebug() << e.what();
+  }
+}
+
+void StreamDiffusionWrapper::update_prompt()
+{
+  try
+  {
+    qDebug() << "Parsing..." << m_prompt_positive;
+    if (auto weights = parse_input_string(m_prompt_positive))
+    {
+      std::string prompt;
+      for (const auto& [k, v] : *weights)
+      {
+        prompt += fmt::format("({}, {}), ", quote_string_for_python(k), v);
+      }
+      if (prompt.ends_with(','))
+        prompt.pop_back();
+
+      qDebug() << fmt::format(
+          "stream.update_prompts(weighted_prompts=[{}])", prompt);
+      py::exec(
+          fmt::format("stream.update_prompts(weighted_prompts=[{}])", prompt));
+    }
+    else
+    {
+      qDebug() << "Failed";
+      py::exec(fmt::format(
+          "stream.update_prompts(weighted_prompts=[({}, 1.0)])",
+          quote_string_for_python(m_prompt_positive)));
+    }
+
+    m_needsUpdatePrompt = false;
   }
   catch (const std::exception& e)
   {
@@ -379,6 +422,8 @@ bool StreamDiffusionWrapper::prepare_inference()
   if (!m_prepared)
     return false;
 
+  if (m_needsUpdatePrompt)
+    this->update_prompt();
   return true;
 }
 
