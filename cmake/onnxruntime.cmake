@@ -79,6 +79,9 @@ if(WIN32)
   file(GLOB onnxruntime_DLLS "${onnxruntime_SOURCE_DIR}/lib/*.dll")
 endif()
 
+if(APPLE)
+    list(APPEND SCORE_BUNDLEUTILITIES_DIRS_LIST)
+endif()
 find_path(onnxruntime_INCLUDE_DIRS
     NAMES onnxruntime_cxx_api.h
     PATHS "${onnxruntime_SOURCE_DIR}/include"
