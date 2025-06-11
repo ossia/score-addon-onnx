@@ -1,0 +1,20 @@
+add_library(rapidlib STATIC
+  "3rdparty/RapidLib/dependencies/bayesfilter/src/BayesianFilter.cpp"
+  "3rdparty/RapidLib/dependencies/bayesfilter/src/filter_utilities.cpp"
+  "3rdparty/RapidLib/dependencies/jsoncpp.cpp"
+  "3rdparty/RapidLib/dependencies/libsvm/libsvm.cpp"
+  "3rdparty/RapidLib/src/classification.cpp"
+  "3rdparty/RapidLib/src/dtw.cpp"
+  "3rdparty/RapidLib/src/fastDTW.cpp"
+  "3rdparty/RapidLib/src/knnClassification.cpp"
+  "3rdparty/RapidLib/src/modelSet.cpp"
+  "3rdparty/RapidLib/src/neuralNetwork.cpp"
+  "3rdparty/RapidLib/src/rapidStream.cpp"
+  "3rdparty/RapidLib/src/regression.cpp"
+  "3rdparty/RapidLib/src/searchWindow.cpp"
+  "3rdparty/RapidLib/src/seriesClassification.cpp"
+  "3rdparty/RapidLib/src/svmClassification.cpp"
+  "3rdparty/RapidLib/src/warpPath.cpp"
+  "3rdparty/RapidLib/test/rapidLibTest.cpp"
+)
+target_include_directories(rapidlib PUBLIC 3rdparty/RapidLib/)
