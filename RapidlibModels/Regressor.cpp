@@ -2,6 +2,8 @@
 
 #include "src/regression.h"
 
+#include <ossia/math/safe_math.hpp>
+
 namespace RapidlibModels
 {
 Regressor::Regressor() noexcept { }
@@ -50,6 +52,12 @@ void Regressor::operator()()
     if (m_trained)
     {
       outputs.output.value = m_model.run(inputs.input.value);
+      if (std::any_of(
+              outputs.output.value.begin(),
+              outputs.output.value.end(),
+              [](auto x)
+              { return ossia::safe_isnan(x) || ossia::safe_isinf(x); }))
+        outputs.output.value.clear();
     }
   }
 }
