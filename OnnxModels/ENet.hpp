@@ -15,7 +15,7 @@ struct OnnxRunContext;
 
 namespace OnnxModels
 {
-struct DetectedElement
+struct ENetDetectedElement
 {
   std::string name;
   float probability{};
@@ -50,7 +50,7 @@ public:
     struct
     {
       halp_meta(name, "Detection");
-      std::vector<DetectedElement> value;
+      std::vector<ENetDetectedElement> value;
     } detection;
   } outputs;
 
