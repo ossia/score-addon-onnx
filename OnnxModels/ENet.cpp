@@ -43,7 +43,7 @@ try
   }
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
-  auto t = tensorFromARGB(
+  auto t = nchw_tensorFromARGB(
       spec.inputs[0],
       in_tex.bytes,
       in_tex.width,
@@ -51,7 +51,8 @@ try
       this->inputs.resolution.value.x,
       this->inputs.resolution.value.y,
       storage,
-      true);
+      {255.f * 0.485f, 255.f * 0.456f, 255.f * 0.406f},
+      {255.f * 0.229f, 255.f * 0.224f, 255.f * 0.225f});
   Ort::Value tt[1] = {std::move(t.value)};
 
   assert(1 == spec.output_names_char.size());

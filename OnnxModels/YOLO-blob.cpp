@@ -40,7 +40,7 @@ void YOLO7BlobDetector::operator()()
   }
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
-  auto t = tensorFromRGBA(
+  auto t = nchw_tensorFromRGBA(
       spec.inputs[0],
       in_tex.bytes,
       in_tex.width,
@@ -48,7 +48,8 @@ void YOLO7BlobDetector::operator()()
       this->inputs.resolution.value.x,
       this->inputs.resolution.value.y,
       storage,
-      false);
+      {0.f, 0.f, 0.f},
+      {255.f, 255.f, 255.f});
   Ort::Value tt[1] = {std::move(t.value)};
 
   assert(1 == spec.output_names_char.size());

@@ -31,18 +31,38 @@ void nhwc_to_nchw(
     std::array<T, 3> mean,
     std::array<T, 3> std)
 {
+  static_assert(std::is_floating_point_v<T>);
   const uint8_t* src = static_cast<const uint8_t*>(data);
   step -= 3 * width;
-#pragma omp simd
-  for (size_t y = 0; y < height; ++y)
+  if (mean == std::array<T, 3>{0.f, 0.f, 0.f}
+      && std == std::array<T, 3>{255.f, 255.f, 255.f})
   {
-    for (size_t x = 0; x < width; ++x)
+    static constexpr T inv_div = T(1.f) / T(255.f);
+#pragma omp simd
+    for (size_t y = 0; y < height; ++y)
     {
-      *r_plane++ = (T(*src++) - mean[0]) / std[0];
-      *g_plane++ = (T(*src++) - mean[1]) / std[1];
-      *b_plane++ = (T(*src++) - mean[2]) / std[2];
+      for (size_t x = 0; x < width; ++x)
+      {
+        *r_plane++ = T(*src++) * inv_div;
+        *g_plane++ = T(*src++) * inv_div;
+        *b_plane++ = T(*src++) * inv_div;
+      }
+      src += step;
     }
-    src += step;
+  }
+  else
+  {
+#pragma omp simd
+    for (size_t y = 0; y < height; ++y)
+    {
+      for (size_t x = 0; x < width; ++x)
+      {
+        *r_plane++ = (T(*src++) - mean[0]) / std[0];
+        *g_plane++ = (T(*src++) - mean[1]) / std[1];
+        *b_plane++ = (T(*src++) - mean[2]) / std[2];
+      }
+      src += step;
+    }
   }
 }
 

@@ -21,7 +21,7 @@ struct FloatTensor
   Ort::Value value;
 };
 
-inline FloatTensor tensorFromARGB(
+inline FloatTensor nchw_tensorFromARGB(
     ModelSpec::Port& port,
     const unsigned char* source_bits,
     int source_w,
@@ -29,21 +29,20 @@ inline FloatTensor tensorFromARGB(
     int model_w,
     int model_h,
     boost::container::vector<float>& input_tensor_values,
-    bool normalize_resnet = false)
+    std::array<float, 3> mean,
+    std::array<float, 3> std)
 {
   auto& input_shape = port.shape;
   QImage img = QImage(source_bits, source_w, source_h, QImage::Format_ARGB32);
-  img = img.scaled(
+  img = std::move(img).scaled(
       model_w,
       model_h,
       Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
-  if (model_w != img.width() || model_h != img.width())
+  if (model_w != img.width() || model_h != img.height())
     img = img.copy(0, 0, model_w, model_h);
-  img = img.rgbSwapped();
-  img = img.convertToFormat(QImage::Format_RGB888);
+  img = std::move(img).convertToFormat(QImage::Format_RGB888);
 
-  // FIXME pass storage as input instead
   input_tensor_values.resize(
       3 * model_w * model_h, boost::container::default_init);
 
@@ -52,32 +51,17 @@ inline FloatTensor tensorFromARGB(
   auto dst_r = dst;
   auto dst_g = dst_r + model_w * model_h;
   auto dst_b = dst_g + model_w * model_h;
-  if (normalize_resnet)
-  {
-    nhwc_to_nchw<float>(
-        model_w,
-        model_h,
-        3 * model_w,
-        ptr,
-        dst_r,
-        dst_g,
-        dst_b,
-        {255.f * 0.485f, 255.f * 0.456f, 255.f * 0.406f},
-        {255.f * 0.229f, 255.f * 0.224f, 255.f * 0.225f});
-  }
-  else
-  {
-    nhwc_to_nchw<float>(
-        model_w,
-        model_h,
-        3 * model_w,
-        ptr,
-        dst_r,
-        dst_g,
-        dst_b,
-        {0., 0., 0.},
-        {255., 255., 255.});
-  }
+
+  nhwc_to_nchw<float>(
+      model_w,
+      model_h,
+      img.bytesPerLine(),
+      ptr,
+      dst_r,
+      dst_g,
+      dst_b,
+      mean,
+      std);
 
   FloatTensor f{
       .storage = {},
@@ -87,7 +71,7 @@ inline FloatTensor tensorFromARGB(
 }
 
 // When coming from a GL_RGBA texture
-inline FloatTensor tensorFromRGBA(
+inline FloatTensor nchw_tensorFromRGBA(
     ModelSpec::Port& port,
     const unsigned char* source_bits,
     int source_w,
@@ -95,7 +79,8 @@ inline FloatTensor tensorFromRGBA(
     int model_w,
     int model_h,
     boost::container::vector<float>& input_tensor_values,
-    bool normalize_resnet = false)
+    std::array<float, 3> mean,
+    std::array<float, 3> std)
 {
   auto& input_shape = port.shape;
   QImage img
@@ -105,9 +90,9 @@ inline FloatTensor tensorFromRGBA(
       model_h,
       Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
-  if (model_w != img.width() || model_h != img.width())
+  if (model_w != img.width() || model_h != img.height())
     img = img.copy(0, 0, model_w, model_h);
-  img = img.convertToFormat(QImage::Format_RGB888);
+  img = std::move(img).convertToFormat(QImage::Format_RGB888);
 
   // FIXME pass storage as input instead
   input_tensor_values.resize(
@@ -118,32 +103,16 @@ inline FloatTensor tensorFromRGBA(
   auto dst_r = dst;
   auto dst_g = dst_r + model_w * model_h;
   auto dst_b = dst_g + model_w * model_h;
-  if (normalize_resnet)
-  {
-    nhwc_to_nchw<float>(
-        model_w,
-        model_h,
-        3 * model_w,
-        ptr,
-        dst_r,
-        dst_g,
-        dst_b,
-        {255.f * 0.485f, 255.f * 0.456f, 255.f * 0.406f},
-        {255.f * 0.229f, 255.f * 0.224f, 255.f * 0.225f});
-  }
-  else
-  {
-    nhwc_to_nchw<float>(
-        model_w,
-        model_h,
-        3 * model_w,
-        ptr,
-        dst_r,
-        dst_g,
-        dst_b,
-        {0., 0., 0.},
-        {255., 255., 255.});
-  }
+  nhwc_to_nchw<float>(
+      model_w,
+      model_h,
+      img.bytesPerLine(),
+      ptr,
+      dst_r,
+      dst_g,
+      dst_b,
+      mean,
+      std);
 
   FloatTensor f{
       .storage = {},
@@ -170,13 +139,13 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
       model_h,
       Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
-  if (model_w != img.width() || model_h != img.width())
+  if (model_w != img.width() || model_h != img.height())
     img = img.copy(0, 0, model_w, model_h);
 
-  // FIXME pass storage as input instead
   input_tensor_values.resize(
       3 * model_w * model_h, boost::container::default_init);
 
+  // FIXME does not work if img.bytesPerLine() != 4 * model_w;
   auto ptr = (unsigned char*)img.constBits();
   auto dst = input_tensor_values.data();
   for (int src_i = 0, dst_i = 0; src_i < 3 * model_w * model_h;)
