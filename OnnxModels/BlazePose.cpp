@@ -82,5 +82,4 @@ void BlazePoseDetector::operator()()
     std::swap(storage, t.storage);
   }
 }
-
 }

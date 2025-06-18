@@ -1,7 +1,10 @@
 #pragma once
 
+#include <ossia/detail/thread.hpp>
+
 #include <halp/file_port.hpp>
 #include <halp/meta.hpp>
+
 #if defined(ORT_API_MANUAL_INIT)
 #include <ossia/detail/dylib_loader.hpp>
 
@@ -25,19 +28,42 @@ public:
             "libonnxruntime.so.1",
             "lib/libonnxruntime.so.1",
             "../lib/libonnxruntime.so.1",
-            "./_deps/onnxruntime-src/lib/libonnxruntime.so.1"
+            "./_deps/onnxruntime-src/lib/libonnxruntime.so.1",
+            "../_deps/onnxruntime-src/lib/libonnxruntime.so.1",
+            ossia::get_exe_folder() + "/libonnxruntime.so.1",
+            ossia::get_exe_folder() + "/lib/libonnxruntime.so.1",
+            ossia::get_exe_folder() + "/../lib/libonnxruntime.so.1",
+            ossia::get_exe_folder()
+                + "/_deps/onnxruntime-src/lib/libonnxruntime.so.1",
+            ossia::get_exe_folder()
+                + "/../_deps/onnxruntime-src/lib/libonnxruntime.so.1",
 #elif defined(__APPLE__)
             "libonnxruntime.dylib",
-            "./_deps/onnxruntime-src/lib/libonnxruntime.dylib"
-#else
+            "./_deps/onnxruntime-src/lib/libonnxruntime.dylib",
+            "../_deps/onnxruntime-src/lib/libonnxruntime.dylib",
+            ossia::get_exe_folder() + "/libonnxruntime.dylib",
+            ossia::get_exe_folder()
+                + "/_deps/onnxruntime-src/lib/libonnxruntime.dylib",
+            ossia::get_exe_folder()
+                + "/../_deps/onnxruntime-src/lib/libonnxruntime.dylib",
+#elif defined(_WIN32)
             "libonnxruntime.dll",
-            "./_deps/onnxruntime-src/lib/libonnxruntime.dll"
+            "./_deps/onnxruntime-src/lib/libonnxruntime.dll",
+            "../_deps/onnxruntime-src/lib/libonnxruntime.dll",
+            ossia::get_exe_folder() + "/libonnxruntime.dll",
+            ossia::get_exe_folder()
+                + "/_deps/onnxruntime-src/lib/libonnxruntime.dll",
+            ossia::get_exe_folder()
+                + "/../_deps/onnxruntime-src/lib/libonnxruntime.dll",
 #endif
 
         }}
   {
     if (!library)
+    {
+      qDebug("Could not load libonnxruntime!");
       return;
+    }
 
     get_api_base = library.symbol<decltype(&::OrtGetApiBase)>("OrtGetApiBase");
     if (!get_api_base)
