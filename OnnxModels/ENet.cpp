@@ -6,6 +6,17 @@
 
 namespace OnnxModels
 {
+// Tested models:
+// enet_b0_8_best_afew.onnx
+// enet_b0_8_best_vgaf.onnx
+// from: https://github.com/sb-ai-lab/EmotiEffLib
+// or: https://github.com/av-savchenko/face-emotion-recognition.git
+
+// model shape:
+// inputs:
+// - tensor: float32[batch_size,3,224,224]
+// outputs:
+// - tensor: float32[batch_size,8]
 
 EmotionNetDetector::EmotionNetDetector() noexcept
 {
