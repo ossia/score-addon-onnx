@@ -93,6 +93,20 @@ avnd_score_plugin_add(
     OnnxModels
 )
 
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/DepthAnything2.hpp
+    OnnxModels/DepthAnything2.cpp
+  TARGET
+    depthanything2
+  MAIN_CLASS
+    DepthAnythingV2
+  NAMESPACE
+    OnnxModels
+)
+
 avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
                            PLUGIN_UUID "24a98f5b-700f-401c-ab89-8c1173bda73f")
 
