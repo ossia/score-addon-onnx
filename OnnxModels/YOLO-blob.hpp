@@ -1,6 +1,6 @@
 #pragma once
+#include <Onnx/helpers/Yolo.hpp>
 #include <OnnxModels/Utils.hpp>
-
 #include <cmath>
 #include <halp/controls.hpp>
 #include <halp/geometry.hpp>
@@ -47,6 +47,8 @@ public:
     } classes;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 640}>
         resolution;
+    halp::knob_f32<"Min. confidence"> confidence;
+    halp::knob_f32<"IoU threshold"> iou_threshold;
   } inputs;
 
   struct
@@ -71,5 +73,6 @@ private:
   std::unique_ptr<Onnx::OnnxRunContext> ctx;
   std::vector<std::string> classes;
   boost::container::vector<float> storage;
+  Yolo::YOLO_blob detector;
 };
 }

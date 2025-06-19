@@ -56,12 +56,20 @@ void YOLO7BlobDetector::operator()()
   Ort::Value out_tt[1]{Ort::Value{nullptr}};
   ctx.infer(spec, tt, out_tt);
 
-  Yolo::YOLO_blob::processOutput_v7(
+  detector.processOutput(
       classes,
       spec,
       out_tt,
       reinterpret_cast<std::vector<Yolo::YOLO_blob::blob_type>&>(
-          outputs.detection.value));
+          outputs.detection.value),
+      0,
+      0,
+      640,
+      640,
+      640,
+      640,
+      inputs.iou_threshold,
+      inputs.confidence);
 
   auto img = Onnx::drawRects(
       inputs.image.texture.bytes,
