@@ -11,6 +11,8 @@
 #include <onnxruntime_cxx_api.h>
 #endif
 
+#include <QDebug>
+
 namespace OnnxModels
 {
 
