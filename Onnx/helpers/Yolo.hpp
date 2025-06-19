@@ -1,12 +1,59 @@
 #pragma once
 #include <ossia/detail/pod_vector.hpp>
 
+#include <boost/dynamic_bitset.hpp>
+
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 
 namespace OnnxModels::Yolo
 {
+
+// intersection-over-union for blobs
+static float iou(const auto& box1, const auto& box2)
+{
+  float x1 = std::max(box1.x, box2.x);
+  float y1 = std::max(box1.y, box2.y);
+  float x2 = std::min(box1.x + box1.w, box2.x + box2.w);
+  float y2 = std::min(box1.y + box1.h, box2.y + box2.h);
+
+  float intersection_w = std::max(0.0f, x2 - x1);
+  float intersection_h = std::max(0.0f, y2 - y1);
+  float intersection_area = intersection_w * intersection_h;
+
+  float box1_area = box1.w * box1.h;
+  float box2_area = box2.w * box2.h;
+  float union_area = box1_area + box2_area - intersection_area;
+
+  return union_area > 1e-6 ? intersection_area / union_area : 0.0f;
+}
+
+// non-maximum supression
+static void nms(auto& candidates, float threshold)
+{
+  using type = std::remove_cvref_t<decltype(candidates)>::value_type;
+  std::sort(
+      candidates.begin(),
+      candidates.end(),
+      [](const type& a, const type& b)
+      { return a.confidence > b.confidence; });
+
+  for (size_t i = 0; i < candidates.size(); ++i)
+  {
+    if (candidates[i].suppressed)
+      continue;
+
+    for (size_t j = i + 1; j < candidates.size(); ++j)
+    {
+      if (candidates[j].suppressed)
+        continue;
+
+      if (iou(candidates[i], candidates[j]) > threshold)
+        candidates[j].suppressed = true;
+    }
+  }
+}
 
 struct YOLO_blob
 {
@@ -28,50 +75,6 @@ struct YOLO_blob
     bool suppressed;
   };
   std::vector<fast_blob_type> candidates;
-
-  // intersection-over-union for blobs
-  static float iou(const fast_blob_type& box1, const fast_blob_type& box2)
-  {
-    float x1 = std::max(box1.x, box2.x);
-    float y1 = std::max(box1.y, box2.y);
-    float x2 = std::min(box1.x + box1.w, box2.x + box2.w);
-    float y2 = std::min(box1.y + box1.h, box2.y + box2.h);
-
-    float intersection_w = std::max(0.0f, x2 - x1);
-    float intersection_h = std::max(0.0f, y2 - y1);
-    float intersection_area = intersection_w * intersection_h;
-
-    float box1_area = box1.w * box1.h;
-    float box2_area = box2.w * box2.h;
-    float union_area = box1_area + box2_area - intersection_area;
-
-    return union_area > 1e-6 ? intersection_area / union_area : 0.0f;
-  }
-
-  // non-maximum supression
-  static void nms(std::span<fast_blob_type> candidates, float threshold)
-  {
-    std::sort(
-        candidates.begin(),
-        candidates.end(),
-        [](const fast_blob_type& a, const fast_blob_type& b)
-        { return a.confidence > b.confidence; });
-
-    for (size_t i = 0; i < candidates.size(); ++i)
-    {
-      if (candidates[i].suppressed)
-        continue;
-
-      for (size_t j = i + 1; j < candidates.size(); ++j)
-      {
-        if (candidates[j].suppressed)
-          continue;
-
-        if (iou(candidates[i], candidates[j]) > threshold)
-          candidates[j].suppressed = true;
-      }
-    }
-  }
 
   void processOutput(
       std::span<std::string> classes,
@@ -303,6 +306,7 @@ struct YOLO_pose
     std::vector<pos> keypoints;
   };
 
+  // FIXME use NMS instead
   static bool similar(pose_type::rect lhs, pose_type::rect rhs) noexcept
   {
     const float epsilon = std::min(0.1 * lhs.w, 0.1 * lhs.h);
@@ -322,6 +326,7 @@ struct YOLO_pose
     }
     return false;
   }
+
   void processOutput(
       const Onnx::ModelSpec& spec,
       std::span<Ort::Value> outputTensor,
@@ -400,6 +405,178 @@ struct YOLO_pose
           }
         }
       }
+    }
+  }
+};
+
+struct YOLO_segmentation
+{
+  // Holds the results for a single segmented object
+  struct segmentation_type
+  {
+    std::string name;
+    struct
+    {
+      float x, y, w, h;
+    } geometry;
+    float confidence{};
+    // The final binary mask, with dimensions of the original image.
+    boost::dynamic_bitset<> mask;
+  };
+
+  // Main processing function for segmentation model outputs
+  static void processOutput(
+      std::span<std::string> classes,
+      std::span<Ort::Value> outputTensors,
+      std::vector<segmentation_type>& out,
+      int image_w,
+      int image_h,
+      int model_w,
+      int model_h,
+      float iou_threshold = 0.45f,
+      float conf_threshold = 0.25f)
+  {
+    out.clear();
+    // Segmentation models have two outputs: predictions and prototypes
+    if (outputTensors.size() != 2)
+      return;
+
+    // 1. Get Tensors and their shapes
+    auto& predictions_tensor
+        = outputTensors[0]; // [1, 4+num_classes+num_masks, 8400]
+    auto& protos_tensor
+        = outputTensors[1]; // [1, num_masks, mask_height, mask_width]
+
+    auto pred_shape
+        = predictions_tensor.GetTensorTypeAndShapeInfo().GetShape();
+    const int num_proposals = pred_shape[2]; // 8400
+    const int num_channels = pred_shape[1];
+    const int num_classes = classes.size();
+    const int num_mask_coeffs = num_channels - 4 - num_classes; // should be 32
+
+    auto protos_shape = protos_tensor.GetTensorTypeAndShapeInfo().GetShape();
+    const int mask_height = protos_shape[2];
+    const int mask_width = protos_shape[3];
+
+    const float* pred_data = predictions_tensor.GetTensorData<float>();
+    const float* protos_data = protos_tensor.GetTensorData<float>();
+
+    // 2. Decode predictions and filter by confidence
+    struct Candidate
+    {
+      int class_id;
+      float confidence;
+      float x, y, w, h; // Bounding box
+      const float* mask_coeffs;
+      bool suppressed{};
+    };
+    std::vector<Candidate> candidates;
+
+    const float x_factor = (float)image_w / model_w;
+    const float y_factor = (float)image_h / model_h;
+
+    for (int i = 0; i < num_proposals; ++i)
+    {
+      // Find class with max score
+      float max_score = 0;
+      int class_id = -1;
+      const float* class_scores_start = pred_data + (4 * num_proposals) + i;
+      for (int j = 0; j < num_classes; ++j)
+      {
+        float score = class_scores_start[j * num_proposals];
+        if (score > max_score)
+        {
+          max_score = score;
+          class_id = j;
+        }
+      }
+
+      if (max_score > conf_threshold)
+      {
+        const float* box_start = pred_data + i;
+        float cx = box_start[0 * num_proposals];
+        float cy = box_start[1 * num_proposals];
+        float w = box_start[2 * num_proposals];
+        float h = box_start[3 * num_proposals];
+
+        if (w * h >= (0.9 * image_w * image_h))
+          continue;
+
+        candidates.push_back(
+            {class_id,
+             max_score,
+             (cx - w / 2.f) * x_factor,
+             (cy - h / 2.f) * y_factor,
+             w * x_factor,
+             h * y_factor,
+             pred_data + ((4 + num_classes) * num_proposals) + i,
+             false});
+      }
+    }
+
+    nms(candidates, iou_threshold);
+
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+      if (candidates[i].suppressed)
+        continue;
+      const auto& det = candidates[i];
+
+      boost::dynamic_bitset<> low_res_mask(mask_width * mask_height);
+      // Matrix multiplication: mask_coeffs [1, 32] x protos [32, 160*160]
+      for (int p_idx = 0; p_idx < mask_width * mask_height; ++p_idx)
+      {
+        float sum = 0;
+        for (int c_idx = 0; c_idx < num_mask_coeffs; ++c_idx)
+        {
+          sum += det.mask_coeffs[c_idx * num_proposals]
+                 * protos_data[c_idx * (mask_width * mask_height) + p_idx];
+        }
+        // FIXME choose this threshold?
+        if ((1.f / (1.f + std::exp(-sum))) > 0.5f)
+          low_res_mask.set(p_idx);
+      }
+
+      // Scale mask to original image size
+      float gain = std::min(
+          (float)mask_width / image_w, (float)mask_height / image_h);
+      float pad_w = ((float)mask_width - image_w * gain) / 2.f;
+      float pad_h = ((float)mask_height - image_h * gain) / 2.f;
+
+      int crop_x1 = std::round(pad_w);
+      int crop_y1 = std::round(pad_h);
+      int crop_x2 = mask_width - std::round(pad_w);
+      int crop_y2 = mask_height - std::round(pad_h);
+
+      boost::dynamic_bitset<> final_mask(image_w * image_h);
+      for (int y = 0; y < image_h; ++y)
+      {
+        for (int x = 0; x < image_w; ++x)
+        {
+          // Map final mask coordinate to low_res_mask coordinate
+          float low_res_x
+              = (x * (crop_x2 - crop_x1) / (float)image_w) + crop_x1;
+          float low_res_y
+              = (y * (crop_y2 - crop_y1) / (float)image_h) + crop_y1;
+          int m_x = std::clamp((int)low_res_x, 0, mask_width - 1);
+          int m_y = std::clamp((int)low_res_y, 0, mask_height - 1);
+
+          if (low_res_mask[m_y * mask_width + m_x])
+          {
+            bool in_box
+                = (x >= det.x && x < (det.x + det.w) && y >= det.y
+                   && y < (det.y + det.h));
+            if (in_box)
+              final_mask.set(y * image_w + x);
+          }
+        }
+      }
+
+      out.push_back(
+          {classes[det.class_id],
+           {det.x, det.y, det.w, det.h},
+           det.confidence,
+           std::move(final_mask)});
     }
   }
 };

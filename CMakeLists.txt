@@ -41,6 +41,20 @@ avnd_score_plugin_add(
   BASE_TARGET
     score_addon_onnx_models
   SOURCES
+    OnnxModels/YOLO-segmentation.hpp
+    OnnxModels/YOLO-segmentation.cpp
+  TARGET
+    yolo-segmentation
+  MAIN_CLASS
+    YOLO8Segmentation
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
     OnnxModels/Resnet.hpp
     OnnxModels/Resnet.cpp
   TARGET
