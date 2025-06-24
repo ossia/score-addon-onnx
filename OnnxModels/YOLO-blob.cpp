@@ -29,15 +29,35 @@ void YOLO7BlobDetector::loadClasses()
 
 void YOLO7BlobDetector::operator()()
 {
+  if (!available)
+    return;
+  if (this->inputs.model.file.bytes.empty())
+    return;
+
   auto& in_tex = inputs.image.texture;
   if (!in_tex.changed)
     return;
 
   if (!this->ctx)
-  {
-    this->ctx
-        = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
-  }
+    try
+    {
+      this->ctx = std::make_unique<Onnx::OnnxRunContext>(
+          this->inputs.model.file.bytes);
+    }
+    catch (std::exception& e)
+    {
+      std::cerr << "Error while loading the model: " << e.what() << "\n";
+      available = false;
+      return;
+    }
+    catch (...)
+    {
+
+      std::cerr << "Error while loading the model\n";
+      available = false;
+      return;
+    }
+
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
   auto t = nchw_tensorFromRGBA(

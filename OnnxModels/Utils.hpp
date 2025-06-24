@@ -48,6 +48,9 @@ public:
                 + "/_deps/onnxruntime-src/lib/libonnxruntime.dylib",
             ossia::get_exe_folder()
                 + "/../_deps/onnxruntime-src/lib/libonnxruntime.dylib",
+            ossia::get_exe_folder()
+                + "/../../../_deps/onnxruntime-src/lib/libonnxruntime.dylib",
+            ossia::get_exe_folder() + "/../Frameworks/libonnxruntime.dylib",
 #elif defined(_WIN32)
             "libonnxruntime.dll",
             "./_deps/onnxruntime-src/lib/libonnxruntime.dll",

@@ -18,7 +18,7 @@ namespace Onnx
 {
 struct Options
 {
-  std::string provider = "cuda";
+  std::string provider = "default";
   int device_id = 0;
 };
 
@@ -42,7 +42,30 @@ try
       c = std::tolower(c);
   }
 
-  if (opts.provider == "cuda" && ossia::contains(p, "cuda"))
+  std::string requested_provider = opts.provider;
+  if (requested_provider == "default")
+  {
+    if (ossia::contains(p, "cuda"))
+      requested_provider = "cuda";
+#if defined(_WIN32)
+    else if (ossia::contains(p, "dml"))
+      requested_provider = "dml";
+#endif
+    else if (ossia::contains(p, "rocm"))
+      requested_provider = "rocm";
+    else if (ossia::contains(p, "openvino"))
+      requested_provider = "openvino";
+#if defined(__APPLE__)
+    else if (ossia::contains(p, "coreml"))
+      requested_provider = "coreml";
+#endif
+    else if (ossia::contains(p, "webgpu"))
+      requested_provider = "webgpu";
+    else if (ossia::contains(p, "cpu"))
+      requested_provider = "cpu";
+  }
+
+  if (requested_provider == "cuda" && ossia::contains(p, "cuda"))
   {
     using namespace Ort;
 
@@ -74,7 +97,7 @@ try
     session_options.AppendExecutionProvider_CUDA_V2(*cuda_option_v2);
   }
 
-  if (opts.provider == "tensorrt" && ossia::contains(p, "tensorrt"))
+  if (requested_provider == "tensorrt" && ossia::contains(p, "tensorrt"))
   {
     using namespace Ort;
     const std::vector keys{
@@ -93,7 +116,7 @@ try
     // FIXME release options
   }
 
-  if (opts.provider == "rocm" && ossia::contains(p, "rocm"))
+  if (requested_provider == "rocm" && ossia::contains(p, "rocm"))
   {
     using namespace Ort;
     OrtROCMProviderOptions* options{};
@@ -103,7 +126,7 @@ try
     // FIXME release options
   }
 
-  if (opts.provider == "openvino" && ossia::contains(p, "openvino"))
+  if (requested_provider == "openvino" && ossia::contains(p, "openvino"))
   {
     using namespace Ort;
 
@@ -117,7 +140,7 @@ try
   }
 
 #if _WIN32
-  if (opts.provider == "dml" && ossia::contains(p, "dml"))
+  if (requested_provider == "dml" && ossia::contains(p, "dml"))
   {
     using namespace Ort;
 
@@ -127,7 +150,7 @@ try
 #endif
 
 #if __APPLE__
-  if (opts.provider == "coreml" && ossia::contains(p, "coreml"))
+  if (requested_provider == "coreml" && ossia::contains(p, "coreml"))
   {
     using namespace Ort;
 
