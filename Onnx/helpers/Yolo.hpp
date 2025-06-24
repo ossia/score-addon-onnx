@@ -32,7 +32,7 @@ static float iou(const auto& box1, const auto& box2)
 // non-maximum supression
 static void nms(auto& candidates, float threshold)
 {
-  using type = std::remove_cvref_t<decltype(candidates)>::value_type;
+  using type = typename std::remove_cvref_t<decltype(candidates)>::value_type;
   std::sort(
       candidates.begin(),
       candidates.end(),
