@@ -7,6 +7,9 @@
   #ifndef _Frees_ptr_opt_
     #define _Frees_ptr_opt_
   #endif
+#ifndef _Return_type_success_
+#define _Return_type_success_(...)
+#endif
 #else
   #define __restrict__
 #endif

@@ -8,7 +8,7 @@
 #if defined(ORT_API_MANUAL_INIT)
 #include <ossia/detail/dylib_loader.hpp>
 
-#include <onnxruntime_cxx_api.h>
+#include <Onnx/helpers/OnnxBase.hpp>
 #endif
 
 #include <QDebug>

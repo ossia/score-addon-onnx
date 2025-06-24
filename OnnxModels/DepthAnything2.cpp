@@ -52,7 +52,9 @@ try
 
   {
     const int N = out_tt[0].GetTensorTypeAndShapeInfo().GetElementCount();
-    SCORE_ASSERT(N == 518 * 518);
+    if (N != 518 * 518)
+      return;
+
     std::span<const float> res
         = std::span(out_tt[0].GetTensorData<float>(), N);
 
