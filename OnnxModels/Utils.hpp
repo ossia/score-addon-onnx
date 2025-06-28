@@ -27,7 +27,6 @@ public:
       : library{{
 
 #if defined(__linux__)
-            "libonnxruntime.so.1",
             "lib/libonnxruntime.so.1",
             "../lib/libonnxruntime.so.1",
             "./_deps/onnxruntime-src/lib/libonnxruntime.so.1",
@@ -39,8 +38,8 @@ public:
                 + "/_deps/onnxruntime-src/lib/libonnxruntime.so.1",
             ossia::get_exe_folder()
                 + "/../_deps/onnxruntime-src/lib/libonnxruntime.so.1",
+            "libonnxruntime.so.1",
 #elif defined(__APPLE__)
-            "libonnxruntime.dylib",
             "./_deps/onnxruntime-src/lib/libonnxruntime.dylib",
             "../_deps/onnxruntime-src/lib/libonnxruntime.dylib",
             ossia::get_exe_folder() + "/libonnxruntime.dylib",
@@ -51,15 +50,16 @@ public:
             ossia::get_exe_folder()
                 + "/../../../_deps/onnxruntime-src/lib/libonnxruntime.dylib",
             ossia::get_exe_folder() + "/../Frameworks/libonnxruntime.dylib",
+            "libonnxruntime.dylib",
 #elif defined(_WIN32)
-            "libonnxruntime.dll",
-            "./_deps/onnxruntime-src/lib/libonnxruntime.dll",
-            "../_deps/onnxruntime-src/lib/libonnxruntime.dll",
-            ossia::get_exe_folder() + "/libonnxruntime.dll",
+            "./_deps/onnxruntime-src/lib/onnxruntime.dll",
+            "../_deps/onnxruntime-src/lib/onnxruntime.dll",
+            ossia::get_exe_folder() + "/onnxruntime.dll",
             ossia::get_exe_folder()
-                + "/_deps/onnxruntime-src/lib/libonnxruntime.dll",
+                + "/_deps/onnxruntime-src/lib/onnxruntime.dll",
             ossia::get_exe_folder()
-                + "/../_deps/onnxruntime-src/lib/libonnxruntime.dll",
+                + "/../_deps/onnxruntime-src/lib/onnxruntime.dll",
+            "onnxruntime.dll",
 #endif
 
         }}
