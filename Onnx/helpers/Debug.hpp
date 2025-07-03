@@ -33,8 +33,12 @@ inline QDebug operator<<(QDebug s, ONNXTensorElementDataType t)
       return s << "UNDEFINED";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
       return s << "FLOAT"; // maps to c type float
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4:
+      return s << "UINT4"; // ??
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
       return s << "UINT8"; // maps to c type uint8_t
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4:
+      return s << "INT4"; // ??
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
       return s << "INT8"; // maps to c type int8_t
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:

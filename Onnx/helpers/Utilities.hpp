@@ -61,7 +61,7 @@ inline void softmax(std::span<const float> in, std::vector<float>& out)
   out.clear();
   out.resize(in.size());
 #pragma omp simd
-  for (int k = 0; k < in.size(); k++)
+  for (std::size_t k = 0; k < in.size(); k++)
   {
     out[k] = std::exp(in[k]);
   }
@@ -70,7 +70,7 @@ inline void softmax(std::span<const float> in, std::vector<float>& out)
     return;
 
 #pragma omp simd
-  for (int k = 0; k < in.size(); k++)
+  for (std::size_t k = 0; k < in.size(); k++)
   {
     out[k] /= esum;
   }
