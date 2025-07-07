@@ -124,7 +124,7 @@ target_include_directories(onnxruntime INTERFACE "${onnxruntime_INCLUDE_DIRS}")
 add_library(onnxruntime::onnxruntime ALIAS onnxruntime)
 
 
-if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES)
+if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES AND NOT SCORE_NO_INSTALL_ONNXRUNTIME)
     if(APPLE)
         file(GLOB ONNXRUNTIME_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dylib")
     elseif(WIN32)
