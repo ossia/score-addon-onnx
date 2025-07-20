@@ -6,6 +6,7 @@
 
 #include <QDir>
 #include <QProcess>
+#include <QDebug>
 
 #include <Onnx/helpers/Images.hpp>
 #include <PythonModels/PromptParser.hpp>
@@ -19,6 +20,7 @@ namespace PythonModels
 
 QString uvPath()
 {
+    return "/home/jcelerier/.local/bin";
   return score::AppContext()
              .settings<Library::Settings::Model>()
              .getPackagesPath()
@@ -26,6 +28,7 @@ QString uvPath()
 }
 QString StreamDiffusionPath()
 {
+    return "/home/jcelerier/projets/oss/StreamDiffusion-uv";
   return score::AppContext()
              .settings<Library::Settings::Model>()
              .getPackagesPath()
@@ -97,6 +100,7 @@ int StreamDiffusionWrapper::setup_path()
   sys.attr("path").attr("insert")(
       1,
       QString(sd_path + "/.venv/lib/python3.13/site-packages").toStdString());
+
   return 1;
 }
 
@@ -172,7 +176,9 @@ stream = StreamDiffusion(
     width={3},
     height={4},
     use_denoising_batch={5}
-))",
+)
+stream.load_lcm_lora()
+)",
         count,
         m_cfg,
         m_add_noise ? "True"sv : "False"sv,
@@ -265,7 +271,6 @@ void StreamDiffusionWrapper::update_prompt()
 {
   try
   {
-    qDebug() << "Parsing..." << m_prompt_positive;
     if (auto weights = parse_input_string(m_prompt_positive))
     {
       std::string prompt;
@@ -275,9 +280,6 @@ void StreamDiffusionWrapper::update_prompt()
       }
       if (prompt.ends_with(','))
         prompt.pop_back();
-
-      qDebug() << fmt::format(
-          "stream.update_prompts(weighted_prompts=[{}])", prompt);
       py::exec(
           fmt::format("stream.update_prompts(weighted_prompts=[{}])", prompt));
     }

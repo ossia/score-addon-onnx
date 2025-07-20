@@ -20,6 +20,9 @@ if(NOT TARGET onnxruntime::onnxruntime)
   return()
 endif()
 
+set (PYBIND11_PYTHON_VERSION "3.13")
+add_subdirectory("${OSSIA_3RDPARTY_FOLDER}/pybind11" pybind11_313)
+
 # General initialization
 score_common_setup()
 
