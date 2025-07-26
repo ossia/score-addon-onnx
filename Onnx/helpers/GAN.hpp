@@ -15,7 +15,7 @@
 
 namespace Onnx
 {
-
+struct ModelSpec;
 // Configuration for different GAN-like architectures
 struct GANConfig
 {
@@ -33,12 +33,18 @@ struct GANConfig
   bool requires_mapping_network = false;
   bool is_generative = true; // false for image-to-image translation
 
+  // Tensor format
+  std::string tensor_format = "NCHW"; // "NCHW" or "NHWC"
+
   // Normalization parameters
   float input_mean = 0.0f;
   float input_std = 1.0f;
   float output_min = -1.0f;
   float output_max = 1.0f;
 };
+
+// Helper function to update GANConfig with model specifications  
+void updateConfigWithModelSpec(GANConfig& config, const ModelSpec& spec, const QImage& input_image = QImage());
 
 // StyleGAN-like architecture (mapping + synthesis)
 class StyleGANModel
@@ -171,34 +177,5 @@ public:
   getDeblurGANv2Config(const std::vector<std::string>& model_paths);
 };
 
-// Utility functions
-class GANUtils
-{
-public:
-  // Generate random latent vector (normal distribution)
-  static std::vector<float>
-  generateRandomLatent(size_t size, float mean = 0.0f, float std = 1.0f);
 
-  // Generate uniform random vector
-  static std::vector<float>
-  generateUniformRandom(size_t size, float min = 0.0f, float max = 1.0f);
-
-  // Interpolate between two latent vectors
-  static std::vector<float> interpolateLatents(
-      const std::vector<float>& a,
-      const std::vector<float>& b,
-      float t);
-
-  // Normalize tensor data to [0,255] range
-  static QImage normalizeToImage(
-      const float* data,
-      const std::vector<int64_t>& shape,
-      float min_val,
-      float max_val);
-
-  // Convert NCHW tensor to QImage
-  static QImage
-  nchwToQImage(const float* data, int width, int height, int channels);
-};
-
-} // namespace GANInference
+} // namespace Onnx

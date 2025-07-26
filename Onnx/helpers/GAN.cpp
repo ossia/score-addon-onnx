@@ -2,10 +2,12 @@
 
 #include <QFile>
 
+#include <Onnx/helpers/Images.hpp>
+#include <Onnx/helpers/OnnxContext.hpp>
+#include <Onnx/helpers/Utilities.hpp>
 #include <cmath>
 
 #include <algorithm>
-
 namespace Onnx
 {
 
@@ -15,35 +17,8 @@ StyleGANModel::StyleGANModel(const GANConfig& config)
     , config_(config)
     , rng_(std::random_device{}())
 {
-  session_options_.SetIntraOpNumThreads(1);
-  session_options_.SetGraphOptimizationLevel(
-      GraphOptimizationLevel::ORT_ENABLE_ALL);
-
-  session_options_.SetGraphOptimizationLevel(
-      GraphOptimizationLevel::ORT_ENABLE_ALL);
-
-  session_options_.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
-  {
-    using namespace Ort;
-
-    auto api = Ort::GetApi();
-    OrtCUDAProviderOptionsV2* cuda_option_v2 = nullptr;
-    Ort::ThrowOnError(api.CreateCUDAProviderOptions(&cuda_option_v2));
-    const std::vector keys{
-        "arena_extend_strategy",
-        "cudnn_conv_algo_search",
-        "do_copy_in_default_stream",
-        "cudnn_conv_use_max_workspace",
-        "cudnn_conv1d_pad_to_nc1d",
-        "enable_cuda_graph",
-        "enable_skip_layer_norm_strict_mode"};
-    const std::vector values{
-        "kNextPowerOfTwo", "EXHAUSTIVE", "1", "1", "1", "0", "1"};
-    Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
-        cuda_option_v2, keys.data(), values.data(), keys.size()));
-    // FIXME release options
-    session_options_.AppendExecutionProvider_CUDA_V2(*cuda_option_v2);
-  }
+  Onnx::Options oopts;
+  session_options_ = Onnx::create_session_options(oopts);
 
   if (config_.model_paths.size() >= 2)
   {
@@ -59,7 +34,7 @@ StyleGANModel::StyleGANModel(const GANConfig& config)
 
 QImage StyleGANModel::generateRandom()
 {
-  auto latent = GANUtils::generateRandomLatent(
+  auto latent = generateRandomLatent(
       config_.latent_dim, config_.input_mean, config_.input_std);
   return generateFromLatent(latent);
 }
@@ -87,22 +62,13 @@ StyleGANModel::runMapping(const std::vector<float>& z_vector)
 
   // Create Z tensor
   std::vector<int64_t> z_shape = {1, static_cast<int64_t>(z_vector.size())};
-  auto z_tensor = Ort::Value::CreateTensor<float>(
-      memory_info,
-      const_cast<float*>(z_vector.data()),
-      z_vector.size(),
-      z_shape.data(),
-      z_shape.size());
+  std::vector<float> z_copy(z_vector); // vec_to_tensor needs non-const data
+  auto z_tensor = vec_to_tensor<float>(z_copy, z_shape);
 
   // Create truncation psi tensor (for StyleGAN)
   std::vector<float> truncation_psi = {0.7f, 0.7f};
   std::vector<int64_t> psi_shape = {2};
-  auto psi_tensor = Ort::Value::CreateTensor<float>(
-      memory_info,
-      truncation_psi.data(),
-      truncation_psi.size(),
-      psi_shape.data(),
-      psi_shape.size());
+  auto psi_tensor = vec_to_tensor<float>(truncation_psi, psi_shape);
 
   // Get input/output names
   auto input0_name = mapping_session_->GetInputNameAllocated(0, allocator_);
@@ -146,22 +112,13 @@ QImage StyleGANModel::runSynthesis(const std::vector<float>& w_vector)
 
   // Create W tensor (reshape to [1, 16, 1024] for StyleGAN)
   std::vector<int64_t> w_shape = {1, 16, 1024};
-  auto w_tensor = Ort::Value::CreateTensor<float>(
-      memory_info,
-      const_cast<float*>(w_vector.data()),
-      w_vector.size(),
-      w_shape.data(),
-      w_shape.size());
+  std::vector<float> w_copy(w_vector); // vec_to_tensor needs non-const data
+  auto w_tensor = vec_to_tensor<float>(w_copy, w_shape);
 
   // Create noise tensor
   std::vector<float> noise = {0.0f};
   std::vector<int64_t> noise_shape = {1};
-  auto noise_tensor = Ort::Value::CreateTensor<float>(
-      memory_info,
-      noise.data(),
-      noise.size(),
-      noise_shape.data(),
-      noise_shape.size());
+  auto noise_tensor = vec_to_tensor<float>(noise, noise_shape);
 
   // Get input/output names
   auto input0_name = synthesis_session_->GetInputNameAllocated(0, allocator_);
@@ -202,12 +159,7 @@ QImage StyleGANModel::tensorToImage(
   if (shape.size() != 4)
     return QImage();
 
-  int channels = static_cast<int>(shape[1]);
-  int height = static_cast<int>(shape[2]);
-  int width = static_cast<int>(shape[3]);
-
-  return GANUtils::normalizeToImage(
-      data, shape, config_.output_min, config_.output_max);
+  return normalizeToImage(data, shape, config_.output_min, config_.output_max);
 }
 
 // Single Network GAN Implementation
@@ -216,25 +168,8 @@ SingleNetworkGAN::SingleNetworkGAN(const GANConfig& config)
     , config_(config)
     , rng_(std::random_device{}())
 {
-  session_options_.SetIntraOpNumThreads(1);
-
-  // For PyTorchGAN, configure for dynamic shape handling
-  if (config_.model_type == "PyTorchGAN")
-  {
-    // Use only basic optimizations and sequential execution for stability
-    session_options_.SetGraphOptimizationLevel(
-        GraphOptimizationLevel::ORT_ENABLE_BASIC);
-    session_options_.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-    session_options_.DisableMemPattern();
-    session_options_.DisableCpuMemArena();
-    qDebug() << "PyTorchGAN: Using basic optimizations with memory "
-                "optimizations disabled";
-  }
-  else
-  {
-    session_options_.SetGraphOptimizationLevel(
-        GraphOptimizationLevel::ORT_ENABLE_ALL);
-  }
+  Onnx::Options oopts;
+  session_options_ = Onnx::create_session_options(oopts);
 
   if (!config_.model_paths.empty())
   {
@@ -252,24 +187,24 @@ QImage SingleNetworkGAN::generateRandom()
   if (config_.model_type == "EigenGAN")
   {
     // eps: [1,512] shape (first input)
-    inputs.push_back(GANUtils::generateRandomLatent(512, 0.0f, 1.0f));
+    inputs.push_back(generateRandomLatent(512, 0.0f, 1.0f));
     // z_ to z_5: [1,6] shape each
     for (int i = 0; i < 6; ++i)
     {
-      inputs.push_back(GANUtils::generateRandomLatent(6, 0.0f, 1.0f));
+      inputs.push_back(generateRandomLatent(6, 0.0f, 1.0f));
     }
   }
   else if (config_.model_type == "PyTorchGAN")
   {
     // PyTorchGAN uses uniform random [0,1]
     inputs.push_back(
-        GANUtils::generateUniformRandom(config_.latent_dim, 0.0f, 1.0f));
+        generateUniformRandom(config_.latent_dim, 0.0f, 1.0f));
   }
   else
   {
     // Default: single latent vector with normal distribution
     inputs.push_back(
-        GANUtils::generateRandomLatent(
+        generateRandomLatent(
             config_.latent_dim, config_.input_mean, config_.input_std));
   }
 
@@ -341,12 +276,8 @@ SingleNetworkGAN::runGenerator(const std::vector<std::vector<float>>& inputs)
       qDebug() << "PyTorchGAN: Input data size:" << inputs[i].size();
     }
 
-    auto tensor = Ort::Value::CreateTensor<float>(
-        memory_info,
-        const_cast<float*>(inputs[i].data()),
-        inputs[i].size(),
-        shape.data(),
-        shape.size());
+    std::vector<float> input_copy(inputs[i]); // vec_to_tensor needs non-const data
+    auto tensor = vec_to_tensor<float>(input_copy, shape);
 
     ort_inputs.push_back(std::move(tensor));
   }
@@ -524,53 +455,10 @@ QImage SingleNetworkGAN::tensorToImage(
   }
 
   // Default NCHW format handling
-  return GANUtils::normalizeToImage(
+  return normalizeToImage(
       data, shape, config_.output_min, config_.output_max);
 }
-/*
-// Factory Implementation
-std::unique_ptr<GANModel> GANFactory::createModel(const std::string& model_type, const std::vector<std::string>& model_paths)
-{
-    if (model_type == "StyleGAN" || model_type == "FBAnime")
-    {
-        auto config = getFBAnimeConfig(model_paths);
-        return std::make_unique<StyleGANModel>(config);
-    }
-    else if (model_type == "EigenGAN")
-    {
-        auto config = getEigenGANConfig(model_paths);
-        return std::make_unique<SingleNetworkGAN>(config);
-    }
-    else if (model_type == "MobileStyleGAN")
-    {
-        auto config = getMobileStyleGANConfig(model_paths);
-        return std::make_unique<SingleNetworkGAN>(config);
-    }
-    else if (model_type == "PyTorchGAN")
-    {
-        auto config = getPyTorchGANConfig(model_paths);
-        return std::make_unique<SingleNetworkGAN>(config);
-    }
-    else if (model_type == "AnimeGANv3")
-    {
-        auto config = getAnimeGANv3Config(model_paths);
-        return std::make_unique<ImageTranslationGAN>(config);
-    }
-    else if (model_type == "FastSRGAN")
-    {
-      auto config = getFastSRGANConfig(model_paths);
-      return std::make_unique<ImageTranslationGAN>(config);
-    }
-    else if (model_type == "DeblurGANv2")
-    {
-        auto config = getDeblurGANv2Config(model_paths);
-        return std::make_unique<ImageTranslationGAN>(config);
-    }
-    
-    qDebug() << "Unknown model type:" << model_type.c_str();
-    return nullptr;
-}
-*/
+
 GANConfig
 GANFactory::getFBAnimeConfig(const std::vector<std::string>& model_paths)
 {
@@ -614,16 +502,24 @@ GANConfig GANFactory::getMobileStyleGANConfig(
   GANConfig config;
   config.model_type = "MobileStyleGAN";
   config.model_paths = model_paths;
-  config.latent_dim = 512;
-  config.output_width = 1024;
-  config.output_height = 1024;
   config.requires_mapping_network = false; // Single ONNX file
-  config.input_names = {"latent_vector"};
-  config.input_shapes = {{1, 512}};
+  config.is_generative = true;
   config.input_mean = 0.0f;
   config.input_std = 1.0f;
   config.output_min = 0.0f; // MobileStyleGAN likely outputs [0,1] range
   config.output_max = 1.0f;
+  
+  // Read actual model specifications
+  if (!model_paths.empty()) {
+    auto spec = readModelSpec(model_paths[0]);
+    updateConfigWithModelSpec(config, spec);
+  }
+  
+  // Fallback defaults if model spec reading failed
+  if (config.latent_dim == 0) config.latent_dim = 512;
+  if (config.output_width == 0) config.output_width = 1024;
+  if (config.output_height == 0) config.output_height = 1024;
+  
   return config;
 }
 
@@ -654,20 +550,25 @@ GANFactory::getAnimeGANv3Config(const std::vector<std::string>& model_paths)
   config.model_type = "AnimeGANv3";
   config.model_paths = model_paths;
   config.latent_dim = 0;    // No latent space for image translation
-  config.input_width = 256; // Default input size (can be dynamic)
-  config.input_height = 256;
-  config.output_width = 256; // Same as input for AnimeGANv3
-  config.output_height = 256;
   config.requires_mapping_network = false;
   config.is_generative = false; // Image-to-image translation
-  config.input_names = {"AnimeGANv3_input:0"};
-  config.output_names = {"generator_1/main/out_layer:0"};
-  config.input_shapes
-      = {{1, -1, -1, 3}};   // [batch, height, width, channels] - dynamic HW
   config.input_mean = 0.0f; // Images normalized to [0,1]
   config.input_std = 1.0f;
   config.output_min = 0.0f; // Output normalized to [0,1]
   config.output_max = 1.0f;
+  
+  // Read actual model specifications
+  if (!model_paths.empty()) {
+    auto spec = readModelSpec(model_paths[0]);
+    updateConfigWithModelSpec(config, spec);
+  }
+  
+  // Fallback defaults if model spec reading failed
+  if (config.input_width == 0) config.input_width = 256;
+  if (config.input_height == 0) config.input_height = 256;
+  if (config.output_width == 0) config.output_width = 256;
+  if (config.output_height == 0) config.output_height = 256;
+  
   return config;
 }
 
@@ -678,22 +579,25 @@ GANFactory::getFastSRGANConfig(const std::vector<std::string>& model_paths)
   config.model_type = "FastSRGAN";
   config.model_paths = model_paths;
   config.latent_dim = 0;    // No latent space for super-resolution
-  config.input_width = 256; // Fixed input size for this model
-  config.input_height = 256;
-  config.output_width = 1024; // 4x upscaling
-  config.output_height = 1024;
   config.requires_mapping_network = false;
-  config.is_generative
-      = false; // Image-to-image translation (super-resolution)
-  config.input_names = {"input_1"};
-  config.output_names = {"model_2"};
-  config.input_shapes
-      = {{1, 3, 256, 256}}; // [batch, channels, height, width] - NCHW format
-  config.input_mean
-      = 0.5f; // Images normalized to [0,1], then centered to [-1,1]
+  config.is_generative = false; // Image-to-image translation (super-resolution)
+  config.input_mean = 0.5f; // Images normalized to [0,1], then centered to [-1,1]
   config.input_std = 0.5f;   // For (x - 0.5) / 0.5 normalization
   config.output_min = -1.0f; // Output in [-1,1] range based on inspection
   config.output_max = 1.0f;
+  
+  // Read actual model specifications
+  if (!model_paths.empty()) {
+    auto spec = readModelSpec(model_paths[0]);
+    updateConfigWithModelSpec(config, spec);
+  }
+  
+  // Fallback defaults if model spec reading failed
+  if (config.input_width == 0) config.input_width = 256;
+  if (config.input_height == 0) config.input_height = 256;
+  if (config.output_width == 0) config.output_width = 1024;  // 4x upscaling default
+  if (config.output_height == 0) config.output_height = 1024;
+  
   return config;
 }
 
@@ -726,35 +630,8 @@ ImageTranslationGAN::ImageTranslationGAN(const GANConfig& config)
     : env_(ORT_LOGGING_LEVEL_WARNING, "image_translation_model")
     , config_(config)
 {
-  qDebug() << "ImageTranslationGAN constructor start for"
-           << config.model_type.c_str();
-  session_options_.SetIntraOpNumThreads(1);
-  session_options_.SetGraphOptimizationLevel(
-      GraphOptimizationLevel::ORT_ENABLE_ALL);
-  session_options_.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
-  qDebug() << "Session options configured";
-
-  // Add CUDA provider if available (temporarily disabled for debugging)
-
-  {
-    using namespace Ort;
-    auto api = Ort::GetApi();
-    OrtCUDAProviderOptionsV2* cuda_option_v2 = nullptr;
-    Ort::ThrowOnError(api.CreateCUDAProviderOptions(&cuda_option_v2));
-    const std::vector keys{
-        "arena_extend_strategy",
-        "cudnn_conv_algo_search",
-        "do_copy_in_default_stream",
-        "cudnn_conv_use_max_workspace",
-        "cudnn_conv1d_pad_to_nc1d",
-        "enable_cuda_graph",
-        "enable_skip_layer_norm_strict_mode"};
-    const std::vector values{
-        "kNextPowerOfTwo", "EXHAUSTIVE", "1", "1", "1", "0", "1"};
-    Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
-        cuda_option_v2, keys.data(), values.data(), keys.size()));
-    session_options_.AppendExecutionProvider_CUDA_V2(*cuda_option_v2);
-  }
+  Onnx::Options oopts;
+  session_options_ = Onnx::create_session_options(oopts);
 
   if (!config_.model_paths.empty())
   {
@@ -783,46 +660,45 @@ QImage ImageTranslationGAN::runTranslation(const QImage& input_image)
 
   // Resize input if needed for models with fixed input sizes
   QImage processed_image = input_image;
-  if (config_.model_type == "FastSRGAN" || config_.model_type == "DeblurGANv2")
+  
+  // Determine if we need to resize based on whether model has fixed dimensions
+  bool needsFixedSize = (config_.input_width > 0 && config_.input_height > 0);
+  
+  if (needsFixedSize && (input_image.width() != config_.input_width || input_image.height() != config_.input_height))
   {
-    if (input_image.width() != config_.input_width
-        || input_image.height() != config_.input_height)
-    {
-      processed_image = input_image.scaled(
-          config_.input_width,
-          config_.input_height,
-          Qt::IgnoreAspectRatio,
-          Qt::SmoothTransformation);
-    }
+    processed_image = input_image.scaled(
+        config_.input_width,
+        config_.input_height,
+        Qt::IgnoreAspectRatio,
+        Qt::SmoothTransformation);
   }
 
   // Convert QImage to tensor format
-  auto tensor_data = imageToTensor(processed_image);
+  auto tensor_data = Onnx::imageToTensor(
+      processed_image,
+      config_.tensor_format,
+      config_.input_mean,
+      config_.input_std);
   if (tensor_data.empty())
   {
     qDebug() << "Failed to convert image to tensor";
     return QImage();
   }
 
-  // Create input tensor with format based on model type
+  // Create input tensor with format based on model configuration
   std::vector<int64_t> input_shape;
-  if (config_.model_type == "FastSRGAN" || config_.model_type == "DeblurGANv2")
+  if (config_.tensor_format == "NCHW")
   {
     // NCHW format: [batch, channels, height, width]
     input_shape = {1, 3, processed_image.height(), processed_image.width()};
   }
   else
   {
-    // NHWC format: [batch, height, width, channels] (AnimeGANv3)
+    // NHWC format: [batch, height, width, channels]
     input_shape = {1, processed_image.height(), processed_image.width(), 3};
   }
 
-  auto input_tensor = Ort::Value::CreateTensor<float>(
-      memory_info,
-      tensor_data.data(),
-      tensor_data.size(),
-      input_shape.data(),
-      input_shape.size());
+  auto input_tensor = vec_to_tensor<float>(tensor_data, input_shape);
 
   // Get input/output names
   auto input_name = translation_session_->GetInputNameAllocated(0, allocator_);
@@ -861,67 +737,6 @@ QImage ImageTranslationGAN::runTranslation(const QImage& input_image)
   }
 }
 
-std::vector<float> ImageTranslationGAN::imageToTensor(const QImage& image)
-{
-  if (image.isNull())
-    return {};
-
-  // Convert to RGB format if necessary
-  QImage rgb_image = image.convertToFormat(QImage::Format_RGB888);
-
-  int width = rgb_image.width();
-  int height = rgb_image.height();
-  std::vector<float> tensor_data(height * width * 3);
-
-  if (config_.model_type == "FastSRGAN" || config_.model_type == "DeblurGANv2")
-  {
-    // NCHW format: [channels, height, width]
-    for (int y = 0; y < height; ++y)
-    {
-      for (int x = 0; x < width; ++x)
-      {
-        QRgb pixel = rgb_image.pixel(x, y);
-
-        // Normalize based on config
-        float r
-            = (qRed(pixel) / 255.0f - config_.input_mean) / config_.input_std;
-        float g = (qGreen(pixel) / 255.0f - config_.input_mean)
-                  / config_.input_std;
-        float b
-            = (qBlue(pixel) / 255.0f - config_.input_mean) / config_.input_std;
-
-        // NCHW format: tensor[c][y][x]
-        tensor_data[0 * height * width + y * width + x] = r; // R channel
-        tensor_data[1 * height * width + y * width + x] = g; // G channel
-        tensor_data[2 * height * width + y * width + x] = b; // B channel
-      }
-    }
-  }
-  else
-  {
-    // NHWC format: [height, width, channels] (AnimeGANv3)
-    for (int y = 0; y < height; ++y)
-    {
-      for (int x = 0; x < width; ++x)
-      {
-        QRgb pixel = rgb_image.pixel(x, y);
-
-        // Normalize to [0,1] range
-        float r = qRed(pixel) / 255.0f;
-        float g = qGreen(pixel) / 255.0f;
-        float b = qBlue(pixel) / 255.0f;
-
-        // NHWC format: tensor[y][x][c]
-        size_t idx = y * width * 3 + x * 3;
-        tensor_data[idx + 0] = r;
-        tensor_data[idx + 1] = g;
-        tensor_data[idx + 2] = b;
-      }
-    }
-  }
-
-  return tensor_data;
-}
 
 QImage ImageTranslationGAN::tensorToImage(
     const float* data,
@@ -934,7 +749,7 @@ QImage ImageTranslationGAN::tensorToImage(
   if (batch != 1)
     return QImage();
 
-  if (config_.model_type == "FastSRGAN" || config_.model_type == "DeblurGANv2")
+  if (config_.tensor_format == "NCHW")
   {
     // NCHW output format: [batch, channels, height, width]
     int channels = static_cast<int>(shape[1]);
@@ -982,7 +797,7 @@ QImage ImageTranslationGAN::tensorToImage(
   }
   else
   {
-    // AnimeGANv3 output format: [batch, height, width, channels] (NHWC)
+    // NHWC output format: [batch, height, width, channels]
     int height = static_cast<int>(shape[1]);
     int width = static_cast<int>(shape[2]);
     int channels = static_cast<int>(shape[3]);
@@ -991,160 +806,108 @@ QImage ImageTranslationGAN::tensorToImage(
       return QImage();
 
     QImage image(width, height, QImage::Format_RGB888);
+    auto ptr = image.bits();
 
-    for (int y = 0; y < height; ++y)
+    const int N = width * height * 3;
+#pragma omp simd
+    for (int i = 0; i < N; i++)
     {
-      for (int x = 0; x < width; ++x)
-      {
-        // NHWC format: data[0][y][x][c]
-        size_t idx = y * width * channels + x * channels;
-        float r = data[idx + 0];
-        float g = data[idx + 1];
-        float b = data[idx + 2];
-
-        // Convert from [0,1] to [0,255] and clamp
-        int red = static_cast<int>(std::clamp(r * 255.0f, 0.0f, 255.0f));
-        int green = static_cast<int>(std::clamp(g * 255.0f, 0.0f, 255.0f));
-        int blue = static_cast<int>(std::clamp(b * 255.0f, 0.0f, 255.0f));
-
-        image.setPixel(x, y, qRgb(red, green, blue));
-      }
+      const float val = data[i] * 255.0f;
+      ptr[i] = static_cast<int>(
+          (val < 255.0f ? (val > 0.f ? val : 0.f) : 255.0f));
     }
 
     return image;
   }
 }
 
-// Utility Functions
-std::vector<float>
-GANUtils::generateRandomLatent(size_t size, float mean, float std)
+
+// Helper function to update GANConfig with model specifications
+void updateConfigWithModelSpec(GANConfig& config, const ModelSpec& spec, const QImage& input_image)
 {
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
-  std::normal_distribution<float> dist(mean, std);
+  // Update input/output names from model spec
+  config.input_names = spec.input_names;
+  config.output_names = spec.output_names;
+  config.input_shapes.clear();
+  for (auto& ins : spec.inputs)
+    config.input_shapes.push_back(ins.shape);
 
-  std::vector<float> latent(size);
-  for (auto& val : latent)
+  // Update input dimensions
+  if (!config.input_shapes.empty())
   {
-    val = dist(gen);
-  }
-  return latent;
-}
+    const auto& input_shape = config.input_shapes[0];
 
-std::vector<float>
-GANUtils::generateUniformRandom(size_t size, float min, float max)
-{
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dist(min, max);
-
-  std::vector<float> latent(size);
-  for (auto& val : latent)
-  {
-    val = dist(gen);
-  }
-  return latent;
-}
-
-std::vector<float> GANUtils::interpolateLatents(
-    const std::vector<float>& a,
-    const std::vector<float>& b,
-    float t)
-{
-  if (a.size() != b.size())
-    return a;
-
-  std::vector<float> result(a.size());
-  for (size_t i = 0; i < a.size(); ++i)
-  {
-    result[i] = a[i] * (1.0f - t) + b[i] * t;
-  }
-  return result;
-}
-
-QImage GANUtils::normalizeToImage(
-    const float* data,
-    const std::vector<int64_t>& shape,
-    float min_val,
-    float max_val)
-{
-  if (shape.size() != 4)
-    return QImage();
-
-  int channels = static_cast<int>(shape[1]);
-  int height = static_cast<int>(shape[2]);
-  int width = static_cast<int>(shape[3]);
-
-  if (channels != 3)
-    return QImage();
-
-  // Find actual min/max for better normalization
-  float actual_min = data[0], actual_max = data[0];
-  size_t total_pixels = channels * height * width;
-  for (size_t i = 0; i < total_pixels; ++i)
-  {
-    actual_min = std::min(actual_min, data[i]);
-    actual_max = std::max(actual_max, data[i]);
-  }
-
-  QImage image(width, height, QImage::Format_RGB888);
-
-  for (int y = 0; y < height; ++y)
-  {
-    for (int x = 0; x < width; ++x)
-    {
-      // Get RGB values from NCHW tensor
-      float r = data[0 * height * width + y * width + x];
-      float g = data[1 * height * width + y * width + x];
-      float b = data[2 * height * width + y * width + x];
-
-      // Normalize to [0,255]
-      int red = static_cast<int>(std::clamp(
-          (r - actual_min) / (actual_max - actual_min) * 255.0f,
-          0.0f,
-          255.0f));
-      int green = static_cast<int>(std::clamp(
-          (g - actual_min) / (actual_max - actual_min) * 255.0f,
-          0.0f,
-          255.0f));
-      int blue = static_cast<int>(std::clamp(
-          (b - actual_min) / (actual_max - actual_min) * 255.0f,
-          0.0f,
-          255.0f));
-
-      image.setPixel(x, y, qRgb(red, green, blue));
+    if (input_shape.size() == 4)
+    { // Batch, Height, Width, Channels or Batch, Channels, Height, Width
+      if (config.is_generative) {
+        // For generative models, the input is usually latent space
+        if (input_shape[1] > 4) { // Likely NCHW with channels > 4, so this is latent dim
+          config.latent_dim = static_cast<int>(input_shape[1]);
+        } else if (input_shape[3] > 4) { // Likely NHWC with channels > 4, so this is latent dim  
+          config.latent_dim = static_cast<int>(input_shape[3]);
+        }
+      } else {
+        // For image-to-image models, determine format and dimensions
+        if (input_shape[1] == 3 || input_shape[1] == 1) {
+          // NCHW format: [batch, channels, height, width]
+          config.tensor_format = "NCHW";
+          if (input_shape[2] != -1) config.input_height = static_cast<int>(input_shape[2]);
+          if (input_shape[3] != -1) config.input_width = static_cast<int>(input_shape[3]);
+        } else if (input_shape[3] == 3 || input_shape[3] == 1) {
+          // NHWC format: [batch, height, width, channels]
+          config.tensor_format = "NHWC";
+          if (input_shape[1] != -1) config.input_height = static_cast<int>(input_shape[1]);
+          if (input_shape[2] != -1) config.input_width = static_cast<int>(input_shape[2]);
+        }
+        
+        // Use input image dimensions for dynamic sizes (-1)
+        if (!input_image.isNull()) {
+          if (config.input_width <= 0 || input_shape[config.tensor_format == "NCHW" ? 3 : 2] == -1) {
+            config.input_width = input_image.width();
+          }
+          if (config.input_height <= 0 || input_shape[config.tensor_format == "NCHW" ? 2 : 1] == -1) {
+            config.input_height = input_image.height();
+          }
+        }
+      }
     }
   }
 
-  return image;
-}
-
-QImage
-GANUtils::nchwToQImage(const float* data, int width, int height, int channels)
-{
-  if (channels != 3)
-    return QImage();
-
-  QImage image(width, height, QImage::Format_RGB888);
-
-  for (int y = 0; y < height; ++y)
+  // Update output dimensions
+  if (!spec.outputs.empty())
   {
-    for (int x = 0; x < width; ++x)
-    {
-      float r = data[0 * height * width + y * width + x];
-      float g = data[1 * height * width + y * width + x];
-      float b = data[2 * height * width + y * width + x];
+    const auto& output_shape = spec.outputs[0].shape;
 
-      // Assume values are in [0,1] range
-      int red = static_cast<int>(std::clamp(r * 255.0f, 0.0f, 255.0f));
-      int green = static_cast<int>(std::clamp(g * 255.0f, 0.0f, 255.0f));
-      int blue = static_cast<int>(std::clamp(b * 255.0f, 0.0f, 255.0f));
-
-      image.setPixel(x, y, qRgb(red, green, blue));
+    if (output_shape.size() == 4)
+    { // Batch, Height, Width, Channels or Batch, Channels, Height, Width
+      if (output_shape[1] == 3 || output_shape[1] == 1) {
+        // NCHW format: [batch, channels, height, width]
+        if (output_shape[2] != -1) config.output_height = static_cast<int>(output_shape[2]);
+        if (output_shape[3] != -1) config.output_width = static_cast<int>(output_shape[3]);
+      } else if (output_shape[3] == 3 || output_shape[3] == 1) {
+        // NHWC format: [batch, height, width, channels]
+        if (output_shape[1] != -1) config.output_height = static_cast<int>(output_shape[1]);
+        if (output_shape[2] != -1) config.output_width = static_cast<int>(output_shape[2]);
+      }
+      
+      // For image-to-image models with dynamic output, use input image scaling
+      if (!config.is_generative && !input_image.isNull()) {
+        if (config.output_width <= 0) {
+          config.output_width = input_image.width();
+        }
+        if (config.output_height <= 0) {
+          config.output_height = input_image.height();
+        }
+      }
     }
   }
 
-  return image;
+  qDebug() << "Updated config for" << config.model_type.c_str()
+           << "- Input:" << config.input_width << "x" << config.input_height
+           << "- Output:" << config.output_width << "x" << config.output_height
+           << "- Latent dim:" << config.latent_dim
+           << "- Format:" << config.tensor_format.c_str();
 }
 
-} // namespace GANInference
+
+} // namespace Onnx

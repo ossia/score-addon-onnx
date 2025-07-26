@@ -68,8 +68,6 @@ public:
         std::shared_ptr<Onnx::ImageTranslationGAN>)>
         request;
 
-    // Called back in a worker thread
-    // The returned function will be later applied in this object's processing thread
     static std::function<void(ImageToImageGAN&)> work(
         QImage input_image,
         std::shared_ptr<Onnx::ImageTranslationGAN> translation_model);

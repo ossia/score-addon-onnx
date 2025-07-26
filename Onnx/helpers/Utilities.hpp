@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <numeric>
+#include <random>
 #include <span>
 #include <vector>
 
@@ -99,5 +100,50 @@ inline void softmax(std::span<const float> in, std::vector<float>& out)
 inline auto sigmoid(std::floating_point auto v)
 {
   return 1. / (1. + std::exp(-v));
+}
+
+// Random number generation utilities
+inline std::vector<float>
+generateRandomLatent(size_t size, float mean = 0.0f, float std = 1.0f)
+{
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  std::normal_distribution<float> dist(mean, std);
+
+  std::vector<float> latent(size);
+  for (auto& val : latent) {
+    val = dist(gen);
+  }
+  return latent;
+}
+
+inline std::vector<float>
+generateUniformRandom(size_t size, float min = 0.0f, float max = 1.0f)
+{
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  std::uniform_real_distribution<float> dist(min, max);
+
+  std::vector<float> latent(size);
+  for (auto& val : latent) {
+    val = dist(gen);
+  }
+  return latent;
+}
+
+// Latent space interpolation
+inline std::vector<float> interpolateLatents(
+    const std::vector<float>& a,
+    const std::vector<float>& b,
+    float t)
+{
+  if (a.size() != b.size())
+    return a;
+
+  std::vector<float> result(a.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    result[i] = a[i] * (1.0f - t) + b[i] * t;
+  }
+  return result;
 }
 }
