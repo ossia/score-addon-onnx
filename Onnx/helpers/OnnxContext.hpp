@@ -27,6 +27,13 @@ try
 {
   Ort::SessionOptions session_options;
 
+  session_options.SetIntraOpNumThreads(1);
+  session_options.SetInterOpNumThreads(1);
+  session_options.SetGraphOptimizationLevel(
+      GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+  session_options.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
+  session_options.DisableProfiling();
   static constexpr const char* device_ids[10]
       = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
 
@@ -90,7 +97,7 @@ try
         "1",
         "1",
         "0",
-        "0"};
+        "1"};
     Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
         cuda_option_v2, keys.data(), values.data(), keys.size()));
     // FIXME release options

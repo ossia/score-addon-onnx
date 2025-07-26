@@ -35,7 +35,7 @@ if(FETCHCONTENT_FULLY_DISCONNECTED)
 endif()
 
 # URLs of the latest release
-set(ONNXRUNTIME_VERSION "1.21.0")
+set(ONNXRUNTIME_VERSION "1.22.0")
 if(WIN32)
   set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-win-x64-gpu-${ONNXRUNTIME_VERSION}.zip")
 elseif(APPLE)
