@@ -25,7 +25,7 @@ public:
       description,
       "Vision Language Model for image captioning and visual question "
       "answering.");
-  halp_meta(uuid, "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+  halp_meta(uuid, "3a3b4824-2b39-4cc0-9b6c-6c030de40dc4");
 
   struct
   {
