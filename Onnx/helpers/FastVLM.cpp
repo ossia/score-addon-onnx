@@ -1,10 +1,10 @@
 #include "FastVLM.hpp"
 
-#include "OnnxContext.hpp"
-
 #include <QImage>
 #include <QRect>
 
+#include <Onnx/helpers/OnnxContext.hpp>
+#include <Onnx/helpers/Utilities.hpp>
 #include <cmath>
 
 #include <algorithm>
@@ -20,7 +20,7 @@
 
 namespace Onnx
 {
-struct TokenizerConstants
+struct FastVLMTokenizerConstants
 {
   static constexpr int BOS_TOKEN_ID = 151643;
   static constexpr int EOS_TOKEN_ID = 151645;
@@ -233,8 +233,8 @@ std::string FastVLMInference::generateResponse(
     size_t assistantPos = response.find("<|im_start|>assistant\n");
     if (assistantPos != std::string::npos)
     {
-      response = response.substr(
-          assistantPos + 22); // Skip "<|im_start|>assistant\n"
+      // Skip "<|im_start|>assistant\n"
+      response = response.substr(assistantPos + 22);
 
       // Remove any trailing tokens
       size_t endPos = response.find("<|im_end|>");
@@ -394,7 +394,7 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
     while (pos < prompt.length())
     {
       size_t imagePos
-          = prompt.find(TokenizerConstants::DEFAULT_IMAGE_TOKEN, pos);
+          = prompt.find(FastVLMTokenizerConstants::DEFAULT_IMAGE_TOKEN, pos);
       if (imagePos == std::string::npos)
       {
         // No more image tokens, add the rest
@@ -411,7 +411,7 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
       // Add empty string to mark where image token was
       chunks.push_back("");
 
-      pos = imagePos + TokenizerConstants::DEFAULT_IMAGE_TOKEN.length();
+      pos = imagePos + FastVLMTokenizerConstants::DEFAULT_IMAGE_TOKEN.length();
     }
 
     std::vector<int64_t> finalTokens;
@@ -421,7 +421,7 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
       if (i > 0 && i % 2 == 1)
       {
         // This is where an image token was, insert IMAGE_TOKEN_INDEX
-        finalTokens.push_back(TokenizerConstants::IMAGE_TOKEN_INDEX);
+        finalTokens.push_back(FastVLMTokenizerConstants::IMAGE_TOKEN_INDEX);
       }
       else if (!chunks[i].empty())
       {
@@ -454,7 +454,7 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
         // Handle BOS token - only add at the very beginning
         size_t startIdx = 0;
         if (i == 0 && tokenCount > 0
-            && tokenData[0] == TokenizerConstants::BOS_TOKEN_ID)
+            && tokenData[0] == FastVLMTokenizerConstants::BOS_TOKEN_ID)
         {
           finalTokens.push_back(static_cast<int64_t>(tokenData[0]));
           startIdx = 1;
@@ -496,7 +496,7 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
 {
   try
   {
-    const size_t hiddenSize = TokenizerConstants::HIDDEN_SIZE; // 896
+    const size_t hiddenSize = FastVLMTokenizerConstants::HIDDEN_SIZE; // 896
     const size_t imagePatchCount = 256; // Vision encoder outputs [1, 256, 896]
 
     std::vector<float> multimodalEmbeddings;
@@ -505,7 +505,7 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
 
     for (size_t i = 0; i < tokenIds.size(); ++i)
     {
-      if (tokenIds[i] == TokenizerConstants::IMAGE_TOKEN_INDEX)
+      if (tokenIds[i] == FastVLMTokenizerConstants::IMAGE_TOKEN_INDEX)
       {
         // Replace single image token with 256 patch embeddings
         multimodalEmbeddings.insert(
@@ -551,7 +551,7 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
 {
   try
   {
-    const size_t hiddenSize = TokenizerConstants::HIDDEN_SIZE; // 896
+    const size_t hiddenSize = FastVLMTokenizerConstants::HIDDEN_SIZE; // 896
     const size_t seqLen = embeddings.size() / hiddenSize;
 
     // Use CPU memory but optimize other aspects for RTX 3090 performance
@@ -711,7 +711,7 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
     std::vector<int64_t> generatedTokens = {bestToken};
 
     // Check for EOS token
-    if (bestToken == TokenizerConstants::EOS_TOKEN_ID)
+    if (bestToken == FastVLMTokenizerConstants::EOS_TOKEN_ID)
     {
       return generatedTokens;
     }
@@ -778,7 +778,7 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
       generatedTokens.push_back(bestToken);
 
       // Check for EOS token
-      if (bestToken == TokenizerConstants::EOS_TOKEN_ID)
+      if (bestToken == FastVLMTokenizerConstants::EOS_TOKEN_ID)
       {
         break;
       }

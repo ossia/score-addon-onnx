@@ -82,7 +82,6 @@ try
     Ort::ThrowOnError(api.CreateCUDAProviderOptions(&cuda_option_v2));
     const std::vector keys{
         "device_id",
-        "gpu_mem_limit",
         "arena_extend_strategy",
         "cudnn_conv_algo_search",
         "do_copy_in_default_stream",
@@ -92,7 +91,6 @@ try
         "enable_skip_layer_norm_strict_mode"};
     const std::vector values{
         device_id_str,
-        "2147483648",
         "kNextPowerOfTwo",
         "EXHAUSTIVE",
         "1",
