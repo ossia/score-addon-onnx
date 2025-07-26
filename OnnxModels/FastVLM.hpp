@@ -1,10 +1,15 @@
 #pragma once
-#include <OnnxModels/Utils.hpp>
+#include <QImage>
+
 #include <Onnx/helpers/FastVLM.hpp>
+#include <OnnxModels/Utils.hpp>
 #include <halp/controls.hpp>
 #include <halp/file_port.hpp>
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
+
+#include <functional>
+#include <memory>
 
 namespace OnnxModels
 {
@@ -16,30 +21,58 @@ public:
   halp_meta(c_name, "fastvlm");
   halp_meta(category, "AI/Vision Language Model");
   halp_meta(author, "Fast VLM authors, Onnxruntime");
-  halp_meta(description, "Vision Language Model for image captioning and visual question answering.");
+  halp_meta(
+      description,
+      "Vision Language Model for image captioning and visual question "
+      "answering.");
   halp_meta(uuid, "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
 
   struct
   {
-    halp::texture_input<"Image"> image;
+    struct : halp::texture_input<"Image">
+    {
+      // Request computation when image changes
+      void update(FastVLMNode& g)
+      {
+        if (g.available && g.vlm)
+        {
+          g.requestInference();
+        }
+      }
+    } image;
 
-    struct : halp::file_port<"Vision Encoder", halp::mmap_file_view> {
+    struct : halp::file_port<"Vision Encoder", halp::mmap_file_view>
+    {
       halp_meta(extensions, "*.onnx");
     } visionEncoder;
-    
-    struct : halp::file_port<"Embed Tokens", halp::mmap_file_view> {
+
+    struct : halp::file_port<"Embed Tokens", halp::mmap_file_view>
+    {
       halp_meta(extensions, "*.onnx");
     } embedTokens;
-    
-    struct : halp::file_port<"Decoder", halp::mmap_file_view> {
+
+    struct : halp::file_port<"Decoder", halp::mmap_file_view>
+    {
       halp_meta(extensions, "*.onnx");
     } decoder;
-    
-    struct : halp::file_port<"Tokenizer", halp::mmap_file_view> {
+
+    struct : halp::file_port<"Tokenizer", halp::mmap_file_view>
+    {
       halp_meta(extensions, "*.json");
     } tokenizer;
 
-    halp::lineedit<"Prompt", "What do you see in this image?"> prompt;
+    struct : halp::lineedit<"Prompt", "What do you see in this image?">
+    {
+      // Request computation when prompt changes
+      void update(FastVLMNode& g)
+      {
+        if (g.available && g.vlm)
+        {
+          g.requestInference();
+        }
+      }
+    } prompt;
+
     halp::knob_f32<"Temperature", halp::range{0.f, 2.f, 1.f}> temperature;
     halp::spinbox_i32<"Max tokens", halp::range{1, 2048, 500}> maxTokens;
   } inputs;
@@ -54,15 +87,37 @@ public:
 
   void operator()();
 
+  // Worker thread infrastructure
+  struct worker
+  {
+    std::function<void(
+        QImage,
+        std::string,
+        float,
+        std::shared_ptr<Onnx::FastVLMInference>)>
+        request;
+
+    // Called back in a worker thread
+    // The returned function will be later applied in this object's processing thread
+    static std::function<void(FastVLMNode&)> work(
+        QImage image,
+        std::string prompt,
+        float temperature,
+        std::shared_ptr<Onnx::FastVLMInference> vlm);
+  } worker;
+
 private:
-  std::unique_ptr<Onnx::FastVLMInference> vlm;
+  std::shared_ptr<Onnx::FastVLMInference> vlm;
   std::string lastVisionEncoderPath;
-  std::string lastEmbedTokensPath; 
+  std::string lastEmbedTokensPath;
   std::string lastDecoderPath;
   std::string lastTokenizerPath;
-  
+
+  bool inferenceInProgress = false;
+
   void initializeModel();
   bool needsReinitialization() const;
+  void requestInference();
 };
 
 }
