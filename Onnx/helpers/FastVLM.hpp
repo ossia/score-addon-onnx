@@ -29,7 +29,8 @@ public:
 
 private:
   std::vector<int64_t> tokenizeImagePrompt(const std::string& prompt) const;
-  std::vector<float> runVisionEncoder(std::span<float> imageData);
+  std::vector<float>
+  runVisionEncoder(std::span<float> imageData, int w, int h);
   std::vector<float> runEmbedTokens(std::span<int64_t> tokenIds);
   std::string decodeTokens(std::span<int64_t> tokens) const;
 
@@ -53,6 +54,8 @@ private:
   std::unique_ptr<Ort::Session> decoderSession;
 
   OrtxTokenizer* tokenizer{};
+
+  boost::container::vector<float> tensorValues;
 
   std::vector<std::vector<Ort::Float16_t>> keyCache
       = std::vector<std::vector<Ort::Float16_t>>(24);

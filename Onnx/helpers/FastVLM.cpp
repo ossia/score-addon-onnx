@@ -3,6 +3,8 @@
 #include <QImage>
 #include <QRect>
 
+#include <Onnx/helpers/Images.hpp>
+#include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 #include <cmath>
@@ -42,93 +44,28 @@ struct FastVLMTokenizerConstants
   static inline const std::string IMAGE_PLACEHOLDER = "<image-placeholder>";
 };
 
-class ImagePreprocessor
+static Onnx::FloatTensor preprocessImageForFastVLM(
+    const QImage& image,
+    boost::container::vector<float>& tensorValues)
 {
-public:
-  static constexpr int TARGET_SIZE = 1024;
-  static constexpr float RESCALE_FACTOR = 1.0f / 255.0f;
+  // Create a minimal ModelSpec::Port for the existing function
+  ModelSpec::Port port;
+  port.shape = {1, 3, image.height(), image.width()};
+  static constexpr std::array<float, 3> mean = {0.0f, 0.0f, 0.0f};
+  static constexpr std::array<float, 3> std = {255.f, 255.f, 255.f};
 
-  struct ProcessedImage
-  {
-    std::vector<float> data;
-    int channels;
-    int height;
-    int width;
-  };
+  tensorValues.clear();
 
-  static ProcessedImage preprocessImage(const QImage& image);
-
-private:
-  static QImage resizeAndCrop(const QImage& image, int targetSize);
-  static std::vector<float> normalizeImage(const QImage& image);
-};
-ImagePreprocessor::ProcessedImage
-ImagePreprocessor::preprocessImage(const QImage& inputImage)
-{
-  QImage rgbImage = inputImage.convertToFormat(QImage::Format_RGB888);
-
-  QImage resizedImage = resizeAndCrop(rgbImage, TARGET_SIZE);
-
-  auto normalizedData = normalizeImage(resizedImage);
-
-  return {
-      .data = std::move(normalizedData),
-      .channels = 3,
-      .height = TARGET_SIZE,
-      .width = TARGET_SIZE};
-}
-
-QImage ImagePreprocessor::resizeAndCrop(const QImage& image, int targetSize)
-{
-  int width = image.width();
-  int height = image.height();
-
-  float scale = static_cast<float>(targetSize) / std::min(width, height);
-
-  int newWidth = static_cast<int>(std::round(width * scale));
-  int newHeight = static_cast<int>(std::round(height * scale));
-
-  QImage scaled = image.scaled(
-      newWidth, newHeight, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-
-  int cropX = (newWidth - targetSize) / 2;
-  int cropY = (newHeight - targetSize) / 2;
-
-  QRect cropRect(cropX, cropY, targetSize, targetSize);
-  return scaled.copy(cropRect);
-}
-
-std::vector<float> ImagePreprocessor::normalizeImage(const QImage& image)
-{
-  std::vector<float> normalized;
-  normalized.reserve(3 * image.width() * image.height());
-
-  std::array<std::vector<float>, 3> channels;
-  for (auto& channel : channels)
-  {
-    channel.reserve(image.width() * image.height());
-  }
-
-  for (int y = 0; y < image.height(); ++y)
-  {
-    const uchar* line = image.scanLine(y);
-    for (int x = 0; x < image.width(); ++x)
-    {
-      int idx = x * 3;
-      channels[0].push_back(static_cast<float>(line[idx]) * RESCALE_FACTOR);
-      channels[1].push_back(
-          static_cast<float>(line[idx + 1]) * RESCALE_FACTOR);
-      channels[2].push_back(
-          static_cast<float>(line[idx + 2]) * RESCALE_FACTOR);
-    }
-  }
-
-  for (const auto& channel : channels)
-  {
-    normalized.insert(normalized.end(), channel.begin(), channel.end());
-  }
-
-  return normalized;
+  return nchw_tensorFromRGBA(
+      port,
+      image.constBits(),
+      image.width(),
+      image.height(),
+      image.width(),
+      image.height(),
+      tensorValues,
+      mean,
+      std);
 }
 
 FastVLMInference::FastVLMInference(
@@ -208,9 +145,16 @@ std::string FastVLMInference::generateResponse(
 {
   try
   {
-    // Process image through vision encoder
-    auto processedImage = ImagePreprocessor::preprocessImage(image);
-    auto imageFeatures = runVisionEncoder(processedImage.data);
+    // Process image through vision encoder using existing Images.hpp functions
+    auto processedImageTensor = preprocessImageForFastVLM(image, tensorValues);
+
+    auto imageFeatures = runVisionEncoder(
+        processedImageTensor.storage, image.width(), image.height());
+    std::swap(processedImageTensor.storage, tensorValues);
+    if (imageFeatures.empty())
+      throw std::runtime_error("No image feature");
+    if (!std::isfinite(imageFeatures[0]))
+      throw std::runtime_error("Anormal feature");
 
     // Create the prompt with proper chat template (like HuggingFace)
     std::string formattedPrompt = createPromptTemplate(prompt);
@@ -254,15 +198,14 @@ std::string FastVLMInference::generateResponse(
 }
 
 std::vector<float>
-FastVLMInference::runVisionEncoder(std::span<float> imageData)
+FastVLMInference::runVisionEncoder(std::span<float> imageData, int w, int h)
 {
   try
   {
     auto memoryInfo
         = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-    std::vector<int64_t> inputShape = {
-        1, 3, ImagePreprocessor::TARGET_SIZE, ImagePreprocessor::TARGET_SIZE};
+    std::vector<int64_t> inputShape = {1, 3, h, w};
     auto inputTensor = Ort::Value::CreateTensor<float>(
         memoryInfo,
         const_cast<float*>(imageData.data()),
@@ -526,14 +469,6 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
             tokenEmbedding.end());
       }
     }
-
-#ifndef NDEBUG
-    std::cout << std::format(
-        "Final multimodal embeddings size: {} (expected sequence_length * "
-        "{})\n",
-        multimodalEmbeddings.size(),
-        hiddenSize);
-#endif
 
     return multimodalEmbeddings;
   }
