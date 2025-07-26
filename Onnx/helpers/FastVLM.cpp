@@ -157,7 +157,7 @@ FastVLMInference::FastVLMInference(
           0, tokenizerModelPath.size() - strlen("tokenizer.json"));
 
     extError_t result = OrtxCreateTokenizer(
-        &tokenizer, "/home/jcelerier/projets/oss/FastVLM-0.5B-ONNX/");
+        &tokenizer, std::string(tokenizerModelPath).c_str());
     if (result != kOrtxOK)
     {
       throw std::runtime_error(

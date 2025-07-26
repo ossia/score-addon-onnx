@@ -13,7 +13,9 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
+
 namespace Onnx
 {
 struct Options
@@ -171,6 +173,13 @@ try
     session_options.AppendExecutionProvider("CoreML", options);
   }
 #endif
+
+  if (requested_provider == "cpu" && ossia::contains(p, "cpu"))
+  {
+    int cpus = std::thread::hardware_concurrency();
+    session_options.SetIntraOpNumThreads(std::max(cpus / 2, 1));
+    session_options.SetInterOpNumThreads(std::max(cpus / 2, 1));
+  }
 
   // FIXME RKNPU
   // FIXME ARMNN, etc.
