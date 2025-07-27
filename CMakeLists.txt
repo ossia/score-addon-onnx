@@ -129,6 +129,20 @@ avnd_score_plugin_add(
   BASE_TARGET
     score_addon_onnx_models
   SOURCES
+    OnnxModels/TRTPose.hpp
+    OnnxModels/TRTPose.cpp
+  TARGET
+    trtpose
+  MAIN_CLASS
+    TRTPoseDetector
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
     OnnxModels/DepthAnything2.hpp
     OnnxModels/DepthAnything2.cpp
   TARGET

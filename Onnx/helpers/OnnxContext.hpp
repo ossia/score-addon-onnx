@@ -195,56 +195,6 @@ catch(...)
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
 }
 
-inline ModelSpec readModelSpec(const std::string& model_path)
-{
-  ModelSpec spec;
-
-  try
-  {
-    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "model_spec_reader");
-    Ort::SessionOptions session_options;
-    session_options.SetIntraOpNumThreads(1);
-    session_options.SetGraphOptimizationLevel(
-        GraphOptimizationLevel::ORT_ENABLE_BASIC);
-
-    Ort::Session session(env, model_path.c_str(), session_options);
-    Ort::AllocatorWithDefaultOptions allocator;
-
-    // Read input specs
-    size_t num_inputs = session.GetInputCount();
-    for (size_t i = 0; i < num_inputs; ++i)
-    {
-      auto input_name = session.GetInputNameAllocated(i, allocator);
-      spec.input_names.push_back(std::string(input_name.get()));
-
-      auto input_type_info = session.GetInputTypeInfo(i);
-      auto tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
-
-      spec.inputs.push_back({});
-      spec.inputs.back().shape = tensor_info.GetShape();
-    }
-
-    // Read output specs
-    size_t num_outputs = session.GetOutputCount();
-    for (size_t i = 0; i < num_outputs; ++i)
-    {
-      auto output_name = session.GetOutputNameAllocated(i, allocator);
-      spec.output_names.push_back(std::string(output_name.get()));
-
-      auto output_type_info = session.GetOutputTypeInfo(i);
-      auto tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
-
-      spec.inputs.push_back({});
-      spec.inputs.back().shape = tensor_info.GetShape();
-    }
-  }
-  catch (const std::exception& e)
-  {
-    // Failed to read model spec - spec will be empty
-  }
-
-  return spec;
-}
 struct OnnxRunContext
 {
   Options opts;
@@ -346,4 +296,10 @@ struct OnnxRunContext
     }
   }
 };
+
+inline ModelSpec readModelSpec(const std::string& model_path)
+{
+  OnnxRunContext ctx{model_path};
+  return ctx.readModelSpec();
+}
 }

@@ -27,6 +27,9 @@ try
   if (!in_tex.changed)
     return;
 
+  if (this->inputs.model.file.bytes.empty())
+    return;
+
   if (!this->ctx)
   {
     this->ctx
