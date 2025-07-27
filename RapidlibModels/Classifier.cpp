@@ -4,6 +4,8 @@
 
 #include <ossia/math/safe_math.hpp>
 
+#include <algorithm>
+
 namespace RapidlibModels
 {
 Classifier::Classifier() noexcept { }
