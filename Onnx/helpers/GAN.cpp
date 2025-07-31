@@ -233,6 +233,7 @@ SingleNetworkGAN::runGenerator(const std::vector<std::vector<float>>& inputs)
   std::vector<Ort::Value> ort_inputs;
   std::vector<std::string> input_name_strings;
   std::vector<const char*> input_names;
+  std::vector<float> input_copy;
 
   for (size_t i = 0; i < inputs.size() && i < config_.input_shapes.size(); ++i)
   {
@@ -276,10 +277,10 @@ SingleNetworkGAN::runGenerator(const std::vector<std::vector<float>>& inputs)
       qDebug() << "PyTorchGAN: Input data size:" << inputs[i].size();
     }
 
-    std::vector<float> input_copy(inputs[i]); // vec_to_tensor needs non-const data
-    auto tensor = vec_to_tensor<float>(input_copy, shape);
+    // FIXME multi-input??
+    input_copy = inputs[i]; // vec_to_tensor needs non-const data
 
-    ort_inputs.push_back(std::move(tensor));
+    ort_inputs.push_back(vec_to_tensor<float>(input_copy, shape));
   }
 
   // Get output name
@@ -511,7 +512,10 @@ GANConfig GANFactory::getMobileStyleGANConfig(
   
   // Read actual model specifications
   if (!model_paths.empty()) {
-    auto spec = readModelSpec(model_paths[0]);
+    QFile f{model_paths[0].c_str()};
+    f.open(QIODevice::ReadOnly);
+    auto data = f.readAll().toStdString();
+    auto spec = readModelSpec(data);
     updateConfigWithModelSpec(config, spec);
   }
   

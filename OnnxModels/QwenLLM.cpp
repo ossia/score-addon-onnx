@@ -146,7 +146,6 @@ std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(
   {
     std::string errorMsg = std::string("Inference error: ") + e.what();
 
-    qDebug() << errorMsg;
     return [errorMsg = std::move(errorMsg)](QwenLLMNode& node) mutable
     {
       node.inference_in_progress = false;
