@@ -4,9 +4,9 @@
 
 #include <ossia/detail/fmt.hpp>
 
+#include <QDebug>
 #include <QDir>
 #include <QProcess>
-#include <QDebug>
 
 #include <Onnx/helpers/Images.hpp>
 #include <PythonModels/PromptParser.hpp>
@@ -108,13 +108,13 @@ int StreamDiffusionWrapper::setup_imports()
 {
   py::exec(R"(import os
 import torch
-from diffusers import AutoencoderTiny, StableDiffusionPipeline
+from diffusers import AutoencoderTiny, StableDiffusionPipeline, StableDiffusionXLPipeline, UNet2DConditionModel
 from diffusers.utils import load_image
 
 from streamdiffusion import StreamDiffusion
 from streamdiffusion.image_utils import postprocess_image
 from streamdiffusion.acceleration.tensorrt import accelerate_with_tensorrt
-# from streamdiffusion.acceleration.sfast import accelerate_with_stable_fast
+#from streamdiffusion.acceleration.sfast import accelerate_with_stable_fast
 
 )");
   return 1;
@@ -127,10 +127,21 @@ void StreamDiffusionWrapper::load_model()
   {
     py::exec(fmt::format(
         R"(
-pipe = StableDiffusionPipeline.from_pretrained("{}").to(
-    device=torch.device("cuda"),
-    dtype=torch.float16
-)
+sdxl = "xl" in "{0}"
+turbo = "turbo" in "{0}"
+if(sdxl):
+    # if(not turbo):
+    #     unet = UNet2DConditionModel.from_pretrained("latent-consistency/lcm-sdxl", torch_dtype=torch.float16, variant="fp16")
+
+    pipe = StableDiffusionXLPipeline.from_pretrained("{0}", unet=unet).to(
+        device=torch.device("cuda"),
+        dtype=torch.float16
+    )
+else:
+    pipe = StableDiffusionPipeline.from_pretrained("{0}").to(
+        device=torch.device("cuda"),
+        dtype=torch.float16
+    )
 )",
         m_model));
     m_needsModel = false;
@@ -166,6 +177,7 @@ void StreamDiffusionWrapper::create()
     }
     py::exec(fmt::format(
         R"(# Wrap the pipeline in StreamDiffusion
+
 stream = None
 stream = StreamDiffusion(
     pipe,
@@ -177,7 +189,29 @@ stream = StreamDiffusion(
     height={4},
     use_denoising_batch={5}
 )
-stream.load_lcm_lora()
+
+# if(sdxl and turbo):
+#     stream.load_lcm_lora("openskyml/lcm-lora-sdxl-turbo")
+#     stream.fuse_lora()
+# elif(sdxl and not turbo):
+#     stream.load_lcm_lora("latent-consistency/lcm-sdxl")
+#     stream.fuse_lora()
+# elif(not sdxl and turbo):
+#     print("no lora to load")
+# elif((not sdxl) and (not turbo)):
+#     stream.load_lcm_lora("latent-consistency/lcm-lora-sdv1-5")
+#     stream.fuse_lora()
+
+#
+# sd-turbo does not need lcm-lora
+
+# if hasattr(stream.unet, 'config'):
+#    stream.unet.config.addition_embed_type = None
+# if device_ids is not None:
+#     stream.unet = torch.nn.DataParallel(
+#         stream.unet, device_ids=device_ids
+#     )
+
 )",
         count,
         m_cfg,
@@ -186,6 +220,7 @@ stream.load_lcm_lora()
         m_height,
         m_denoising_batch ? "True"sv : "False"sv));
 
+    qDebug()<<m_lora_weight;
     if (!m_sd_turbo)
     {
       for (const auto& [k, v] : m_loras)
@@ -195,19 +230,23 @@ stream.load_lcm_lora()
           py::exec(fmt::format(
               R"(
 stream.load_lora('{}',  weight_name='{}')
-stream.fuse_lora(True, True, 1.0, False)
+#stream.fuse_lora(True, True, 1.0, False)
+stream.fuse_lora(fuse_unet=True, fuse_text_encoder=True, lora_scale={}, safe_fusing=False)
+stream.pipe.unload_lora_weights()
 )",
               k,
-              v));
+              v, m_lora_weight * 2.5));
+          qDebug()<<"Loading lora: " << k.c_str() << v.c_str() << m_lora_weight;
         }
         else
         {
           py::exec(fmt::format(
               R"(
 stream.load_lora('{}')
-stream.fuse_lora(True, True, 1.0, False)
+stream.fuse_lora(fuse_unet=True, fuse_text_encoder=True, lora_scale={}, safe_fusing=False)
+stream.pipe.unload_lora_weights()
 )",
-              k));
+              k, m_lora_weight * 2.5));
         }
       }
     }
@@ -217,9 +256,9 @@ stream.fuse_lora(True, True, 1.0, False)
 stream.vae = AutoencoderTiny.from_pretrained("{2}").to(device=pipe.device, dtype=pipe.dtype)
 
 resolutiondict = {{'engine_build_options' : {{ 'opt_image_width': {0}, 'opt_image_height': {1} }} }}
-stream = accelerate_with_tensorrt(
-    stream, "engines_{0}_{1}", max_batch_size={3},engine_build_options=resolutiondict
-)
+#if((not sdxl) and (not turbo)):
+#stream = accelerate_with_tensorrt(stream, "engines_test_sd_turbo_{0}_{1}", max_batch_size={3},engine_build_options=resolutiondict)
+# stream.pipe.enable_xformers_memory_efficient_attention()
 )",
         m_width,
         m_height,
@@ -285,7 +324,6 @@ void StreamDiffusionWrapper::update_prompt()
     }
     else
     {
-      qDebug() << "Failed";
       py::exec(fmt::format(
           "stream.update_prompts(weighted_prompts=[({}, 1.0)])",
           quote_string_for_python(m_prompt_positive)));

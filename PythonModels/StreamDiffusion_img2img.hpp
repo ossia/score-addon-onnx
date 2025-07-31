@@ -2,6 +2,7 @@
 #include <PythonModels/StreamDiffusionWrapper.hpp>
 #include <cmath>
 #include <halp/controls.hpp>
+#include <halp/dynamic_port.hpp>
 #include <halp/meta.hpp>
 #include <halp/sample_accurate_controls.hpp>
 #include <halp/texture.hpp>
@@ -159,7 +160,17 @@ public:
     } denoise_batch;
     halp::toggle<"Manual mode"> manual;
     halp::val_port<"Manual trigger", std::optional<halp::impulse>> trigger;
+
     // TODO feed % last output, feed % last input
+
+    struct : halp::hslider_f32<"Lora weight">
+    {
+      void update(StreamDiffusionImg2Img& self)
+      {
+        self.m_wrapper.set_lora_weight(value);
+        self.inputs.trigger.value.emplace();
+      }
+    } lora_w;
   } inputs;
 
   struct

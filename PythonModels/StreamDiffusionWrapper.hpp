@@ -160,6 +160,14 @@ struct StreamDiffusionWrapper
     m_needsCreate = true;
     m_needsPrepare = true;
   }
+  inline void set_lora_weight(float b)
+  {
+    std::lock_guard _{m_mtx};
+    m_lora_weight = b;
+    m_needsModel = true;
+    m_needsCreate = true;
+    m_needsPrepare = true;
+  }
 
   void read_image_pil(std::string_view bytes, unsigned char* output);
 
@@ -176,6 +184,7 @@ struct StreamDiffusionWrapper
   int m_height{};
   float m_guidance{};
   float m_delta{};
+  float m_lora_weight{};
   bool m_add_noise{true};
   bool m_denoising_batch{true};
   bool m_sd_turbo{false};
