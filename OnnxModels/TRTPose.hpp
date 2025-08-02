@@ -1,6 +1,6 @@
 #pragma once
+#include <Onnx/helpers/ModelSpec.hpp>
 #include <OnnxModels/Utils.hpp>
-
 #include <cmath>
 #include <halp/controls.hpp>
 #include <halp/geometry.hpp>
@@ -47,10 +47,16 @@ public:
 
       struct
   {
-    halp::fixed_texture_input<"In"> image;
+    halp::texture_input<"In"> image;
     ModelPort model;
-    halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 640}>
+    halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 512}>
         resolution;
+    halp::hslider_f32<
+        "Confidence threshold",
+        halp::range{0.0001f, 0.05f, 0.001f}>
+        confidence_threshold;
+    halp::hslider_f32<"PAF threshold", halp::range{0.0001f, 0.01f, 0.001f}>
+        paf_threshold;
 
   } inputs;
 
@@ -72,6 +78,7 @@ public:
 
 private:
   std::unique_ptr<Onnx::OnnxRunContext> ctx;
+  Onnx::ModelSpec spec;
   boost::container::vector<float> storage;
 };
 }

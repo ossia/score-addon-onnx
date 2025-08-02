@@ -288,4 +288,140 @@ inline QImage drawKeypoints(
 
   return img;
 }
+
+// GAN-specific image utilities
+inline QImage normalizeToImage(
+    const float* data,
+    const std::vector<int64_t>& shape,
+    float min_val,
+    float max_val)
+{
+  if (shape.size() != 4)
+    return QImage();
+
+  int channels = static_cast<int>(shape[1]);
+  int height = static_cast<int>(shape[2]);
+  int width = static_cast<int>(shape[3]);
+
+  if (channels != 3)
+    return QImage();
+
+  // Find actual min/max for better normalization
+  float actual_min = data[0], actual_max = data[0];
+  size_t total_pixels = channels * height * width;
+  for (size_t i = 0; i < total_pixels; ++i) {
+    actual_min = std::min(actual_min, data[i]);
+    actual_max = std::max(actual_max, data[i]);
+  }
+
+  QImage image(width, height, QImage::Format_RGB888);
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      // Get RGB values from NCHW tensor
+      float r = data[0 * height * width + y * width + x];
+      float g = data[1 * height * width + y * width + x];
+      float b = data[2 * height * width + y * width + x];
+
+      // Normalize to [0,255]
+      int red = static_cast<int>(std::clamp(
+          (r - actual_min) / (actual_max - actual_min) * 255.0f,
+          0.0f,
+          255.0f));
+      int green = static_cast<int>(std::clamp(
+          (g - actual_min) / (actual_max - actual_min) * 255.0f,
+          0.0f,
+          255.0f));
+      int blue = static_cast<int>(std::clamp(
+          (b - actual_min) / (actual_max - actual_min) * 255.0f,
+          0.0f,
+          255.0f));
+
+      image.setPixel(x, y, qRgb(red, green, blue));
+    }
+  }
+
+  return image;
+}
+
+inline QImage nchwToQImage(const float* data, int width, int height, int channels)
+{
+  if (channels != 3)
+    return QImage();
+
+  QImage image(width, height, QImage::Format_RGB888);
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      float r = data[0 * height * width + y * width + x];
+      float g = data[1 * height * width + y * width + x];
+      float b = data[2 * height * width + y * width + x];
+
+      // Assume values are in [0,1] range
+      int red = static_cast<int>(std::clamp(r * 255.0f, 0.0f, 255.0f));
+      int green = static_cast<int>(std::clamp(g * 255.0f, 0.0f, 255.0f));
+      int blue = static_cast<int>(std::clamp(b * 255.0f, 0.0f, 255.0f));
+
+      image.setPixel(x, y, qRgb(red, green, blue));
+    }
+  }
+
+  return image;
+}
+
+// Convert QImage to tensor data in specified format
+inline std::vector<float> imageToTensor(
+    const QImage& image,
+    const std::string& tensor_format,
+    float input_mean = 0.0f,
+    float input_std = 1.0f)
+{
+  if (image.isNull())
+    return {};
+
+  // Convert to RGB format if necessary
+  QImage rgb_image = image.convertToFormat(QImage::Format_RGB888);
+  int width = rgb_image.width();
+  int height = rgb_image.height();
+  std::vector<float> tensor_data(height * width * 3);
+
+  if (tensor_format == "NCHW") {
+    // NCHW format: [channels, height, width]
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        QRgb pixel = rgb_image.pixel(x, y);
+
+        // Normalize based on config
+        float r = (qRed(pixel) / 255.0f - input_mean) / input_std;
+        float g = (qGreen(pixel) / 255.0f - input_mean) / input_std;
+        float b = (qBlue(pixel) / 255.0f - input_mean) / input_std;
+
+        // NCHW format: tensor[c][y][x]
+        tensor_data[0 * height * width + y * width + x] = r; // R channel
+        tensor_data[1 * height * width + y * width + x] = g; // G channel
+        tensor_data[2 * height * width + y * width + x] = b; // B channel
+      }
+    }
+  } else {
+    // NHWC format: [height, width, channels]
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        QRgb pixel = rgb_image.pixel(x, y);
+
+        // Normalize to [0,1] range
+        float r = qRed(pixel) / 255.0f;
+        float g = qGreen(pixel) / 255.0f;
+        float b = qBlue(pixel) / 255.0f;
+
+        // NHWC format: tensor[y][x][c]
+        size_t idx = y * width * 3 + x * 3;
+        tensor_data[idx + 0] = r;
+        tensor_data[idx + 1] = g;
+        tensor_data[idx + 2] = b;
+      }
+    }
+  }
+
+  return tensor_data;
+}
 }

@@ -13,7 +13,9 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
+
 namespace Onnx
 {
 struct Options
@@ -27,6 +29,13 @@ try
 {
   Ort::SessionOptions session_options;
 
+  session_options.SetIntraOpNumThreads(1);
+  session_options.SetInterOpNumThreads(1);
+  session_options.SetGraphOptimizationLevel(
+      GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+  session_options.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
+  session_options.DisableProfiling();
   static constexpr const char* device_ids[10]
       = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
 
@@ -73,7 +82,6 @@ try
     Ort::ThrowOnError(api.CreateCUDAProviderOptions(&cuda_option_v2));
     const std::vector keys{
         "device_id",
-        "gpu_mem_limit",
         "arena_extend_strategy",
         "cudnn_conv_algo_search",
         "do_copy_in_default_stream",
@@ -83,14 +91,13 @@ try
         "enable_skip_layer_norm_strict_mode"};
     const std::vector values{
         device_id_str,
-        "2147483648",
         "kNextPowerOfTwo",
         "EXHAUSTIVE",
         "1",
         "1",
         "1",
         "0",
-        "0"};
+        "1"};
     Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
         cuda_option_v2, keys.data(), values.data(), keys.size()));
     // FIXME release options
@@ -165,6 +172,13 @@ try
   }
 #endif
 
+  if (requested_provider == "cpu" && ossia::contains(p, "cpu"))
+  {
+    int cpus = std::thread::hardware_concurrency();
+    session_options.SetIntraOpNumThreads(std::max(cpus / 2, 1));
+    session_options.SetInterOpNumThreads(std::max(cpus / 2, 1));
+  }
+
   // FIXME RKNPU
   // FIXME ARMNN, etc.
 
@@ -180,7 +194,6 @@ catch(...)
   qDebug() << "OnnxRuntime: falling back to CPU: unknown error";
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
 }
-
 
 struct OnnxRunContext
 {
@@ -283,4 +296,10 @@ struct OnnxRunContext
     }
   }
 };
+
+inline ModelSpec readModelSpec(const std::string& model_path)
+{
+  OnnxRunContext ctx{model_path};
+  return ctx.readModelSpec();
+}
 }

@@ -21,6 +21,21 @@ endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rapidlib.cmake")
 
+set(ENABLE_TESTS 0)
+set(ENABLE_PYTHON 0)
+set(ENABLE_JAVA 0)
+set(ENABLE_MODEL_BENCHMARK 0)
+set(OCOS_ENABLE_VENDOR_IMAGE_CODECS 1)
+set(OCOS_ENABLE_VISION 0)
+set(OCOS_ENABLE_AUDIO 0)
+set(OCOS_ENABLE_RE2_REGEX 0)
+set(OCOS_BUILD_SHARED_LIB 0)
+set(OCOS_BUILD_PRESET token_api_only)
+if(LINUX OR WIN32)
+  set(OCOS_USE_CUDA 0)
+endif()
+add_subdirectory(3rdparty/onnxruntime-extensions)
+
 # General initialization
 score_common_setup()
 
@@ -114,6 +129,20 @@ avnd_score_plugin_add(
   BASE_TARGET
     score_addon_onnx_models
   SOURCES
+    OnnxModels/TRTPose.hpp
+    OnnxModels/TRTPose.cpp
+  TARGET
+    trtpose
+  MAIN_CLASS
+    TRTPoseDetector
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
     OnnxModels/DepthAnything2.hpp
     OnnxModels/DepthAnything2.cpp
   TARGET
@@ -152,13 +181,86 @@ avnd_score_plugin_add(
     RapidlibModels
 )
 
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/FastVLM.hpp
+    OnnxModels/FastVLM.cpp
+    Onnx/helpers/FastVLM.hpp
+    Onnx/helpers/FastVLM.cpp
+  TARGET
+    fastvlm
+  MAIN_CLASS
+    FastVLMNode
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/QwenLLM.hpp
+    OnnxModels/QwenLLM.cpp
+    Onnx/helpers/QwenLLM.hpp
+    Onnx/helpers/QwenLLM.cpp
+  TARGET
+    qwenllm
+  MAIN_CLASS
+    QwenLLMNode
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/GenerativeImageGAN.hpp
+    OnnxModels/GenerativeImageGAN.cpp
+  TARGET
+    generative-image-gan
+  MAIN_CLASS
+    GenerativeImageGAN
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/ImageToImageGAN.hpp
+    OnnxModels/ImageToImageGAN.cpp
+  TARGET
+    image-to-image-gan
+  MAIN_CLASS
+    ImageToImageGAN
+  NAMESPACE
+    OnnxModels
+)
+
 avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
                            PLUGIN_UUID "24a98f5b-700f-401c-ab89-8c1173bda73f")
+
+target_sources(score_addon_onnx_models
+  PRIVATE
+    Onnx/helpers/GAN.hpp
+    Onnx/helpers/GAN.cpp
+    Onnx/helpers/Utilities.hpp
+    Onnx/helpers/Images.hpp
+    Onnx/helpers/ModelSpec.hpp
+    Onnx/helpers/OnnxBase.hpp
+    Onnx/helpers/OnnxContext.hpp
+)
 
 # Link
 target_link_libraries(score_addon_onnx_models
     PUBLIC
       $<COMPILE_ONLY:onnxruntime::onnxruntime>
       rapidlib
+      ocos_operators
+      onnxruntime_extensions
  )
-
