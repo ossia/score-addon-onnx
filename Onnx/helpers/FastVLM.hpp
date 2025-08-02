@@ -1,5 +1,7 @@
 #pragma once
 
+#include <boost/container/vector.hpp>
+
 #include <QImage>
 
 #include <onnxruntime_cxx_api.h>
