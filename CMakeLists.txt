@@ -36,6 +36,10 @@ if(LINUX OR WIN32)
 endif()
 add_subdirectory(3rdparty/onnxruntime-extensions)
 
+if(TARGET onnxruntime-extensions)
+  set_target_properties(onnxruntime-extensions PROPERTIES UNITY_BUILD 0)
+endif()
+
 # General initialization
 score_common_setup()
 
