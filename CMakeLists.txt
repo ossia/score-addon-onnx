@@ -34,11 +34,10 @@ set(OCOS_BUILD_PRESET token_api_only)
 if(LINUX OR WIN32)
   set(OCOS_USE_CUDA 0)
 endif()
-add_subdirectory(3rdparty/onnxruntime-extensions)
-
-if(TARGET onnxruntime-extensions)
-  set_target_properties(onnxruntime-extensions PROPERTIES UNITY_BUILD 0)
-endif()
+block()
+  set(CMAKE_UNITY_BUILD 0)
+  add_subdirectory(3rdparty/onnxruntime-extensions)
+endblock()
 
 # General initialization
 score_common_setup()
