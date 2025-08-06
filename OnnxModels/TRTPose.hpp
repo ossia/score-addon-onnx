@@ -13,7 +13,7 @@ namespace Onnx
 struct OnnxRunContext;
 }
 
-namespace OnnxModels
+namespace OnnxModels::TRTPose
 {
 struct Keypoint
 {

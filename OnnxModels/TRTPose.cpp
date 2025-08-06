@@ -7,7 +7,7 @@
 #include <Onnx/helpers/Trt.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 
-namespace OnnxModels
+namespace OnnxModels::TRTPose
 {
 TRTPoseDetector::TRTPoseDetector() noexcept
 {
@@ -205,10 +205,10 @@ void TRTPoseDetector::operator()()
         min_y = std::min(min_y, img_y);
         max_y = std::max(max_y, img_y);
 
-        detected_pose.keypoints.push_back({
-            i,
-            img_x / in_tex.width, // Normalize to [0,1]
-            img_y / in_tex.height // Normalize to [0,1]
+        detected_pose.keypoints.push_back(Keypoint{
+            .kp = i,
+            .x = img_x / in_tex.width, // Normalize to [0,1]
+            .y = img_y / in_tex.height // Normalize to [0,1]
         });
         has_valid_keypoints = true;
       }
