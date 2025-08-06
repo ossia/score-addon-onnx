@@ -15,6 +15,7 @@ GenerativeImageGAN::GenerativeImageGAN() noexcept
   // Initialize with 512-dimensional latent vector (standard for StyleGAN)
   latent_vector.resize(512, 0.0f);
   scaled_latent_vector.resize(512, 0.0f);
+
   initializeLatentVector();
 }
 
@@ -34,24 +35,13 @@ void GenerativeImageGAN::initializeLatentVector()
 
 void GenerativeImageGAN::updateLatentFromControls()
 {
-  // Update first 16 dimensions from sliders
-  if (latent_vector.size() >= 16) {
-    latent_vector[0] = inputs.z0.value;
-    latent_vector[1] = inputs.z1.value;
-    latent_vector[2] = inputs.z2.value;
-    latent_vector[3] = inputs.z3.value;
-    latent_vector[4] = inputs.z4.value;
-    latent_vector[5] = inputs.z5.value;
-    latent_vector[6] = inputs.z6.value;
-    latent_vector[7] = inputs.z7.value;
-    latent_vector[8] = inputs.z8.value;
-    latent_vector[9] = inputs.z9.value;
-    latent_vector[10] = inputs.z10.value;
-    latent_vector[11] = inputs.z11.value;
-    latent_vector[12] = inputs.z12.value;
-    latent_vector[13] = inputs.z13.value;
-    latent_vector[14] = inputs.z14.value;
-    latent_vector[15] = inputs.z15.value;
+  // Update first 16 dimensions from array input
+  const int N
+      = std::min(latent_vector.size(), inputs.latent_dims.value.size());
+
+  for (int i = 0; i < N; ++i)
+  {
+    latent_vector[i] = inputs.latent_dims.value[i];
   }
 }
 
@@ -66,24 +56,12 @@ void GenerativeImageGAN::randomizeLatent()
     val = dist(gen);
   }
 
+  // Update the array input with the first 16 dimensions
   if (latent_vector.size() >= 16)
   {
-    inputs.z0.value = latent_vector[0];
-    inputs.z1.value = latent_vector[1];
-    inputs.z2.value = latent_vector[2];
-    inputs.z3.value = latent_vector[3];
-    inputs.z4.value = latent_vector[4];
-    inputs.z5.value = latent_vector[5];
-    inputs.z6.value = latent_vector[6];
-    inputs.z7.value = latent_vector[7];
-    inputs.z8.value = latent_vector[8];
-    inputs.z9.value = latent_vector[9];
-    inputs.z10.value = latent_vector[10];
-    inputs.z11.value = latent_vector[11];
-    inputs.z12.value = latent_vector[12];
-    inputs.z13.value = latent_vector[13];
-    inputs.z14.value = latent_vector[14];
-    inputs.z15.value = latent_vector[15];
+    for (size_t i = 0; i < 16; ++i) {
+      inputs.latent_dims.value[i] = latent_vector[i];
+    }
   }
 }
 

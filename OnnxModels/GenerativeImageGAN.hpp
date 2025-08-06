@@ -1,9 +1,14 @@
 #pragma once
+#include <ossia/detail/pod_vector.hpp>
+#include <ossia/detail/small_vector.hpp>
+
 #include <OnnxModels/Utils.hpp>
 #include <cmath>
 #include <halp/controls.hpp>
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
+
+#include <array>
 
 namespace Onnx
 {
@@ -40,23 +45,9 @@ public:
     ModelPort mapping_model;
     ModelPort synthesis_model;
 
-    // Latent space controls - 512 dimensions for StyleGAN
-    halp::hslider_f32<"Z0", latent_range> z0;
-    halp::hslider_f32<"Z1", latent_range> z1;
-    halp::hslider_f32<"Z2", latent_range> z2;
-    halp::hslider_f32<"Z3", latent_range> z3;
-    halp::hslider_f32<"Z4", latent_range> z4;
-    halp::hslider_f32<"Z5", latent_range> z5;
-    halp::hslider_f32<"Z6", latent_range> z6;
-    halp::hslider_f32<"Z7", latent_range> z7;
-    halp::hslider_f32<"Z8", latent_range> z8;
-    halp::hslider_f32<"Z9", latent_range> z9;
-    halp::hslider_f32<"Z10", latent_range> z10;
-    halp::hslider_f32<"Z11", latent_range> z11;
-    halp::hslider_f32<"Z12", latent_range> z12;
-    halp::hslider_f32<"Z13", latent_range> z13;
-    halp::hslider_f32<"Z14", latent_range> z14;
-    halp::hslider_f32<"Z15", latent_range> z15;
+    // Latent space controls - first 16 dimensions for StyleGAN
+    halp::val_port<"Latent Vector", ossia::small_pod_vector<float, 16>>
+        latent_dims;
 
     halp::hslider_f32<"Scale", halp::range{-10., 10., 1.}> scale;
 
