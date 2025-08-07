@@ -1,5 +1,7 @@
 #include "FastVLM.hpp"
 
+#include <ossia/detail/fmt.hpp>
+
 #include <QImage>
 #include <QRect>
 
@@ -12,7 +14,6 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <format>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -110,7 +111,7 @@ FastVLMInference::FastVLMInference(
     if (result != kOrtxOK)
     {
       throw std::runtime_error(
-          std::format(
+          fmt::format(
               "Failed to create Ortx tokenizer: {}",
               OrtxGetLastErrorMessage()));
     }
@@ -138,7 +139,7 @@ FastVLMInference::FastVLMInference(
   catch (const Ort::Exception& e)
   {
     throw std::runtime_error(
-        std::format("Failed to load ONNX models: {}", e.what()));
+        fmt::format("Failed to load ONNX models: {}", e.what()));
   }
 }
 
@@ -205,7 +206,7 @@ std::string FastVLMInference::generateResponse(
   catch (const std::exception& e)
   {
     throw std::runtime_error(
-        std::format("Manual multimodal inference failed: {}", e.what()));
+        fmt::format("Manual multimodal inference failed: {}", e.what()));
   }
 }
 
@@ -248,7 +249,7 @@ FastVLMInference::runVisionEncoder(std::span<float> imageData, int w, int h)
   catch (const Ort::Exception& e)
   {
     throw std::runtime_error(
-        std::format("Vision encoder failed: {}", e.what()));
+        fmt::format("Vision encoder failed: {}", e.what()));
   }
 }
 
@@ -290,7 +291,7 @@ FastVLMInference::runEmbedTokens(std::span<int64_t> tokenIds)
   }
   catch (const Ort::Exception& e)
   {
-    throw std::runtime_error(std::format("Embed tokens failed: {}", e.what()));
+    throw std::runtime_error(fmt::format("Embed tokens failed: {}", e.what()));
   }
 }
 
@@ -312,7 +313,7 @@ std::string FastVLMInference::decodeTokens(std::span<int64_t> tokens) const
     if (result != kOrtxOK)
     {
       throw std::runtime_error(
-          std::format("Token decoding failed: {}", OrtxGetLastErrorMessage()));
+          fmt::format("Token decoding failed: {}", OrtxGetLastErrorMessage()));
     }
 
     // Get the decoded string from the array (should have one item)
@@ -322,7 +323,7 @@ std::string FastVLMInference::decodeTokens(std::span<int64_t> tokens) const
     {
       OrtxDispose((OrtxObject**)&stringArray);
       throw std::runtime_error(
-          std::format(
+          fmt::format(
               "Failed to get decoded string: {}", OrtxGetLastErrorMessage()));
     }
 
@@ -333,7 +334,7 @@ std::string FastVLMInference::decodeTokens(std::span<int64_t> tokens) const
   catch (const std::exception& e)
   {
     throw std::runtime_error(
-        std::format("Token decoding failed: {}", e.what()));
+        fmt::format("Token decoding failed: {}", e.what()));
   }
 }
 
@@ -389,7 +390,7 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
         if (result != kOrtxOK)
         {
           throw std::runtime_error(
-              std::format(
+              fmt::format(
                   "Tokenization failed: {}", OrtxGetLastErrorMessage()));
         }
 
@@ -402,7 +403,7 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
         {
           OrtxDispose((OrtxObject**)&tokenArray);
           throw std::runtime_error(
-              std::format(
+              fmt::format(
                   "Failed to get tokens: {}", OrtxGetLastErrorMessage()));
         }
 
@@ -429,14 +430,14 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
   catch (const std::exception& e)
   {
     throw std::runtime_error(
-        std::format("Image tokenization failed: {}", e.what()));
+        fmt::format("Image tokenization failed: {}", e.what()));
   }
 }
 
 std::string
 FastVLMInference::createPromptTemplate(std::string_view userPrompt) const
 {
-  return std::format(
+  return fmt::format(
       "<|im_start|>system\n"
       "You are a helpful assistant.<|im_end|>\n"
       "<|im_start|>user\n"
@@ -487,7 +488,7 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
   catch (const std::exception& e)
   {
     throw std::runtime_error(
-        std::format("Failed to create multimodal embeddings: {}", e.what()));
+        fmt::format("Failed to create multimodal embeddings: {}", e.what()));
   }
 }
 
@@ -750,12 +751,12 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
   }
   catch (const Ort::Exception& e)
   {
-    std::cout << std::format("ONNX decoder error: {}\n", e.what());
+    std::cout << fmt::format("ONNX decoder error: {}\n", e.what());
     return {};
   }
   catch (const std::exception& e)
   {
-    std::cout << std::format("Generation error: {}\n", e.what());
+    std::cout << fmt::format("Generation error: {}\n", e.what());
     return {};
   }
 }
