@@ -81,13 +81,25 @@ FastVLMInference::FastVLMInference(
 
   try
   {
+#if defined(_WIN32)
+    auto model0 = QString::fromUtf8(visionEncoderPath);
+    auto model1 = QString::fromUtf8(embedTokensPath);
+    auto model2 = QString::fromUtf8(decoderPath);
+    auto model0_str = model0.toStdWString();
+    auto model1_str = model1.toStdWString();
+    auto model2_str = model2.toStdWString();
+#else
+    auto model0_str = visionEncoderPath;
+    auto model1_str = embedTokensPath;
+    auto model2_str = decoderPath;
+#endif
     // Load separate ONNX models from onnx/ directory
     visionEncoderSession = std::make_unique<Ort::Session>(
-        env, visionEncoderPath.data(), sessionOptions);
+        env, model0_str.data(), sessionOptions);
     embedTokensSession = std::make_unique<Ort::Session>(
-        env, embedTokensPath.data(), sessionOptions);
+        env, model1_str.data(), sessionOptions);
     decoderSession = std::make_unique<Ort::Session>(
-        env, decoderPath.data(), sessionOptions);
+        env, model2_str.data(), sessionOptions);
 
     if (tokenizerModelPath.ends_with("tokenizer.json"))
       tokenizerModelPath = tokenizerModelPath.substr(

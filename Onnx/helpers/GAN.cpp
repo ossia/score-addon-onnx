@@ -1,6 +1,7 @@
 #include "GAN.hpp"
 
 #include <QFile>
+#include <QString>
 
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
@@ -22,11 +23,20 @@ StyleGANModel::StyleGANModel(const GANConfig& config)
 
   if (config_.model_paths.size() >= 2)
   {
+#if defined(_WIN32)
+    auto model0 = QString::fromStdString(config_.model_paths[0]);
+    auto model1 = QString::fromStdString(config_.model_paths[1]);
+    auto model0_str = model0.toStdWString();
+    auto model1_str = model1.toStdWString();
+#else
+    auto model0_str = config_.model_paths[0];
+    auto model1_str = config_.model_paths[1];
+#endif
     // Load mapping and synthesis networks
     mapping_session_ = std::make_unique<Ort::Session>(
-        env_, config_.model_paths[0].c_str(), session_options_);
+        env_, model0_str.c_str(), session_options_);
     synthesis_session_ = std::make_unique<Ort::Session>(
-        env_, config_.model_paths[1].c_str(), session_options_);
+        env_, model1_str.c_str(), session_options_);
     qDebug() << "Loaded StyleGAN models:" << config_.model_paths[0].c_str()
              << "and" << config_.model_paths[1].c_str();
   }
@@ -173,8 +183,14 @@ SingleNetworkGAN::SingleNetworkGAN(const GANConfig& config)
 
   if (!config_.model_paths.empty())
   {
+#if defined(_WIN32)
+    auto model0 = QString::fromStdString(config_.model_paths[0]);
+    auto model0_str = model0.toStdWString();
+#else
+    auto model0_str = config_.model_paths[0];
+#endif
     generator_session_ = std::make_unique<Ort::Session>(
-        env_, config_.model_paths[0].c_str(), session_options_);
+        env_, model0_str.c_str(), session_options_);
     qDebug() << "Loaded single GAN model:" << config_.model_paths[0].c_str();
   }
 }
