@@ -655,8 +655,14 @@ ImageTranslationGAN::ImageTranslationGAN(const GANConfig& config)
 
   if (!config_.model_paths.empty())
   {
+#if defined(_WIN32)
+    auto model0 = QString::fromStdString(config_.model_paths[0]);
+    auto model0_str = model0.toStdWString();
+#else
+    auto model0_str = config_.model_paths[0];
+#endif
     translation_session_ = std::make_unique<Ort::Session>(
-        env_, config_.model_paths[0].c_str(), session_options_);
+        env_, model0_str.c_str(), session_options_);
     qDebug() << "Loaded image translation model:"
              << config_.model_paths[0].c_str();
   }
