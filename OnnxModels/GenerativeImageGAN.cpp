@@ -55,14 +55,6 @@ void GenerativeImageGAN::randomizeLatent()
   {
     val = dist(gen);
   }
-
-  // Update the array input with the first 16 dimensions
-  if (latent_vector.size() >= 16)
-  {
-    for (size_t i = 0; i < 16; ++i) {
-      inputs.latent_dims.value[i] = latent_vector[i];
-    }
-  }
 }
 
 bool GenerativeImageGAN::needsReinitialization() const
