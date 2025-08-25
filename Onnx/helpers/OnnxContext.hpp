@@ -232,9 +232,10 @@ struct OnnxRunContext
            .shape = input_tensor_type.GetShape()});
 
       // some models might have negative shape values to indicate dynamic shape, e.g., for variable batch size.
-      for (int64_t& dim : spec.inputs.back().shape)
-        if (dim < 0)
-          dim = 1;
+      if (auto& tensor = spec.inputs.back();
+          tensor.shape.size() == 4) // NCHW or NHCW
+        if (tensor.shape[0] == -1)
+          tensor.shape[0] = 1;
 
       spec.input_names.push_back(std::move(name));
     }
@@ -297,7 +298,7 @@ struct OnnxRunContext
   }
 };
 
-inline ModelSpec readModelSpec(const std::string& model_path)
+inline ModelSpec readModelSpec(std::string_view model_path)
 {
   OnnxRunContext ctx{model_path};
   return ctx.readModelSpec();

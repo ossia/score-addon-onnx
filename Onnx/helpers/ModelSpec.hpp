@@ -3,6 +3,7 @@
 
 #include <ossia/network/common/parameter_properties.hpp>
 
+#include <QDebug>
 #include <QString>
 
 #include <vector>
@@ -25,4 +26,22 @@ struct ModelSpec
   std::vector<const char*> input_names_char;
   std::vector<const char*> output_names_char;
 };
+
+inline QDebug operator<<(QDebug s, const ModelSpec& spec)
+{
+  s << "Model: " << spec.input_names.size() << spec.output_names.size()
+    << "\n";
+  for (auto& port : spec.input_names)
+    s << " - i: " << port << "\n";
+  for (auto& port : spec.inputs)
+    s << "   => " << port.name << (int)port.port_type << (int)port.data_type
+      << port.shape << "\n";
+  for (auto& port : spec.output_names)
+    s << " - o: " << port << "\n";
+  for (auto& port : spec.outputs)
+    s << "   => " << port.name << (int)port.port_type << (int)port.data_type
+      << port.shape << "\n";
+
+  return s;
+}
 }

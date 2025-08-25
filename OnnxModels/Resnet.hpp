@@ -37,13 +37,14 @@ public:
 
       struct
   {
-    halp::fixed_texture_input<"In"> image;
+    halp::texture_input<"In"> image;
     ModelPort model;
-    struct : halp::lineedit<"Classes", "">
+
+    struct : halp::file_port<"Classes">
     {
       void update(ResnetDetector& self)
       {
-        self.resnet.loadClasses(this->value);
+        self.resnet.loadClasses(this->file.filename);
       }
     } classes;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 224}>

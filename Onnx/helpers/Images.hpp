@@ -34,7 +34,8 @@ inline FloatTensor nchw_tensorFromARGB(
     std::array<float, 3> std)
 {
   auto& input_shape = port.shape;
-  QImage img = QImage(source_bits, source_w, source_h, QImage::Format_ARGB32);
+  QImage img
+      = QImage(source_bits, source_w, source_h, QImage::Format_RGBA8888);
   img = std::move(img).scaled(
       model_w,
       model_h,

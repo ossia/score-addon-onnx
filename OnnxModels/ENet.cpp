@@ -18,11 +18,7 @@ namespace OnnxModels
 // outputs:
 // - tensor: float32[batch_size,8]
 
-EmotionNetDetector::EmotionNetDetector() noexcept
-{
-  inputs.image.request_height = 224;
-  inputs.image.request_width = 224;
-}
+EmotionNetDetector::EmotionNetDetector() noexcept { }
 
 EmotionNetDetector::~EmotionNetDetector() = default;
 
@@ -43,7 +39,7 @@ try
   }
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
-  auto t = nchw_tensorFromARGB(
+  auto t = nchw_tensorFromRGBA(
       spec.inputs[0],
       in_tex.bytes,
       in_tex.width,

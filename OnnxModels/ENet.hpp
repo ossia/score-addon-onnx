@@ -1,7 +1,6 @@
 #pragma once
-#include <OnnxModels/Utils.hpp>
 #include <Onnx/helpers/Resnet.hpp>
-#include <cmath>
+#include <OnnxModels/Utils.hpp>
 #include <halp/controls.hpp>
 #include <halp/geometry.hpp>
 #include <halp/meta.hpp>
@@ -37,7 +36,7 @@ public:
 
       struct
   {
-    halp::fixed_texture_input<"In"> image;
+    halp::texture_input<"In"> image;
     ModelPort model;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 224}>
         resolution;

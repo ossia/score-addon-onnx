@@ -27,7 +27,7 @@ void ImageToImageGAN::createModelFromFile()
     return;
 
   try {
-    std::vector<std::string> model_paths = {std::string(inputs.model.file.filename)};
+    std::vector<std::string_view> model_paths = {inputs.model.file.bytes};
 
     // Get appropriate config based on selected model type
     Onnx::GANConfig config;

@@ -20,8 +20,7 @@ struct ModelSpec;
 struct GANConfig
 {
   std::string model_type;
-  std::vector<std::string>
-      model_paths;    // Support multi-file models (mapping + synthesis)
+  std::vector<std::string_view> model_bytes;
   int latent_dim = 0; // 0 for image-to-image models
   int output_width;
   int output_height;
@@ -160,21 +159,20 @@ private:
 class GANFactory
 {
 public:
-  // static std::unique_ptr<GANModel> createModel(const std::string& model_type, const std::vector<std::string>& model_paths);
   static GANConfig
-  getFBAnimeConfig(const std::vector<std::string>& model_paths);
+  getFBAnimeConfig(const std::vector<std::string_view>& models);
   static GANConfig
-  getEigenGANConfig(const std::vector<std::string>& model_paths);
+  getEigenGANConfig(const std::vector<std::string_view>& models);
   static GANConfig
-  getMobileStyleGANConfig(const std::vector<std::string>& model_paths);
+  getMobileStyleGANConfig(const std::vector<std::string_view>& models);
   static GANConfig
-  getPyTorchGANConfig(const std::vector<std::string>& model_paths);
+  getPyTorchGANConfig(const std::vector<std::string_view>& models);
   static GANConfig
-  getAnimeGANv3Config(const std::vector<std::string>& model_paths);
+  getAnimeGANv3Config(const std::vector<std::string_view>& models);
   static GANConfig
-  getFastSRGANConfig(const std::vector<std::string>& model_paths);
+  getFastSRGANConfig(const std::vector<std::string_view>& models);
   static GANConfig
-  getDeblurGANv2Config(const std::vector<std::string>& model_paths);
+  getDeblurGANv2Config(const std::vector<std::string_view>& models);
 };
 
 

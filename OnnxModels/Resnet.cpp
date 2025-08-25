@@ -7,11 +7,7 @@
 namespace OnnxModels
 {
 
-ResnetDetector::ResnetDetector() noexcept
-{
-  inputs.image.request_height = 224;
-  inputs.image.request_width = 224;
-}
+ResnetDetector::ResnetDetector() noexcept { }
 
 ResnetDetector::~ResnetDetector() = default;
 
@@ -31,7 +27,7 @@ void ResnetDetector::operator()()
   }
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
-  auto t = nchw_tensorFromARGB(
+  auto t = nchw_tensorFromRGBA(
       spec.inputs[0],
       in_tex.bytes,
       in_tex.width,

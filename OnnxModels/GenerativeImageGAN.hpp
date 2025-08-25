@@ -41,11 +41,10 @@ public:
 
   struct
   {
-    halp::enum_t<ModelType, "ModelType"> model_type;
-    ModelPort mapping_model;
-    ModelPort synthesis_model;
+    halp::enum_t<ModelType, "Model Type"> model_type;
+    struct : ModelPort{halp_meta(name, "Mapping model")} mapping_model;
+    struct : ModelPort{halp_meta(name, "Synthesis model")} synthesis_model;
 
-    // Latent space controls - first 16 dimensions for StyleGAN
     halp::val_port<"Latent Vector", ossia::small_pod_vector<float, 16>>
         latent_dims;
 

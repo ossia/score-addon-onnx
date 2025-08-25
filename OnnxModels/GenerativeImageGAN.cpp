@@ -71,10 +71,10 @@ void GenerativeImageGAN::createModelFromFile()
     return;
 
   try {
-    std::vector<std::string> model_paths;
+    std::vector<std::string_view> model_paths;
     if (!inputs.mapping_model.file.filename.empty())
-      model_paths.push_back(std::string(inputs.mapping_model.file.filename));
-    model_paths.push_back(std::string(inputs.synthesis_model.file.filename));
+      model_paths.push_back(inputs.mapping_model.file.bytes);
+    model_paths.push_back(inputs.synthesis_model.file.bytes);
 
     // Get appropriate config based on selected model type
     Onnx::GANConfig config;

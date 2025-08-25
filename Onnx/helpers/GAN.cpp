@@ -21,24 +21,15 @@ StyleGANModel::StyleGANModel(const GANConfig& config)
   Onnx::Options oopts;
   session_options_ = Onnx::create_session_options(oopts);
 
-  if (config_.model_paths.size() >= 2)
+  if (config_.model_bytes.size() >= 2)
   {
-#if defined(_WIN32)
-    auto model0 = QString::fromStdString(config_.model_paths[0]);
-    auto model1 = QString::fromStdString(config_.model_paths[1]);
-    auto model0_str = model0.toStdWString();
-    auto model1_str = model1.toStdWString();
-#else
-    auto model0_str = config_.model_paths[0];
-    auto model1_str = config_.model_paths[1];
-#endif
+    auto& model0_str = config_.model_bytes[0];
+    auto& model1_str = config_.model_bytes[1];
     // Load mapping and synthesis networks
     mapping_session_ = std::make_unique<Ort::Session>(
-        env_, model0_str.c_str(), session_options_);
+        env_, model0_str.data(), model0_str.size(), session_options_);
     synthesis_session_ = std::make_unique<Ort::Session>(
-        env_, model1_str.c_str(), session_options_);
-    qDebug() << "Loaded StyleGAN models:" << config_.model_paths[0].c_str()
-             << "and" << config_.model_paths[1].c_str();
+        env_, model1_str.data(), model1_str.size(), session_options_);
   }
 }
 
@@ -181,17 +172,11 @@ SingleNetworkGAN::SingleNetworkGAN(const GANConfig& config)
   Onnx::Options oopts;
   session_options_ = Onnx::create_session_options(oopts);
 
-  if (!config_.model_paths.empty())
+  if (!config_.model_bytes.empty())
   {
-#if defined(_WIN32)
-    auto model0 = QString::fromStdString(config_.model_paths[0]);
-    auto model0_str = model0.toStdWString();
-#else
-    auto model0_str = config_.model_paths[0];
-#endif
+    auto& model0_str = config_.model_bytes[0];
     generator_session_ = std::make_unique<Ort::Session>(
-        env_, model0_str.c_str(), session_options_);
-    qDebug() << "Loaded single GAN model:" << config_.model_paths[0].c_str();
+        env_, model0_str.data(), model0_str.size(), session_options_);
   }
 }
 
@@ -477,11 +462,11 @@ QImage SingleNetworkGAN::tensorToImage(
 }
 
 GANConfig
-GANFactory::getFBAnimeConfig(const std::vector<std::string>& model_paths)
+GANFactory::getFBAnimeConfig(const std::vector<std::string_view>& model_bytes)
 {
   GANConfig config;
   config.model_type = "FBAnime";
-  config.model_paths = model_paths;
+  config.model_bytes = model_bytes;
   config.latent_dim = 1024;
   config.output_width = 512;
   config.output_height = 1024;
@@ -494,11 +479,11 @@ GANFactory::getFBAnimeConfig(const std::vector<std::string>& model_paths)
 }
 
 GANConfig
-GANFactory::getEigenGANConfig(const std::vector<std::string>& model_paths)
+GANFactory::getEigenGANConfig(const std::vector<std::string_view>& model_bytes)
 {
   GANConfig config;
   config.model_type = "EigenGAN";
-  config.model_paths = model_paths;
+  config.model_bytes = model_bytes;
   config.latent_dim = 512; // eps dimension
   config.output_width = 256;
   config.output_height = 256;
@@ -514,11 +499,11 @@ GANFactory::getEigenGANConfig(const std::vector<std::string>& model_paths)
 }
 
 GANConfig GANFactory::getMobileStyleGANConfig(
-    const std::vector<std::string>& model_paths)
+    const std::vector<std::string_view>& model_bytes)
 {
   GANConfig config;
   config.model_type = "MobileStyleGAN";
-  config.model_paths = model_paths;
+  config.model_bytes = model_bytes;
   config.requires_mapping_network = false; // Single ONNX file
   config.is_generative = true;
   config.input_mean = 0.0f;
@@ -527,14 +512,12 @@ GANConfig GANFactory::getMobileStyleGANConfig(
   config.output_max = 1.0f;
   
   // Read actual model specifications
-  if (!model_paths.empty()) {
-    QFile f{model_paths[0].c_str()};
-    f.open(QIODevice::ReadOnly);
-    auto data = f.readAll().toStdString();
-    auto spec = readModelSpec(data);
+  if (!model_bytes.empty())
+  {
+    auto spec = readModelSpec(model_bytes[0]);
     updateConfigWithModelSpec(config, spec);
   }
-  
+
   // Fallback defaults if model spec reading failed
   if (config.latent_dim == 0) config.latent_dim = 512;
   if (config.output_width == 0) config.output_width = 1024;
@@ -543,12 +526,12 @@ GANConfig GANFactory::getMobileStyleGANConfig(
   return config;
 }
 
-GANConfig
-GANFactory::getPyTorchGANConfig(const std::vector<std::string>& model_paths)
+GANConfig GANFactory::getPyTorchGANConfig(
+    const std::vector<std::string_view>& model_bytes)
 {
   GANConfig config;
   config.model_type = "PyTorchGAN";
-  config.model_paths = model_paths;
+  config.model_bytes = model_bytes;
   config.latent_dim = 512;
   config.output_width = 128; // CelebA model
   config.output_height = 128;
@@ -563,12 +546,12 @@ GANFactory::getPyTorchGANConfig(const std::vector<std::string>& model_paths)
   return config;
 }
 
-GANConfig
-GANFactory::getAnimeGANv3Config(const std::vector<std::string>& model_paths)
+GANConfig GANFactory::getAnimeGANv3Config(
+    const std::vector<std::string_view>& model_bytes)
 {
   GANConfig config;
   config.model_type = "AnimeGANv3";
-  config.model_paths = model_paths;
+  config.model_bytes = model_bytes;
   config.latent_dim = 0;    // No latent space for image translation
   config.requires_mapping_network = false;
   config.is_generative = false; // Image-to-image translation
@@ -578,11 +561,12 @@ GANFactory::getAnimeGANv3Config(const std::vector<std::string>& model_paths)
   config.output_max = 1.0f;
   
   // Read actual model specifications
-  if (!model_paths.empty()) {
-    auto spec = readModelSpec(model_paths[0]);
+  if (!model_bytes.empty())
+  {
+    ModelSpec spec = readModelSpec(model_bytes[0]);
     updateConfigWithModelSpec(config, spec);
   }
-  
+
   // Fallback defaults if model spec reading failed
   if (config.input_width == 0) config.input_width = 256;
   if (config.input_height == 0) config.input_height = 256;
@@ -592,12 +576,12 @@ GANFactory::getAnimeGANv3Config(const std::vector<std::string>& model_paths)
   return config;
 }
 
-GANConfig
-GANFactory::getFastSRGANConfig(const std::vector<std::string>& model_paths)
+GANConfig GANFactory::getFastSRGANConfig(
+    const std::vector<std::string_view>& model_bytes)
 {
   GANConfig config;
   config.model_type = "FastSRGAN";
-  config.model_paths = model_paths;
+  config.model_bytes = model_bytes;
   config.latent_dim = 0;    // No latent space for super-resolution
   config.requires_mapping_network = false;
   config.is_generative = false; // Image-to-image translation (super-resolution)
@@ -607,11 +591,12 @@ GANFactory::getFastSRGANConfig(const std::vector<std::string>& model_paths)
   config.output_max = 1.0f;
   
   // Read actual model specifications
-  if (!model_paths.empty()) {
-    auto spec = readModelSpec(model_paths[0]);
+  if (!model_bytes.empty())
+  {
+    auto spec = readModelSpec(model_bytes[0]);
     updateConfigWithModelSpec(config, spec);
   }
-  
+
   // Fallback defaults if model spec reading failed
   if (config.input_width == 0) config.input_width = 256;
   if (config.input_height == 0) config.input_height = 256;
@@ -621,12 +606,12 @@ GANFactory::getFastSRGANConfig(const std::vector<std::string>& model_paths)
   return config;
 }
 
-GANConfig
-GANFactory::getDeblurGANv2Config(const std::vector<std::string>& model_paths)
+GANConfig GANFactory::getDeblurGANv2Config(
+    const std::vector<std::string_view>& model_bytes)
 {
   GANConfig config;
   config.model_type = "DeblurGANv2";
-  config.model_paths = model_paths;
+  config.model_bytes = model_bytes;
   config.latent_dim = 0;    // No latent space for deblurring
   config.input_width = 640; // Fixed input size for this model
   config.input_height = 480;
@@ -653,18 +638,11 @@ ImageTranslationGAN::ImageTranslationGAN(const GANConfig& config)
   Onnx::Options oopts;
   session_options_ = Onnx::create_session_options(oopts);
 
-  if (!config_.model_paths.empty())
+  if (!config_.model_bytes.empty())
   {
-#if defined(_WIN32)
-    auto model0 = QString::fromStdString(config_.model_paths[0]);
-    auto model0_str = model0.toStdWString();
-#else
-    auto model0_str = config_.model_paths[0];
-#endif
+    const auto& model0_str = config_.model_bytes[0];
     translation_session_ = std::make_unique<Ort::Session>(
-        env_, model0_str.c_str(), session_options_);
-    qDebug() << "Loaded image translation model:"
-             << config_.model_paths[0].c_str();
+        env_, model0_str.data(), model0_str.size(), session_options_);
   }
 }
 
