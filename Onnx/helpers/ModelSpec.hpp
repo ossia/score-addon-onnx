@@ -32,12 +32,12 @@ inline QDebug operator<<(QDebug s, const ModelSpec& spec)
   s << "Model: " << spec.input_names.size() << spec.output_names.size()
     << "\n";
   for (auto& port : spec.input_names)
-    s << " - i: " << port << "\n";
+    s << " - i: " << port.c_str() << "\n";
   for (auto& port : spec.inputs)
     s << "   => " << port.name << (int)port.port_type << (int)port.data_type
       << port.shape << "\n";
   for (auto& port : spec.output_names)
-    s << " - o: " << port << "\n";
+    s << " - o: " << port.c_str() << "\n";
   for (auto& port : spec.outputs)
     s << "   => " << port.name << (int)port.port_type << (int)port.data_type
       << port.shape << "\n";
