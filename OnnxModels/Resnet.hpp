@@ -38,7 +38,7 @@ public:
       struct
   {
     halp::texture_input<"In"> image;
-    ModelPort model;
+    ModelPort<"Model"> model;
 
     struct : halp::file_port<"Classes">
     {

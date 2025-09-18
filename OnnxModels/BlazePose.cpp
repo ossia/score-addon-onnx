@@ -17,8 +17,11 @@ BlazePoseDetector::BlazePoseDetector() noexcept
 BlazePoseDetector::~BlazePoseDetector() = default;
 
 void BlazePoseDetector::operator()()
+try
 {
   if (!available)
+    return;
+  if (current_model_invalid)
     return;
 
   auto& in_tex = inputs.image.texture;
@@ -28,9 +31,10 @@ void BlazePoseDetector::operator()()
 
   if (!this->ctx)
   {
-    this->ctx
-        = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
+    this->ctx = std::make_unique<Onnx::OnnxRunContext>(
+        this->inputs.model.file.bytes);
   }
+
   auto& ctx = *this->ctx;
   auto spec = ctx.readModelSpec();
   auto t = nhwc_rgb_tensorFromRGBA(
@@ -81,5 +85,9 @@ void BlazePoseDetector::operator()()
     outputs.image.texture.changed = true;
     std::swap(storage, t.storage);
   }
+}
+catch (...)
+{
+  current_model_invalid = true;
 }
 }

@@ -14,8 +14,11 @@ PoseDetector::PoseDetector() noexcept
 PoseDetector::~PoseDetector() = default;
 
 void PoseDetector::operator()()
+try
 {
   if (!available)
+    return;
+  if (current_model_invalid)
     return;
 
   auto& in_tex = inputs.image.texture;
@@ -70,5 +73,9 @@ void PoseDetector::operator()()
       in_tex.width * in_tex.height * 4);
   outputs.image.texture.changed = true;
   std::swap(storage, t.storage);
+}
+catch (...)
+{
+  current_model_invalid = true;
 }
 }

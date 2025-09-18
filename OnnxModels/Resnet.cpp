@@ -12,8 +12,11 @@ ResnetDetector::ResnetDetector() noexcept { }
 ResnetDetector::~ResnetDetector() = default;
 
 void ResnetDetector::operator()()
+try
 {
   if (!available)
+    return;
+  if (current_model_invalid)
     return;
 
   auto& in_tex = inputs.image.texture;
@@ -56,5 +59,9 @@ void ResnetDetector::operator()()
          .height = in_tex.height,
          .changed = true};
   std::swap(storage, t.storage);
+}
+catch (...)
+{
+  current_model_invalid = true;
 }
 }

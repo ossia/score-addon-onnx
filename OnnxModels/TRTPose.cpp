@@ -16,11 +16,14 @@ TRTPoseDetector::TRTPoseDetector() noexcept
 TRTPoseDetector::~TRTPoseDetector() = default;
 
 void TRTPoseDetector::operator()()
+try
 {
 #if 0
   qDebug("============ BEGIN FRAME");
 #endif
   if (!available)
+    return;
+  if (current_model_invalid)
     return;
 
   auto& in_tex = inputs.image.texture;
@@ -316,5 +319,9 @@ void TRTPoseDetector::operator()()
   outputs.image.texture.changed = true;
 
   std::swap(storage, t.storage);
+}
+catch (...)
+{
+  current_model_invalid = true;
 }
 }

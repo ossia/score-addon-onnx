@@ -32,7 +32,7 @@ public:
       struct
   {
     halp::fixed_texture_input<"In"> image;
-    ModelPort model;
+    ModelPort<"Model"> model;
     struct : halp::file_port<"Classes">
     {
       void update(YOLO8Segmentation& self) { self.loadClasses(); }

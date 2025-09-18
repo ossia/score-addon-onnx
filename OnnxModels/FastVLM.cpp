@@ -83,6 +83,8 @@ try
     outputs.response.value = "ONNX Runtime not available";
     return;
   }
+  if (current_model_invalid)
+    return;
 
   if (needsReinitialization())
   {

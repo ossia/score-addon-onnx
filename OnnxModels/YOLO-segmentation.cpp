@@ -28,9 +28,12 @@ void YOLO8Segmentation::loadClasses()
 }
 
 void YOLO8Segmentation::operator()()
+try
 {
   auto& in_tex = inputs.image.texture;
   if (!in_tex.changed)
+    return;
+  if (current_model_invalid)
     return;
 
   if (!this->ctx)
@@ -79,5 +82,8 @@ void YOLO8Segmentation::operator()()
   outputs.image.texture.changed = true;
   std::swap(storage, t.storage);
 }
-
+catch (...)
+{
+  current_model_invalid = true;
+}
 }

@@ -45,8 +45,8 @@ public:
       }
     } input_image;
 
-    halp::enum_t<ModelType, "ModelType"> model_type;
-    ModelPort model;
+    halp::enum_t<ModelType, "Model Type"> model_type;
+    ModelPort<"Model"> model;
 
   } inputs;
 

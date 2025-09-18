@@ -35,7 +35,11 @@ public:
     struct : halp::file_port<"Model", halp::mmap_file_view>
     {
       halp_meta(extensions, "*.onnx");
-      void update(QwenLLMNode& g) { g.must_infer = true; }
+      void update(QwenLLMNode& g)
+      {
+        g.must_infer = true;
+        g.current_model_invalid = false;
+      }
     } model;
 
     struct : halp::file_port<"Tokenizer", halp::mmap_file_view>

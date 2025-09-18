@@ -47,7 +47,7 @@ public:
       struct
   {
     halp::fixed_texture_input<"In"> image;
-    ModelPort model;
+    ModelPort<"Model"> model;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 640}>
         resolution;
 

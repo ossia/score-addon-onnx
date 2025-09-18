@@ -41,24 +41,14 @@ public:
       }
     } image;
 
-    struct : halp::file_port<"Vision Encoder", halp::mmap_file_view>
-    {
-      halp_meta(extensions, "*.onnx");
-    } visionEncoder;
-
-    struct : halp::file_port<"Embed Tokens", halp::mmap_file_view>
-    {
-      halp_meta(extensions, "*.onnx");
-    } embedTokens;
-
-    struct : halp::file_port<"Decoder", halp::mmap_file_view>
-    {
-      halp_meta(extensions, "*.onnx");
-    } decoder;
+    ModelPort<"Vision Encoder"> visionEncoder;
+    ModelPort<"Embed Tokens"> embedTokens;
+    ModelPort<"Decoder"> decoder;
 
     struct : halp::file_port<"Tokenizer", halp::mmap_file_view>
     {
       halp_meta(extensions, "*.json");
+      void update(FastVLMNode& self) { self.current_model_invalid = false; }
     } tokenizer;
 
     struct : halp::lineedit<"Prompt", "What do you see in this image?">

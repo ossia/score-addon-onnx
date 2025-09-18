@@ -22,6 +22,8 @@ try
 {
   if (!available)
     return;
+  if (current_model_invalid)
+    return;
 
   auto& in_tex = inputs.image.texture;
   if (!in_tex.changed)
@@ -73,5 +75,6 @@ try
 }
 catch (...)
 {
+  current_model_invalid = true;
 }
 }

@@ -42,8 +42,8 @@ public:
   struct
   {
     halp::enum_t<ModelType, "Model Type"> model_type;
-    struct : ModelPort{halp_meta(name, "Mapping model")} mapping_model;
-    struct : ModelPort{halp_meta(name, "Synthesis model")} synthesis_model;
+    ModelPort<"Mapping model"> mapping_model;
+    ModelPort<"Synthesis model"> synthesis_model;
 
     halp::val_port<"Latent Vector", ossia::small_pod_vector<float, 16>>
         latent_dims;

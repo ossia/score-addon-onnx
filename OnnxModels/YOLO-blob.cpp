@@ -28,10 +28,11 @@ void YOLO7BlobDetector::loadClasses()
 }
 
 void YOLO7BlobDetector::operator()()
+try
 {
   if (!available)
     return;
-  if (this->inputs.model.file.bytes.empty())
+  if (current_model_invalid)
     return;
 
   auto& in_tex = inputs.image.texture;
@@ -104,5 +105,8 @@ void YOLO7BlobDetector::operator()()
   outputs.image.texture.changed = true;
   std::swap(storage, t.storage);
 }
-
+catch (...)
+{
+  current_model_invalid = true;
+}
 }

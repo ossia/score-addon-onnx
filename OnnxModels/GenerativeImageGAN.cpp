@@ -158,6 +158,7 @@ void GenerativeImageGAN::requestInference()
 }
 
 void GenerativeImageGAN::operator()()
+try
 {
   if (!available)
     return;
@@ -176,6 +177,9 @@ void GenerativeImageGAN::operator()()
   {
     requestInference();
   }
+}
+catch (...)
+{
 }
 
 // Worker thread implementation
