@@ -52,6 +52,11 @@ try
   }
 
   std::string requested_provider = opts.provider;
+  if (auto env = qEnvironmentVariable("SCORE_ONNX_FORCE_PROVIDER");
+      !env.isEmpty())
+  {
+    requested_provider = env.trimmed().toLower().toStdString();
+  }
   if (requested_provider == "default")
   {
     if (ossia::contains(p, "cuda"))
