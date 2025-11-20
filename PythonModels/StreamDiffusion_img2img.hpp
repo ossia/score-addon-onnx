@@ -6,6 +6,9 @@
 #include <halp/meta.hpp>
 #include <halp/sample_accurate_controls.hpp>
 #include <halp/texture.hpp>
+#include <pybind11/subinterpreter.h>
+
+#include <thread>
 namespace PythonModels
 {
 struct StreamDiffusionImg2Img
@@ -23,12 +26,15 @@ public:
 
   struct
   {
-    halp::texture_input<"In"> image;
+    halp::rgb_texture_input<"In"> image;
     struct : halp::lineedit<"Prompt +", "mushroom kingdom, charcoal, velvia">
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_prompt_positive(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_prompt_positive(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } prompt;
@@ -36,7 +42,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_prompt_negative(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_prompt_negative(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } negative_prompt;
@@ -44,7 +53,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_model(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_model(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } model;
@@ -52,7 +64,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_loras(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_loras(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } loras;
@@ -60,7 +75,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_vae(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_vae(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } vae;
@@ -68,7 +86,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_seed(value);
+        {
+          self.m_wrapper->set_seed(value);
+          std::lock_guard _{self.m_param_mutex};
+        }
         self.inputs.trigger.value.emplace();
       }
     } seed;
@@ -76,7 +97,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_steps(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_steps(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } steps;
@@ -84,7 +108,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_guidance(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_guidance(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } guidance;
@@ -96,7 +123,10 @@ public:
         ts.push_back(self.inputs.t1);
         if (self.inputs.tcount > 1)
           ts.push_back(self.inputs.t2);
-        self.m_wrapper.set_temps(std::move(ts));
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_temps(std::move(ts));
+        }
         self.inputs.trigger.value.emplace();
       }
     } t1;
@@ -108,7 +138,10 @@ public:
         ts.push_back(self.inputs.t1);
         if (self.inputs.tcount > 1)
           ts.push_back(self.inputs.t2);
-        self.m_wrapper.set_temps(std::move(ts));
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_temps(std::move(ts));
+        }
         self.inputs.trigger.value.emplace();
       }
     } t2;
@@ -120,7 +153,10 @@ public:
         ts.push_back(self.inputs.t1);
         if (self.inputs.tcount > 1)
           ts.push_back(self.inputs.t2);
-        self.m_wrapper.set_temps(std::move(ts));
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_temps(std::move(ts));
+        }
         self.inputs.trigger.value.emplace();
       }
     } tcount;
@@ -128,7 +164,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_size(value.x, value.y);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_size(value.x, value.y);
+        }
         self.inputs.trigger.value.emplace();
       }
     } size;
@@ -137,7 +176,10 @@ public:
       halp_meta(description, "none, self, full, initialize.") void update(
           StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_cfg(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_cfg(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } cfg;
@@ -146,7 +188,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_add_noise(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_add_noise(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } add_noise;
@@ -154,7 +199,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_denoising_batch(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_denoising_batch(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } denoise_batch;
@@ -167,7 +215,10 @@ public:
     {
       void update(StreamDiffusionImg2Img& self)
       {
-        self.m_wrapper.set_lora_weight(value);
+        {
+          std::lock_guard _{self.m_param_mutex};
+          self.m_wrapper->set_lora_weight(value);
+        }
         self.inputs.trigger.value.emplace();
       }
     } lora_w;
@@ -175,7 +226,7 @@ public:
 
   struct
   {
-    halp::texture_output<"Out"> image;
+    halp::rgb_texture_output<"Out"> image;
 
   } outputs;
 
@@ -185,6 +236,12 @@ public:
   void operator()();
 
 private:
-  StreamDiffusionWrapper m_wrapper;
+  std::shared_ptr<StreamDiffusionWrapper> m_wrapper;
+  std::thread m_t;
+  boost::container::vector<unsigned char> in_vec, out_vec;
+  std::atomic_bool m_running;
+  std::mutex m_param_mutex;
+  std::atomic_int queue{};
+  pybind11::subinterpreter sub;
 };
 }

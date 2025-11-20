@@ -13,6 +13,7 @@
 #include <pybind11/embed.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/subinterpreter.h>
 namespace py = pybind11;
 
 namespace PythonModels
@@ -28,7 +29,7 @@ QString uvPath()
 }
 QString StreamDiffusionPath()
 {
-    return "/home/jcelerier/projets/oss/StreamDiffusion-uv";
+  return "/home/jcelerier/projets/oss/StreamDiffusion";
   return score::AppContext()
              .settings<Library::Settings::Model>()
              .getPackagesPath()
@@ -45,9 +46,6 @@ StreamDiffusionWrapper::StreamDiffusionWrapper() { }
 
 int StreamDiffusionWrapper::init()
 {
-  static int guard = python_interpreter_global_instance();
-  static int path = setup_path();
-  static int imports = setup_imports();
 
   return 1;
 }
@@ -99,6 +97,9 @@ int StreamDiffusionWrapper::setup_path()
   sys.attr("path").attr("insert")(0, QString(sd_path + "/src").toStdString());
   sys.attr("path").attr("insert")(
       1,
+      "/home/jcelerier/projets/oss/StreamDiffusion/src/streamdiffusion/cuda");
+  sys.attr("path").attr("insert")(
+      2,
       QString(sd_path + "/.venv/lib/python3.13/site-packages").toStdString());
 
   return 1;
@@ -106,17 +107,22 @@ int StreamDiffusionWrapper::setup_path()
 
 int StreamDiffusionWrapper::setup_imports()
 {
-  py::exec(R"(import os
-import torch
-from diffusers import AutoencoderTiny, StableDiffusionPipeline, StableDiffusionXLPipeline, UNet2DConditionModel
-from diffusers.utils import load_image
+  py::exec(R"(import os)");
+  py::exec("import torch");
+  py::exec(
+      "from diffusers import AutoencoderTiny, StableDiffusionPipeline, "
+      "StableDiffusionXLPipeline, UNet2DConditionModel");
+  py::exec("from diffusers.utils import load_image");
 
-from streamdiffusion import StreamDiffusion
-from streamdiffusion.image_utils import postprocess_image
-from streamdiffusion.acceleration.tensorrt import accelerate_with_tensorrt
-#from streamdiffusion.acceleration.sfast import accelerate_with_stable_fast
+  py::exec("from streamdiffusion import StreamDiffusion");
+  py::exec("from streamdiffusion.image_utils import postprocess_image");
+  py::exec(
+      "from streamdiffusion.acceleration.tensorrt import "
+      "accelerate_with_tensorrt");
+  py::exec(
+      "#from streamdiffusion.acceleration.sfast import "
+      "accelerate_with_stable_fast");
 
-)");
   return 1;
 }
 
@@ -175,8 +181,20 @@ void StreamDiffusionWrapper::create()
       count += ",";
       count += std::to_string(m_temps[2]);
     }
-    py::exec(fmt::format(
-        R"(# Wrap the pipeline in StreamDiffusion
+    py::exec(R"(
+from streamdiffusion.cuda import is_cuda_available
+
+print("Loading cuda")
+if not is_cuda_available():
+  print("ERROR: CUDA operations library is not available!")
+  raise RuntimeError("CUDA library not loaded")
+else:
+  print("SUCCESS: CUDA library loaded and available")
+  )");
+    py::exec(
+        fmt::format(
+            R"(# Wrap the pipeline in StreamDiffusion
+print("Loading SteamDiffusion")
 
 stream = None
 stream = StreamDiffusion(
@@ -187,8 +205,11 @@ stream = StreamDiffusion(
     do_add_noise={2},
     width={3},
     height={4},
-    use_denoising_batch={5}
+    use_denoising_batch={5},
+    use_cuda_native=True
 )
+print("Loaded!")
+print(stream)
 
 # if(sdxl and turbo):
 #     stream.load_lcm_lora("openskyml/lcm-lora-sdxl-turbo")
@@ -213,12 +234,12 @@ stream = StreamDiffusion(
 #     )
 
 )",
-        count,
-        m_cfg,
-        m_add_noise ? "True"sv : "False"sv,
-        m_width,
-        m_height,
-        m_denoising_batch ? "True"sv : "False"sv));
+            count,
+            m_cfg,
+            m_add_noise ? "True"sv : "False"sv,
+            m_width,
+            m_height,
+            m_denoising_batch ? "True"sv : "False"sv));
 
     qDebug()<<m_lora_weight;
     if (!m_sd_turbo)
@@ -251,19 +272,20 @@ stream.pipe.unload_lora_weights()
       }
     }
 
-    py::exec(fmt::format(
-        R"(
+    py::exec(
+        fmt::format(
+            R"(
 stream.vae = AutoencoderTiny.from_pretrained("{2}").to(device=pipe.device, dtype=pipe.dtype)
 
-resolutiondict = {{'engine_build_options' : {{ 'opt_image_width': {0}, 'opt_image_height': {1} }} }}
+resolutiondict = {{ 'opt_image_width': {0}, 'opt_image_height': {1}, 'opt_batch_size': 2 }} 
 #if((not sdxl) and (not turbo)):
-#stream = accelerate_with_tensorrt(stream, "engines_test_sd_turbo_{0}_{1}", max_batch_size={3},engine_build_options=resolutiondict)
+# stream = accelerate_with_tensorrt(stream, "engines_test_sd_turbo_{0}_{1}", max_batch_size={3},engine_build_options=resolutiondict)
 # stream.pipe.enable_xformers_memory_efficient_attention()
 )",
-        m_width,
-        m_height,
-        m_vae,
-        m_temps.size()));
+            m_width,
+            m_height,
+            m_vae,
+            m_temps.size()));
     m_needsCreate = false;
     m_created = true;
   }
@@ -346,20 +368,12 @@ void StreamDiffusionWrapper::img2img(
   try
   {
     using namespace py::literals;
-    auto img = Onnx::rescaleImage(
-        in_bytes,
-        in_width,
-        in_height,
-        QImage::Format_RGBA8888,
-        m_width,
-        m_height);
-    img = img.convertToFormat(QImage::Format::Format_RGB888);
 
     // RGBA to PIL
     auto img_array = py::array_t<uint8_t>(
         {m_width, m_height, 3}, // shape
         {m_width * 3, 3, 1},    // strides (row, col, channel)
-        img.constBits()         // pointer to data
+        in_bytes                // pointer to data
     );
 
     // Import PIL and create image in Python
@@ -391,7 +405,9 @@ for _ in range({}):
         locals);
 
     // Get our image back
-    read_image_pil(raw_bytes, out_bytes);
+    const auto vv = std::string_view(raw_bytes);
+    memcpy(out_bytes, vv.data(), vv.size());
+    // read_image_pil(raw_bytes, out_bytes);
   }
   catch (const std::exception& e)
   {
