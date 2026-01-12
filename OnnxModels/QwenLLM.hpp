@@ -32,13 +32,12 @@ public:
       void update(QwenLLMNode& g) { g.must_infer = true; }
     } prompt;
 
-    struct : halp::file_port<"Model", halp::mmap_file_view>
+    struct : ModelPort<"Model">
     {
-      halp_meta(extensions, "*.onnx");
       void update(QwenLLMNode& g)
       {
+        ModelPort::update(g);
         g.must_infer = true;
-        g.current_model_invalid = false;
       }
     } model;
 

@@ -21,7 +21,8 @@ try
 {
   if (!available)
     return;
-  if (current_model_invalid)
+
+  if (this->inputs.model.current_model_invalid)
     return;
 
   auto& in_tex = inputs.image.texture;
@@ -88,6 +89,6 @@ try
 }
 catch (...)
 {
-  current_model_invalid = true;
+  inputs.model.current_model_invalid = true;
 }
 }

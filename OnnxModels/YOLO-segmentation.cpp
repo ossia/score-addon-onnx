@@ -33,7 +33,7 @@ try
   auto& in_tex = inputs.image.texture;
   if (!in_tex.changed)
     return;
-  if (current_model_invalid)
+  if (inputs.model.current_model_invalid)
     return;
 
   if (!this->ctx)
@@ -84,6 +84,6 @@ try
 }
 catch (...)
 {
-  current_model_invalid = true;
+  inputs.model.current_model_invalid = true;
 }
 }

@@ -83,7 +83,13 @@ try
     outputs.response.value = "ONNX Runtime not available";
     return;
   }
-  if (current_model_invalid)
+  if (inputs.visionEncoder.current_model_invalid)
+    return;
+  if (inputs.embedTokens.current_model_invalid)
+    return;
+  if (inputs.embedTokens.current_model_invalid)
+    return;
+  if (inputs.decoder.current_model_invalid)
     return;
 
   if (needsReinitialization())

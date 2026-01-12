@@ -48,7 +48,11 @@ public:
     struct : halp::file_port<"Tokenizer", halp::mmap_file_view>
     {
       halp_meta(extensions, "*.json");
-      void update(FastVLMNode& self) { self.current_model_invalid = false; }
+      void update(FastVLMNode& self)
+      {
+        current_model_invalid = this->file.bytes.size() < 32;
+      }
+      bool current_model_invalid{};
     } tokenizer;
 
     struct : halp::lineedit<"Prompt", "What do you see in this image?">

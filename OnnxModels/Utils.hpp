@@ -118,7 +118,6 @@ struct OnnxObject
 public:
   OnnxObject() noexcept { available = initOnnxRuntime(); }
   bool available{false};
-  bool current_model_invalid{false};
 };
 
 template <halp::static_string lit>
@@ -128,7 +127,8 @@ struct ModelPort : halp::file_port<lit, halp::mmap_file_view>
 
   void update(OnnxObject& obj)
   {
-    obj.current_model_invalid = this->file.bytes.size() < 32;
+    current_model_invalid = this->file.bytes.size() < 32;
   }
+  bool current_model_invalid{false};
 };
 }
