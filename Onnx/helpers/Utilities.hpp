@@ -81,17 +81,21 @@ inline void softmax(std::span<const float> in, std::vector<float>& out)
 {
   out.clear();
   out.resize(in.size());
+
+  // Find max for numerical stability (prevents exp overflow)
+  float max_val = *std::max_element(in.begin(), in.end());
+
 #pragma omp simd
-  for (int k = 0; k < in.size(); k++)
+  for (size_t k = 0; k < in.size(); k++)
   {
-    out[k] = std::exp(in[k]);
+    out[k] = std::exp(in[k] - max_val);
   }
   float esum = std::reduce(out.begin(), out.end());
   if (!(esum > 0.f))
     return;
 
 #pragma omp simd
-  for (int k = 0; k < in.size(); k++)
+  for (size_t k = 0; k < in.size(); k++)
   {
     out[k] /= esum;
   }

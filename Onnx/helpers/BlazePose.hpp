@@ -1,6 +1,7 @@
 #pragma once
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
+#include <Onnx/helpers/Utilities.hpp>
 
 namespace OnnxModels::Blazepose
 {
@@ -41,22 +42,12 @@ struct BlazePose_fullbody
     std::copy_n(
         data, NUM_KPS * 5, reinterpret_cast<float*>(&out->keypoints[0]));
 
-    float probas_visibility[NUM_KPS];
-    float probas_presence[NUM_KPS];
-    static thread_local std::vector<float> probas_out_presence;
-    static thread_local std::vector<float> probas_out_visibility;
-    for (int i = 0; i < NUM_KPS; i++)
-    {
-      probas_visibility[i] = (*out).keypoints[i].visibility;
-      probas_presence[i] = (*out).keypoints[i].presence;
-    }
-    Onnx::softmax(probas_visibility, probas_out_visibility);
-    Onnx::softmax(probas_presence, probas_out_presence);
+    // Apply sigmoid to convert logits to per-keypoint probabilities
     auto& kps = out->keypoints;
     for (int i = 0; i < NUM_KPS; i++)
     {
-      kps[i].visibility = probas_out_visibility[i];
-      kps[i].presence = probas_out_presence[i];
+      kps[i].visibility = Onnx::sigmoid(kps[i].visibility);
+      kps[i].presence = Onnx::sigmoid(kps[i].presence);
     }
 
     return true;

@@ -149,6 +149,20 @@ avnd_score_plugin_add(
   BASE_TARGET
     score_addon_onnx_models
   SOURCES
+    OnnxModels/PoseDetector.hpp
+    OnnxModels/PoseDetector.cpp
+  TARGET
+    pose-detector
+  MAIN_CLASS
+    PoseDetector
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
     OnnxModels/DepthAnything2.hpp
     OnnxModels/DepthAnything2.cpp
   TARGET
@@ -262,6 +276,10 @@ target_sources(score_addon_onnx_models
     Onnx/helpers/ModelSpec.hpp
     Onnx/helpers/OnnxBase.hpp
     Onnx/helpers/OnnxContext.hpp
+    Onnx/helpers/BlazeFace.hpp
+    Onnx/helpers/FaceMesh.hpp
+    Onnx/helpers/MediaPipeHands.hpp
+    Onnx/helpers/RTMPose.hpp
 )
 
 # Link

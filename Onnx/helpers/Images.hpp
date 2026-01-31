@@ -11,6 +11,7 @@
 #include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 
+#include <algorithm>
 #include <vector>
 
 namespace Onnx
@@ -42,7 +43,12 @@ inline FloatTensor nchw_tensorFromARGB(
       Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
   if (model_w != img.width() || model_h != img.height())
-    img = img.copy(0, 0, model_w, model_h);
+  {
+    // Center crop instead of top-left crop
+    int x = (img.width() - model_w) / 2;
+    int y = (img.height() - model_h) / 2;
+    img = img.copy(x, y, model_w, model_h);
+  }
   img = std::move(img).convertToFormat(QImage::Format_RGB888);
 
   input_tensor_values.resize(
@@ -93,7 +99,12 @@ inline FloatTensor nchw_tensorFromRGBA(
       Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
   if (model_w != img.width() || model_h != img.height())
-    img = img.copy(0, 0, model_w, model_h);
+  {
+    // Center crop instead of top-left crop
+    int x = (img.width() - model_w) / 2;
+    int y = (img.height() - model_h) / 2;
+    img = img.copy(x, y, model_w, model_h);
+  }
   img = std::move(img).convertToFormat(QImage::Format_RGB888);
 
   // FIXME pass storage as input instead
@@ -142,7 +153,12 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
       Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
   if (model_w != img.width() || model_h != img.height())
-    img = img.copy(0, 0, model_w, model_h);
+  {
+    // Center crop instead of top-left crop
+    int x = (img.width() - model_w) / 2;
+    int y = (img.height() - model_h) / 2;
+    img = img.copy(x, y, model_w, model_h);
+  }
 
   input_tensor_values.resize(
       3 * model_w * model_h, boost::container::default_init);
@@ -173,25 +189,28 @@ inline QImage drawRects(const unsigned char* input, int w, int h, auto& rects)
 
   {
     QPainter p(&img);
+    p.setClipRect(img.rect());
     p.setPen(QPen(Qt::white, 4));
     p.setBrush(Qt::NoBrush);
     for (const auto& rect : rects)
     {
-      p.drawRect(
-          rect.geometry.x, rect.geometry.y, rect.geometry.w, rect.geometry.h);
+      // Clamp coordinates to valid range
+      int rx = std::clamp(static_cast<int>(rect.geometry.x), 0, w);
+      int ry = std::clamp(static_cast<int>(rect.geometry.y), 0, h);
+      int rw = std::clamp(static_cast<int>(rect.geometry.w), 0, w - rx);
+      int rh = std::clamp(static_cast<int>(rect.geometry.h), 0, h - ry);
+      p.drawRect(rx, ry, rw, rh);
       if constexpr (requires { rect.name; })
       {
-        p.drawText(
-            rect.geometry.x,
-            rect.geometry.y,
-            QString::fromStdString(rect.name));
+        p.drawText(std::max(0, rx), std::max(10, ry), QString::fromStdString(rect.name));
       }
 
       if constexpr (requires { rect.keypoints; })
       {
         for (auto [i, x, y] : rect.keypoints)
         {
-          p.drawEllipse(QPoint(x, y), 5, 5);
+          if (x >= 0 && x < w && y >= 0 && y < h)
+            p.drawEllipse(QPoint(x, y), 5, 5);
         }
       }
     }
@@ -212,11 +231,12 @@ inline QImage drawBlobAndSegmentation(
 
   QPainter painter(&maskOverlay);
   painter.setRenderHint(QPainter::Antialiasing);
+  painter.setClipRect(maskOverlay.rect());
 
   int k = 120;
   for (const auto& seg : segmentations)
   {
-    QColor color = QColor::fromHsv(k, 200, 220);
+    QColor color = QColor::fromHsv(k % 360, 200, 220);
     color.setAlpha(100);
     auto r = color.red();
     auto g = color.green();
@@ -225,17 +245,19 @@ inline QImage drawBlobAndSegmentation(
     painter.setPen(color);
     auto data = img.bits();
     const boost::dynamic_bitset<>& mask = seg.mask;
+    const size_t mask_size = mask.size();
 #pragma omp simd
     for (int y = 0; y < h; y++)
     {
       for (int x = 0; x < w; x++)
       {
-        if (mask[y * w + x])
+        size_t idx = y * w + x;
+        if (idx < mask_size && mask[idx])
         {
-          auto* pixel = data + (y * w + x) * 4;
-          pixel[0] = std::min(pixel[0] + r * 0.25, 255.);
-          pixel[1] = std::min(pixel[1] + g * 0.25, 255.);
-          pixel[2] = std::min(pixel[2] + b * 0.25, 255.);
+          auto* pixel = data + idx * 4;
+          pixel[0] = static_cast<unsigned char>(std::min(pixel[0] + r * 0.25, 255.));
+          pixel[1] = static_cast<unsigned char>(std::min(pixel[1] + g * 0.25, 255.));
+          pixel[2] = static_cast<unsigned char>(std::min(pixel[2] + b * 0.25, 255.));
         }
       }
     }
@@ -245,20 +267,26 @@ inline QImage drawBlobAndSegmentation(
   }
 
   QPainter finalPainter(&img);
+  finalPainter.setClipRect(img.rect());
   finalPainter.drawImage(0, 0, maskOverlay);
 
   for (const auto& seg : segmentations)
   {
     finalPainter.setBrush(Qt::NoBrush);
     finalPainter.setPen(QPen(Qt::white, 2));
-    finalPainter.drawRect(
-        seg.geometry.x, seg.geometry.y, seg.geometry.w, seg.geometry.h);
+
+    // Clamp coordinates to valid range
+    int rx = std::clamp(static_cast<int>(seg.geometry.x), 0, w);
+    int ry = std::clamp(static_cast<int>(seg.geometry.y), 0, h);
+    int rw = std::clamp(static_cast<int>(seg.geometry.w), 0, w - rx);
+    int rh = std::clamp(static_cast<int>(seg.geometry.h), 0, h - ry);
+    finalPainter.drawRect(rx, ry, rw, rh);
 
     QString label = QString("%1: %2")
                         .arg(QString::fromStdString(seg.name))
                         .arg(seg.confidence, 0, 'f', 2);
 
-    QPointF textPos(seg.geometry.x, seg.geometry.y - 5);
+    QPointF textPos(std::max(0, rx), std::max(10, ry - 5));
     finalPainter.setPen(Qt::white);
     finalPainter.drawText(textPos, label);
   }
@@ -277,13 +305,19 @@ inline QImage drawKeypoints(
 
   {
     QPainter p(&img);
+    p.setClipRect(img.rect());
     p.setPen(QPen(Qt::white, 4));
     p.setBrush(Qt::NoBrush);
     for (const auto& kp : keypoints)
     {
-      p.setPen(QPen(QColor::fromRgbF(1., 1., 1., kp.confidence()), 4));
-      //if (kp.confidence() >= min_confidence)
-        p.drawEllipse(QPoint(kp.x, kp.y), 5, 5);
+      if (kp.x >= 0 && kp.x < w)
+        if (kp.y >= 0 && kp.y < h)
+        {
+          float conf = std::clamp(static_cast<float>(kp.confidence()), 0.0f, 1.0f);
+          p.setPen(QPen(QColor::fromRgbF(1., 1., 1., conf), 4));
+          //if (kp.confidence() >= min_confidence)
+          p.drawEllipse(QPoint(kp.x, kp.y), 5, 5);
+        }
     }
   }
 
