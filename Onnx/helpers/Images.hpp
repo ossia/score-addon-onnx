@@ -166,7 +166,7 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
   // FIXME does not work if img.bytesPerLine() != 4 * model_w;
   auto ptr = (unsigned char*)img.constBits();
   auto dst = input_tensor_values.data();
-  for (int src_i = 0, dst_i = 0; src_i < 3 * model_w * model_h;)
+  for (int src_i = 0, dst_i = 0; dst_i < 3 * model_w * model_h;)
   {
     dst[dst_i] = ptr[src_i] / 255.f;
     dst[dst_i + 1] = ptr[src_i + 1] / 255.f;

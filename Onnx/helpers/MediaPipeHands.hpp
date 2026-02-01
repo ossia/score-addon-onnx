@@ -113,6 +113,13 @@ inline bool processOutput(
   if(outputs.size() < 1)
     return false;
 
+  // Get model input size from spec (NHWC: [N, H, W, C])
+  float model_size = 256.0f;  // default
+  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
+  {
+    model_size = static_cast<float>(spec.inputs[0].shape[1]);
+  }
+
   // Identify outputs by shape
   const float* landmark_data = nullptr;
   const float* hand_flag_data = nullptr;
@@ -168,14 +175,14 @@ inline bool processOutput(
     is_right = handedness > 0.5f;
   }
 
-  // Parse landmarks - coordinates are normalized to input image size (256)
+  // Parse landmarks - coordinates are in pixel coords (0 to model_size)
   std::vector<Landmark> landmarks(NUM_LANDMARKS);
   for(int i = 0; i < NUM_LANDMARKS; ++i)
   {
-    // Normalize to [0, 1] - MediaPipe outputs are in pixel coords (0-256)
-    landmarks[i].x = landmark_data[i * 3] / 256.0f;
-    landmarks[i].y = landmark_data[i * 3 + 1] / 256.0f;
-    landmarks[i].z = landmark_data[i * 3 + 2] / 256.0f;  // Z is relative depth
+    // Normalize to [0, 1]
+    landmarks[i].x = landmark_data[i * 3] / model_size;
+    landmarks[i].y = landmark_data[i * 3 + 1] / model_size;
+    landmarks[i].z = landmark_data[i * 3 + 2] / model_size;  // Z is relative depth
   }
 
   result = HandResult{
