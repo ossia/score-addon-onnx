@@ -8,6 +8,7 @@
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/Utilities.hpp>
+#include <onnxruntime_session_options_config_keys.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -28,8 +29,10 @@ static Ort::SessionOptions create_session_options(const Options& opts)
 try
 {
   Ort::SessionOptions session_options;
-
-  session_options.SetIntraOpNumThreads(1);
+  session_options.AddConfigEntry(
+      kOrtSessionOptionsConfigUseORTModelBytesDirectly, "1");
+  session_options.SetIntraOpNumThreads(
+      1); // FIXME seemed to cause issues with Fast-VLM
   session_options.SetInterOpNumThreads(1);
   session_options.SetGraphOptimizationLevel(
       GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -189,12 +192,12 @@ try
 
   return session_options;
 }
-catch(const std::exception& e)
+catch (const std::exception& e)
 {
   qDebug() << "Onnxruntime: falling back to CPU: " << e.what();
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
 }
-catch(...)
+catch (...)
 {
   qDebug() << "OnnxRuntime: falling back to CPU: unknown error";
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
