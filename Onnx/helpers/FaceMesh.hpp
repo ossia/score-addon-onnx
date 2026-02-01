@@ -86,26 +86,47 @@ inline bool processOutput(
   if(outputs.size() < 1)
     return false;
 
-  // Determine number of landmarks from output size
-  auto shape = outputs[0].GetTensorTypeAndShapeInfo();
-  int total_elements = shape.GetElementCount();
-
-  int detected_landmarks = total_elements / 3;
-  if(detected_landmarks != NUM_LANDMARKS && detected_landmarks != NUM_LANDMARKS_V2)
+  // Get model input size from spec (NHWC: [N, H, W, C])
+  float model_size = 192.0f;  // default
+  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
   {
-    // Try to use provided num_landmarks
-    if(num_landmarks * 3 != total_elements)
-      return false;
-    detected_landmarks = num_landmarks;
+    model_size = static_cast<float>(spec.inputs[0].shape[1]);
   }
 
-  const float* landmark_data = outputs[0].GetTensorData<float>();
+  // Find landmark and face_flag outputs by shape
+  const float* landmark_data = nullptr;
+  const float* face_flag_data = nullptr;
+  int detected_landmarks = 0;
 
-  // Get face flag if available (second output)
-  float face_flag = 1.0f;
-  if(outputs.size() >= 2)
+  for(size_t i = 0; i < outputs.size(); ++i)
   {
-    face_flag = outputs[1].GetTensorData<float>()[0];
+    int64_t total = outputs[i].GetTensorTypeAndShapeInfo().GetElementCount();
+    const float* data = outputs[i].GetTensorData<float>();
+
+    if(total == NUM_LANDMARKS * 3 || total == NUM_LANDMARKS_V2 * 3)
+    {
+      landmark_data = data;
+      detected_landmarks = static_cast<int>(total / 3);
+    }
+    else if(total == num_landmarks * 3)
+    {
+      landmark_data = data;
+      detected_landmarks = num_landmarks;
+    }
+    else if(total == 1)
+    {
+      face_flag_data = data;
+    }
+  }
+
+  if(!landmark_data)
+    return false;
+
+  // Get face flag if available
+  float face_flag = 1.0f;
+  if(face_flag_data)
+  {
+    face_flag = *face_flag_data;
     // Apply sigmoid if raw logit
     if(face_flag < -10.0f || face_flag > 10.0f)
       face_flag = 1.0f / (1.0f + std::exp(-face_flag));
@@ -120,10 +141,10 @@ inline bool processOutput(
   std::vector<Landmark> landmarks(detected_landmarks);
   for(int i = 0; i < detected_landmarks; ++i)
   {
-    // Coordinates are already normalized to [0, 1] in MediaPipe models
-    landmarks[i].x = landmark_data[i * 3];
-    landmarks[i].y = landmark_data[i * 3 + 1];
-    landmarks[i].z = landmark_data[i * 3 + 2];
+    // Coordinates are in pixel space (0 to model_size), normalize to [0, 1]
+    landmarks[i].x = landmark_data[i * 3] / model_size;
+    landmarks[i].y = landmark_data[i * 3 + 1] / model_size;
+    landmarks[i].z = landmark_data[i * 3 + 2] / model_size;  // Z is relative depth
   }
 
   result = FaceMeshResult{.landmarks = std::move(landmarks), .face_flag = face_flag};

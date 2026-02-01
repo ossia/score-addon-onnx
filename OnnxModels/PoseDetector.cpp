@@ -1505,8 +1505,8 @@ PoseWorkflow PoseDetector::detectWorkflowFromModel()
       }
     }
 
-    // MediaPipe Hands: 224x224 input, output with 63 values (21×3)
-    if(input_h == 224 && input_w == 224)
+    // MediaPipe Hands: 224x224 or 256x256 input, output with 63 values (21×3)
+    if((input_h == 224 && input_w == 224) || (input_h == 256 && input_w == 256))
     {
       for(const auto& out : outputs)
       {

@@ -296,8 +296,7 @@ struct OnnxRunContext
     }
     catch (const Ort::Exception& exception)
     {
-      std::cout << "ERROR running model inference: " << exception.what()
-                << std::endl;
+      qDebug() << "ERROR running model inference: " << exception.what();
       exit(-1);
     }
   }
