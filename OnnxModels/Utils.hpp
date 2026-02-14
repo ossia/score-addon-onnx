@@ -85,10 +85,12 @@ private:
 [[nodiscard]]
 inline bool initOnnxRuntime()
 {
+  static bool available{};
+
   // Needed so that machines that cannot run onnxruntime (e.g. macs older than 13.x)
   // can still run ossia
 #if defined(ORT_API_MANUAL_INIT)
-  if (!Ort::Global<void>::api_)
+  if (!available)
   {
     try
     {
@@ -100,17 +102,19 @@ inline bool initOnnxRuntime()
         {
           auto apiapi = api->GetApi(ORT_API_VERSION);
           Ort::InitApi(apiapi);
-          return Ort::Global<void>::api_;
+          available = bool(api->GetApi(ORT_API_VERSION));
         }
       }
     }
     catch (...)
     {
     }
-    return false;
   }
-#endif
+#else
   return true;
+#endif
+
+  return available;
 }
 
 struct OnnxObject
