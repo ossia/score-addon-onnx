@@ -1,5 +1,7 @@
 #include "PoseDetector.hpp"
 
+#include <ossia/math/safe_math.hpp>
+
 #include <QImage>
 #include <QPainter>
 
