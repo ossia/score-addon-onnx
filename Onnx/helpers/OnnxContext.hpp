@@ -185,6 +185,8 @@ try
     int cpus = std::thread::hardware_concurrency();
     session_options.SetIntraOpNumThreads(std::max(cpus / 2, 1));
     session_options.SetInterOpNumThreads(std::max(cpus / 2, 1));
+    session_options.SetGraphOptimizationLevel(
+        GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
   }
 
   // FIXME RKNPU
