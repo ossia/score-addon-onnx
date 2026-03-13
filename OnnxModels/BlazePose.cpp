@@ -22,7 +22,10 @@ try
   if (!available)
     return;
 
-  if (this->inputs.model.current_model_invalid)
+  if (this->inputs.det_model.current_model_invalid)
+    return;
+
+  if (this->inputs.lm_model.current_model_invalid)
     return;
 
   auto& in_tex = inputs.image.texture;
@@ -30,65 +33,72 @@ try
   if (!in_tex.changed)
     return;
 
-  if (!this->ctx)
+  if (!this->det_ctx)
   {
-    this->ctx = std::make_unique<Onnx::OnnxRunContext>(
-        this->inputs.model.file.bytes);
+    this->det_ctx = std::make_unique<Onnx::OnnxRunContext>(
+        this->inputs.det_model.file.bytes);
   }
 
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
+  auto& det_ctx = *this->det_ctx;
+  auto spec = det_ctx.readModelSpec();
   auto t = nhwc_rgb_tensorFromRGBA(
       spec.inputs[0],
       in_tex.bytes,
       in_tex.width,
       in_tex.height,
-      256,
-      256,
+      224,
+      224,
       storage);
   Ort::Value tensor_inputs[1] = {std::move(t.value)};
+
+  qDebug() << "image height:" << in_tex.height << "width:" << in_tex.width;
 
   assert(
       1 <= spec.output_names_char.size()
       && spec.output_names_char.size() <= 5);
 
-  Ort::Value tensor_outputs[5]{
-      Ort::Value{nullptr},
-      Ort::Value{nullptr},
-      Ort::Value{nullptr},
+  Ort::Value tensor_outputs[2]{
       Ort::Value{nullptr},
       Ort::Value{nullptr}};
-  ctx.infer(
+  det_ctx.infer(
       spec,
       tensor_inputs,
       std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
 
-  std::optional<Blazepose::BlazePose_fullbody::pose_data> out;
-  Blazepose::BlazePose_fullbody::processOutput(spec, tensor_outputs, out);
+  qDebug() << "Output values: " << tensor_outputs[0].IsTensor() << " "
+           << tensor_outputs[0].HasValue() << " "
+           << tensor_outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
 
-  if (out)
-  {
-    static_assert(sizeof(*out) == sizeof(*outputs.detection.value));
-    outputs.detection.value.emplace();
-    memcpy((void*)&*outputs.detection.value, (void*)&*out, sizeof(*out));
-    auto img = Onnx::drawKeypoints(
-        inputs.image.texture.bytes,
-        in_tex.width,
-        in_tex.height,
-        std::pow(inputs.min_confidence, 6),
-        out->keypoints);
+  qDebug() << "Output values: " << tensor_outputs[1].IsTensor() << " "
+           << tensor_outputs[1].HasValue() << " "
+           << tensor_outputs[1].GetTensorTypeAndShapeInfo().GetElementCount();
+  //std::optional<Blazepose::BlazePose_fullbody::pose_data> out;
+  //Blazepose::BlazePose_fullbody::processOutput(spec, tensor_outputs, out);
 
-    outputs.image.create(in_tex.width, in_tex.height);
-    memcpy(
-        outputs.image.texture.bytes,
-        img.constBits(),
-        in_tex.width * in_tex.height * 4);
-    outputs.image.texture.changed = true;
-    std::swap(storage, t.storage);
-  }
+  // if (out)
+  // {
+  //   static_assert(sizeof(*out) == sizeof(*outputs.detection.value));
+  //   outputs.detection.value.emplace();
+  //   memcpy((void*)&*outputs.detection.value, (void*)&*out, sizeof(*out));
+  //   auto img = Onnx::drawKeypoints(
+  //       inputs.image.texture.bytes,
+  //       in_tex.width,
+  //       in_tex.height,
+  //       std::pow(inputs.min_confidence, 6),
+  //       out->keypoints);
+
+  //   outputs.image.create(in_tex.width, in_tex.height);
+  //   memcpy(
+  //       outputs.image.texture.bytes,
+  //       img.constBits(),
+  //       in_tex.width * in_tex.height * 4);
+  //   outputs.image.texture.changed = true;
+  //   std::swap(storage, t.storage);
+  // }
 }
 catch (...)
 {
-  inputs.model.current_model_invalid = true;
+  inputs.det_model.current_model_invalid = true;
+  inputs.lm_model.current_model_invalid = true;
 }
 }
