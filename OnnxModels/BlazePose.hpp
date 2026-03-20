@@ -50,7 +50,7 @@ public:
 
       struct
   {
-    halp::fixed_texture_input<"In"> image;
+    halp::texture_input<"In"> image;
     ModelPort<"Pose Detection Model"> det_model;
     ModelPort<"Landmark Detection Model"> lm_model;
     halp::xy_spinboxes_i32<"Model input resolution", halp::range{1, 2048, 256}>
@@ -79,6 +79,7 @@ public:
 private:
   std::unique_ptr<Onnx::OnnxRunContext> det_ctx;
   std::unique_ptr<Onnx::OnnxRunContext> lm_ctx;
-  boost::container::vector<float> storage;
+  boost::container::vector<float> det_storage;
+  boost::container::vector<float> lm_storage;
 };
 }
