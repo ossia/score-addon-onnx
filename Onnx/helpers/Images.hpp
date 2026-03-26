@@ -40,16 +40,15 @@ inline FloatTensor nchw_tensorFromARGB(
   img = std::move(img).scaled(
       model_w,
       model_h,
-      Qt::IgnoreAspectRatio,
-      //Qt::AspectRatioMode::KeepAspectRatioByExpanding,
+      Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
-  // if (model_w != img.width() || model_h != img.height())
-  // {
-  //   // Center crop instead of top-left crop
-  //   int x = (img.width() - model_w) / 2;
-  //   int y = (img.height() - model_h) / 2;
-  //   img = img.copy(x, y, model_w, model_h);
-  // }
+  if (model_w != img.width() || model_h != img.height())
+  {
+    // Center crop instead of top-left crop
+    int x = (img.width() - model_w) / 2;
+    int y = (img.height() - model_h) / 2;
+    img = img.copy(x, y, model_w, model_h);
+  }
   img = std::move(img).convertToFormat(QImage::Format_RGB888);
 
   input_tensor_values.resize(
@@ -97,16 +96,15 @@ inline FloatTensor nchw_tensorFromRGBA(
   img = img.scaled(
       model_w,
       model_h,
-      Qt::IgnoreAspectRatio,
-      //Qt::AspectRatioMode::KeepAspectRatioByExpanding,
+      Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
-  // if (model_w != img.width() || model_h != img.height())
-  // {
-  //   // Center crop instead of top-left crop
-  //   int x = (img.width() - model_w) / 2;
-  //   int y = (img.height() - model_h) / 2;
-  //   img = img.copy(x, y, model_w, model_h);
-  // }
+  if (model_w != img.width() || model_h != img.height())
+  {
+    // Center crop instead of top-left crop
+    int x = (img.width() - model_w) / 2;
+    int y = (img.height() - model_h) / 2;
+    img = img.copy(x, y, model_w, model_h);
+  }
   img = std::move(img).convertToFormat(QImage::Format_RGB888);
 
   // FIXME pass storage as input instead
@@ -152,16 +150,15 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
   img = img.scaled(
       model_w,
       model_h,
-      Qt::IgnoreAspectRatio,
-      //Qt::AspectRatioMode::KeepAspectRatioByExpanding,
+      Qt::AspectRatioMode::KeepAspectRatioByExpanding,
       Qt::SmoothTransformation);
-  // if (model_w != img.width() || model_h != img.height())
-  // {
-  //   // Center crop instead of top-left crop
-  //   int x = (img.width() - model_w) / 2;
-  //   int y = (img.height() - model_h) / 2;
-  //   img = img.copy(x, y, model_w, model_h);
-  // }
+  if (model_w != img.width() || model_h != img.height())
+  {
+    // Center crop instead of top-left crop
+    int x = (img.width() - model_w) / 2;
+    int y = (img.height() - model_h) / 2;
+    img = img.copy(x, y, model_w, model_h);
+  }
 
   input_tensor_values.resize(
       3 * model_w * model_h, boost::container::default_init);

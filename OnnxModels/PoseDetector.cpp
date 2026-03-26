@@ -406,7 +406,7 @@ void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
 
         QColor color = getColor(from);
         color.setAlphaF(safeAlpha(conf));
-        p.setPen(QPen(color, 10));
+        p.setPen(QPen(color, 2));
         p.drawLine(toPoint(from), toPoint(to));
       }
     };
@@ -735,7 +735,7 @@ void PoseDetector::runBlazePose()
   {
     // Setup coordinate transform for mapping back to source image
     CoordTransform xform;
-    xform.init(model_size, model_size, model_size, model_size);
+    xform.init(in_tex.width, in_tex.height, model_size, model_size);
 
     DetectedPose detected;
     detected.keypoints.reserve(33);
@@ -838,7 +838,7 @@ void PoseDetector::runRTMPose()
   {
     // Setup coordinate transform for mapping back to source image
     CoordTransform xform;
-    xform.init(model_w, model_h, model_w, model_h);
+    xform.init(in_tex.width, in_tex.height, model_w, model_h);
 
     DetectedPose detected;
     detected.keypoints.reserve(result->keypoints.size());
@@ -846,7 +846,7 @@ void PoseDetector::runRTMPose()
     {
       // RTMPose outputs normalized [0,1] coords, transform to source image space
       float sx, sy;
-      xform.modelToSource(sx, sy, sx, sy);
+      xform.modelToSource(kp.x, kp.y, sx, sy);
       detected.keypoints.push_back({sx, sy, 0.0f, kp.confidence});
     }
     detected.mean_confidence = result->mean_confidence;
@@ -931,7 +931,7 @@ void PoseDetector::runViTPose()
 
   // Setup coordinate transform for mapping back to source image
   CoordTransform xform;
-  xform.init(model_w, model_h, model_w, model_h);
+  xform.init(in_tex.width, in_tex.height, model_w, model_h);
 
   DetectedPose detected;
   detected.keypoints.reserve(num_keypoints);
@@ -1039,7 +1039,7 @@ void PoseDetector::runYOLOPose()
   {
     // Setup coordinate transform for mapping back to source image
     CoordTransform xform;
-    xform.init(model_size, model_size, model_size, model_size);
+    xform.init(in_tex.width, in_tex.height, model_size, model_size);
 
     // Use the first (highest confidence) detection
     const auto& pose = poses[0];
@@ -1124,7 +1124,7 @@ void PoseDetector::runMediaPipeHands()
   {
     // Setup coordinate transform for mapping back to source image
     CoordTransform xform;
-    xform.init(model_size, model_size, model_size, model_size);
+    xform.init(in_tex.width, in_tex.height, model_size, model_size);
 
     DetectedPose detected;
     detected.keypoints.reserve(result->landmarks.size());
@@ -1198,7 +1198,7 @@ void PoseDetector::runFaceMesh()
   {
     // Setup coordinate transform for mapping back to source image
     CoordTransform xform;
-    xform.init(model_size, model_size, model_size, model_size);
+    xform.init(in_tex.width, in_tex.height, model_size, model_size);
 
     DetectedPose detected;
     detected.keypoints.reserve(result->landmarks.size());
@@ -1274,7 +1274,7 @@ void PoseDetector::runBlazeFace()
   {
     // Setup coordinate transform for mapping back to source image
     CoordTransform xform;
-    xform.init(model_size, model_size, model_size, model_size);
+    xform.init(in_tex.width, in_tex.height, model_size, model_size);
 
     // Use the first (highest confidence) detection
     const auto& det = detections[0];
@@ -1350,7 +1350,7 @@ void PoseDetector::runMobileFaceNet()
   {
     // Setup coordinate transform for mapping back to source image
     CoordTransform xform;
-    xform.init(model_size, model_size, model_size, model_size);
+    xform.init(in_tex.width, in_tex.height, model_size, model_size);
 
     const int num_landmarks = static_cast<int>(shape[1]);
     const float* data = output.GetTensorData<float>();
