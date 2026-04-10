@@ -405,6 +405,72 @@ struct YOLO_pose
           }
         }
       }
+      else if (Nfloats == 300 * 57)
+      { // YOLO 26 Implementation (1, 300, 57)
+        const float* data = outputTensor.front().GetTensorData<float>();
+        thread_local ossia::pod_vector<int> idx;
+        idx.clear();
+        idx.resize(300, boost::container::default_init);
+
+        // 1. Filter by confidence (index 4 in the 57-length feature vector)
+        int k = 0;
+#pragma omp simd
+        for (int i = 0; i < 300; i++)
+        {
+          if (data[i * 57 + 4] > min_confidence)
+            idx[k++] = i;
+        }
+
+        if (k == 0)
+          return;
+        idx.resize(k);
+
+        // 2. Sort the array by confidence descending
+        std::stable_sort(
+            idx.data(),
+            idx.data() + k,
+            [&](int i1, int i2)
+            { return data[i1 * 57 + 4] > data[i2 * 57 + 4]; });
+
+        // 3. Add the poses directly (No NMS / hasSimilarRect needed for YOLO 26)
+        for (auto j : idx)
+        {
+          // Pointer to the start of this specific prediction's 57 features
+          const float* row = data + (j * 57);
+
+          // Indices 0-3 are absolute coordinates: x1, y1, x2, y2
+          float x1 = row[0];
+          float y1 = row[1];
+          float x2 = row[2];
+          float y2 = row[3];
+          float conf = row[4];
+          // float class_id = row[5]; // Unused, we assume class is correct
+
+          auto rect = pose_type::rect{
+              x1,
+              y1,
+              x2 - x1, // Calculate width
+              y2 - y1  // Calculate height
+          };
+
+          out.push_back(pose_type{.geometry = rect, .confidence = conf});
+
+          auto& kps = out.back().keypoints;
+
+          // Indices 6 to 56 are the keypoints (x, y, visibility)
+          for (int i = 0; i < NUM_KPS; i++) // Assumes NUM_KPS <= 17
+          {
+            float kx = row[6 + (i * 3) + 0];
+            float ky = row[6 + (i * 3) + 1];
+            float kc = row[6 + (i * 3) + 2];
+
+            if (kc > min_confidence)
+            {
+              kps.push_back({i, kx, ky});
+            }
+          }
+        }
+      }
     }
   }
 };
