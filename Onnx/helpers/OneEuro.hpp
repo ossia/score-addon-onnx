@@ -42,6 +42,8 @@ struct OneEuroFilter
     dx_prev = dx_hat;
     return x_hat;
   }
+
+  void reset() { initialized = false; }
 };
 
 // One filter per scalar component (e.g. x,y,z per keypoint). Reallocating when
@@ -71,5 +73,42 @@ struct PoseSmoother
     }
   }
   void reset() { f.clear(); }
+};
+
+// Smooths the 5 scalars of a ROI rect (cx, cy, w, h, angle) across frames so the
+// crop fed to the landmark model stays stable. Angle is unwrapped to avoid ±pi
+// discontinuities.
+struct RectSmoother
+{
+  OneEuroFilter f[5];
+  bool initialized = false;
+  float prev_angle = 0.0f;
+
+  void configure(float min_cutoff, float beta)
+  {
+    for(auto& x : f)
+    {
+      x.min_cutoff = min_cutoff;
+      x.beta = beta;
+    }
+  }
+  // in/out: {cx, cy, w, h, angle}; returns the smoothed values in the same array
+  void smooth(float* v, float dt = 1.0f)
+  {
+    // unwrap angle relative to previous so it never jumps by ~2pi
+    float a = v[4];
+    while(a - prev_angle > 3.14159265f) a -= 2.0f * 3.14159265f;
+    while(a - prev_angle < -3.14159265f) a += 2.0f * 3.14159265f;
+    v[4] = a;
+    for(int i = 0; i < 5; ++i)
+      v[i] = f[i].filter(v[i], dt);
+    prev_angle = v[4];
+    initialized = true;
+  }
+  void reset()
+  {
+    for(auto& x : f) x.reset();
+    initialized = false;
+  }
 };
 } // namespace Onnx

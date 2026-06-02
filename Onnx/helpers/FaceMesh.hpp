@@ -2,7 +2,9 @@
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxBase.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <optional>
 #include <span>
 #include <vector>
@@ -79,18 +81,21 @@ inline bool processOutput(
     const ModelSpec& spec,
     std::span<Ort::Value> outputs,
     int num_landmarks,
-    std::optional<FaceMeshResult>& result)
+    std::optional<FaceMeshResult>& result,
+    float presence_thresh = 0.5f)
 {
   result.reset();
 
   if(outputs.size() < 1)
     return false;
 
-  // Get model input size from spec (NHWC: [N, H, W, C])
+  // Get model input size — robust to NHWC [N,H,W,C] and NCHW [N,C,H,W]
+  // (FaceMeshV2 is NCHW 256, where shape[1]=3): take the largest spatial dim.
   float model_size = 192.0f;  // default
   if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
   {
-    model_size = static_cast<float>(spec.inputs[0].shape[1]);
+    const auto& s = spec.inputs[0].shape;
+    model_size = static_cast<float>(std::max({s[1], s[2], s[3]}));
   }
 
   // Find landmark and face_flag outputs by shape
@@ -113,8 +118,11 @@ inline bool processOutput(
       landmark_data = data;
       detected_landmarks = num_landmarks;
     }
-    else if(total == 1)
+    else if(total == 1 && !face_flag_data)
     {
+      // FIRST scalar output is the presence logit. (FaceMeshV2 has a 2nd scalar
+      // ~0 that would otherwise overwrite it and gate the mesh out at any
+      // confidence > 0.)
       face_flag_data = data;
     }
   }
@@ -132,7 +140,7 @@ inline bool processOutput(
       face_flag = 1.0f / (1.0f + std::exp(-face_flag));
   }
 
-  if(face_flag < 0.5f)
+  if(face_flag < presence_thresh)
   {
     result.reset();
     return false;
