@@ -4,13 +4,17 @@
 
 #include <QImage>
 #include <QPainter>
+#include <QTransform>
 
 #include <Onnx/helpers/BlazeFace.hpp>
 #include <Onnx/helpers/BlazePose.hpp>
+#include <Onnx/helpers/Detection.hpp>
 #include <Onnx/helpers/FaceMesh.hpp>
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/MediaPipeHands.hpp>
+#include <Onnx/helpers/ModelRole.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
+#include <Onnx/helpers/ROI.hpp>
 #include <Onnx/helpers/RTMPose.hpp>
 #include <Onnx/helpers/Yolo.hpp>
 #include <cmath>
@@ -20,72 +24,6 @@
 
 namespace OnnxModels
 {
-
-// Helper to transform model-space coordinates back to input image space
-// Accounts for the KeepAspectRatioByExpanding + center crop preprocessing
-struct CoordTransform
-{
-  float crop_x{0}, crop_y{0};   // Crop offset in scaled space
-  float scaled_w{1}, scaled_h{1}; // Size after scaling (before crop)
-  float model_w{1}, model_h{1};   // Model input size
-
-  // Initialize transform from source and model dimensions
-  void init(int source_w, int source_h, int model_w_, int model_h_)
-  {
-    model_w = static_cast<float>(model_w_);
-    model_h = static_cast<float>(model_h_);
-
-    float source_aspect = static_cast<float>(source_w) / source_h;
-    float model_aspect = model_w / model_h;
-
-    if(source_aspect > model_aspect)
-    {
-      // Source is wider - scale based on height, crop width
-      float scale = model_h / source_h;
-      scaled_w = source_w * scale;
-      scaled_h = model_h;
-      crop_x = (scaled_w - model_w) / 2.0f;
-      crop_y = 0;
-    }
-    else
-    {
-      // Source is taller - scale based on width, crop height
-      float scale = model_w / source_w;
-      scaled_w = model_w;
-      scaled_h = source_h * scale;
-      crop_x = 0;
-      crop_y = (scaled_h - model_h) / 2.0f;
-    }
-  }
-
-  // Transform normalized [0,1] model coordinates to normalized [0,1] source coordinates
-  void modelToSource(float mx, float my, float& sx, float& sy) const
-  {
-    // Model normalized -> model pixels
-    float mx_pix = mx * model_w;
-    float my_pix = my * model_h;
-
-    // Add crop offset to get to scaled source space
-    float scaled_x = mx_pix + crop_x;
-    float scaled_y = my_pix + crop_y;
-
-    // Normalize by scaled source size
-    sx = scaled_x / scaled_w;
-    sy = scaled_y / scaled_h;
-  }
-
-  // Transform pixel coordinates in model space to normalized [0,1] source coordinates
-  void modelPixelsToSource(float mx_pix, float my_pix, float& sx, float& sy) const
-  {
-    // Add crop offset to get to scaled source space
-    float scaled_x = mx_pix + crop_x;
-    float scaled_y = my_pix + crop_y;
-
-    // Normalize by scaled source size
-    sx = scaled_x / scaled_w;
-    sy = scaled_y / scaled_h;
-  }
-};
 
 // Skeleton connection definitions
 namespace Skeletons
@@ -691,1019 +629,899 @@ void PoseDetector::generateGeometryOutput(const DetectedPose& pose, PoseWorkflow
   }
 }
 
-void PoseDetector::runBlazePose()
+namespace
 {
-  auto& in_tex = inputs.image.texture;
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
-
-  // Detect model size from input shape (NHWC: [N, H, W, C])
-  int model_size = 256; // default
-  if (!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
+// Map a classified model role to the PoseWorkflow used for drawing/skeletons.
+PoseWorkflow workflowForRole(const Onnx::ModelRole& r)
+{
+  using K = Onnx::ModelKind;
+  switch(r.kind)
   {
-    model_size = static_cast<int>(spec.inputs[0].shape[1]);
+    case K::BlazePoseLandmark:
+    case K::BlazePoseDetector:
+      return PoseWorkflow::BlazePose;
+    case K::HandLandmark:
+    case K::PalmDetector:
+      return PoseWorkflow::MediaPipeHands;
+    case K::FaceMeshLandmark:
+      return PoseWorkflow::FaceMesh;
+    case K::MobileFaceNet:
+      return PoseWorkflow::MobileFaceNet;
+    case K::SimccPose:
+      return (r.num_keypoints > 50) ? PoseWorkflow::RTMPose_Whole
+                                    : PoseWorkflow::RTMPose_COCO;
+    case K::HeatmapPose:
+      return PoseWorkflow::ViTPose;
+    case K::YoloPose:
+    case K::RtmoPose:
+      return PoseWorkflow::YOLOPose;
+    case K::BlazeFaceDetector:
+      return PoseWorkflow::BlazeFace;
+    default:
+      return PoseWorkflow::BlazePose;
+  }
+}
+
+// Lightweight ModelSpec -> ModelIO view for the classifier.
+Onnx::ModelIO toModelIO(const Onnx::ModelSpec& s)
+{
+  Onnx::ModelIO io;
+  io.inputs.reserve(s.inputs.size());
+  io.outputs.reserve(s.outputs.size());
+  for(const auto& p : s.inputs)
+    io.inputs.push_back({p.name.toStdString(), p.shape});
+  for(const auto& p : s.outputs)
+    io.outputs.push_back({p.name.toStdString(), p.shape});
+  return io;
+}
+
+// NHWC float tensor from an RGBA crop with affine pixel mapping out = px*a + b
+// ([0,1]: a=1,b=0 ; [-1,1]: a=2,b=-1).
+Onnx::FloatTensor nhwcDetectorTensor(
+    Onnx::ModelSpec::Port& port, const QImage& crop, int mw, int mh,
+    boost::container::vector<float>& storage, float a, float b)
+{
+  storage.resize(3 * mw * mh, boost::container::default_init);
+  const unsigned char* ptr = crop.constBits();
+  const int bpl = crop.bytesPerLine();
+  float* dst = storage.data();
+  int di = 0;
+  for(int y = 0; y < mh; ++y)
+  {
+    const unsigned char* row = ptr + y * bpl;
+    for(int x = 0; x < mw; ++x)
+    {
+      dst[di++] = (row[4 * x + 0] / 255.f) * a + b;
+      dst[di++] = (row[4 * x + 1] / 255.f) * a + b;
+      dst[di++] = (row[4 * x + 2] / 255.f) * a + b;
+    }
+  }
+  Onnx::FloatTensor f{
+      .storage = {},
+      .value = Onnx::vec_to_tensor<float>(storage, port.shape)};
+  f.storage = std::move(storage);
+  return f;
+}
+
+// NCHW float tensor for end2end detectors (YOLOX/RTMDet). These expect BGR
+// channel order; out = (px - mean)/std per channel (mean/std given in BGR).
+Onnx::FloatTensor nchwBgrDetectorTensor(
+    Onnx::ModelSpec::Port& port, const QImage& crop, int mw, int mh,
+    boost::container::vector<float>& storage, std::array<float, 3> mean_bgr,
+    std::array<float, 3> std_bgr)
+{
+  storage.resize(3 * mw * mh, boost::container::default_init);
+  const unsigned char* ptr = crop.constBits();
+  const int bpl = crop.bytesPerLine();
+  float* b_plane = storage.data();
+  float* g_plane = b_plane + mw * mh;
+  float* r_plane = g_plane + mw * mh;
+  int p = 0;
+  for(int y = 0; y < mh; ++y)
+  {
+    const unsigned char* row = ptr + y * bpl;
+    for(int x = 0; x < mw; ++x, ++p)
+    {
+      const float R = row[4 * x + 0];
+      const float G = row[4 * x + 1];
+      const float B = row[4 * x + 2];
+      b_plane[p] = (B - mean_bgr[0]) / std_bgr[0];
+      g_plane[p] = (G - mean_bgr[1]) / std_bgr[1];
+      r_plane[p] = (R - mean_bgr[2]) / std_bgr[2];
+    }
+  }
+  Onnx::FloatTensor f{
+      .storage = {},
+      .value = Onnx::vec_to_tensor<float>(storage, port.shape)};
+  f.storage = std::move(storage);
+  return f;
+}
+} // namespace
+
+Onnx::ModelRole PoseDetector::roleForWorkflow(PoseWorkflow w) const
+{
+  // Keep the real model's input dims/layout; override the kind by selection.
+  Onnx::ModelRole r = m_landmark_role;
+  using K = Onnx::ModelKind;
+  using S = Onnx::ModelStage;
+  using D = Onnx::ModelDomain;
+  switch(w)
+  {
+    case PoseWorkflow::BlazePose:
+      r.kind = K::BlazePoseLandmark; r.stage = S::Landmark; r.domain = D::Body;
+      break;
+    case PoseWorkflow::RTMPose_COCO:
+    case PoseWorkflow::RTMPose_Whole:
+      r.kind = K::SimccPose; r.stage = S::Landmark; r.domain = D::Body;
+      break;
+    case PoseWorkflow::ViTPose:
+      r.kind = K::HeatmapPose; r.stage = S::Landmark; r.domain = D::Body;
+      break;
+    case PoseWorkflow::YOLOPose:
+      r.kind = K::YoloPose; r.stage = S::SingleStage; r.domain = D::Body;
+      break;
+    case PoseWorkflow::MediaPipeHands:
+      r.kind = K::HandLandmark; r.stage = S::Landmark; r.domain = D::Hand;
+      break;
+    case PoseWorkflow::FaceMesh:
+      r.kind = K::FaceMeshLandmark; r.stage = S::Landmark; r.domain = D::Face;
+      break;
+    case PoseWorkflow::BlazeFace:
+      r.kind = K::BlazeFaceDetector; r.stage = S::Detector; r.domain = D::Face;
+      break;
+    case PoseWorkflow::MobileFaceNet:
+      r.kind = K::MobileFaceNet; r.stage = S::Landmark; r.domain = D::Face;
+      break;
+    case PoseWorkflow::Auto:
+    default:
+      break;
+  }
+  return r;
+}
+
+void PoseDetector::passthrough(const QImage& src)
+{
+  outputs.detection.value.reset();
+  outputs.geometry.value.clear();
+  outputs.image.create(src.width(), src.height());
+  std::memcpy(
+      outputs.image.texture.bytes, src.constBits(),
+      src.width() * src.height() * 4);
+  outputs.image.texture.changed = true;
+  // Lost the subject -> drop temporal state so reacquisition doesn't lurch.
+  m_smoother.reset();
+}
+
+void PoseDetector::applySmoothing(DetectedPose& pose)
+{
+  if(!inputs.smoothing.value || pose.keypoints.empty())
+    return;
+  const float amt
+      = std::clamp(static_cast<float>(inputs.smoothing_amount.value), 0.f, 1.f);
+  // amt 0 -> min_cutoff 3.0 (responsive); amt 1 -> 0.1 (very smooth).
+  const float min_cutoff = 3.0f * (1.0f - amt) + 0.1f * amt;
+  m_smoother.configure(min_cutoff, 0.3f);
+  m_smoother.ensure(pose.keypoints.size() * 3);
+  for(size_t i = 0; i < pose.keypoints.size(); ++i)
+  {
+    auto& k = pose.keypoints[i];
+    k.x = m_smoother.f[i * 3 + 0].filter(k.x, 1.0f);
+    k.y = m_smoother.f[i * 3 + 1].filter(k.y, 1.0f);
+    k.z = m_smoother.f[i * 3 + 2].filter(k.z, 1.0f);
+  }
+}
+
+std::vector<Onnx::Detection::Detection>
+PoseDetector::runDetector(const Onnx::ModelRole& role, const QImage& src)
+{
+  if(!this->det_ctx)
+    return {};
+
+  auto& dctx = *this->det_ctx;
+  auto spec = dctx.readModelSpec();
+  if(spec.inputs.empty() || spec.inputs[0].shape.size() != 4)
+    return {};
+
+  const int model = role.input_w > 0 ? role.input_w : 128;
+
+  // The model's declared anchor count (from the box output's second dim).
+  int num_boxes = 0;
+  for(const auto& o : spec.outputs)
+    if(o.shape.size() == 3
+       && (o.shape.back() == 12 || o.shape.back() == 16 || o.shape.back() == 18))
+      num_boxes = static_cast<int>(o.shape[1]);
+
+  // Map detections from the letterboxed model square back to image-normalized
+  // [0,1] coordinates (works for both centered and top-left letterboxes).
+  const float iw = src.width(), ih = src.height();
+  auto removeLetterbox
+      = [&](std::vector<Onnx::Detection::Detection>& dets,
+            const Onnx::ROI::LetterboxResult& lb) {
+          auto fix = [&](float nx, float ny, float& ox, float& oy) {
+            ox = ((nx * model - lb.pad_x) / lb.scale) / iw;
+            oy = ((ny * model - lb.pad_y) / lb.scale) / ih;
+          };
+          for(auto& d : dets)
+          {
+            fix(d.xc, d.yc, d.xc, d.yc);
+            d.w = (d.w * model / lb.scale) / iw;
+            d.h = (d.h * model / lb.scale) / ih;
+            for(auto& k : d.keypoints)
+            {
+              float ox, oy;
+              fix(static_cast<float>(k.x()), static_cast<float>(k.y()), ox, oy);
+              k = QPointF(ox, oy);
+            }
+          }
+        };
+
+  // --- End2end person/hand detector (YOLOX / RTMDet): BGR NCHW, top-left
+  // letterbox, dets+labels output. ---
+  if(role.kind == Onnx::ModelKind::PersonDetector)
+  {
+    auto lb = Onnx::ROI::letterbox(src, model, model, /*center=*/false);
+    // Heuristic: small input (<=320) -> RTMDet (mean/std); else YOLOX (raw).
+    std::array<float, 3> mean_bgr{0, 0, 0}, std_bgr{1, 1, 1};
+    if(model <= 320)
+    {
+      mean_bgr = {103.53f, 116.28f, 123.675f};
+      std_bgr = {57.375f, 57.12f, 58.395f};
+    }
+    Ort::Value input_value{nullptr};
+    {
+      auto t = nchwBgrDetectorTensor(
+          spec.inputs[0], lb.img, model, model, det_storage, mean_bgr, std_bgr);
+      input_value = std::move(t.value);
+      std::swap(det_storage, t.storage);
+    }
+    Ort::Value ins[1] = {std::move(input_value)};
+    Ort::Value outs[4]{
+        Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
+        Ort::Value{nullptr}};
+    const size_t n_out = std::min<size_t>(4, spec.output_names_char.size());
+    dctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+
+    auto dets = Onnx::Detection::decodeEnd2End(
+        std::span<Ort::Value>(outs, n_out), model, /*keep_label=*/0, 0.3f);
+    removeLetterbox(dets, lb);
+    return dets;
   }
 
-  // BlazePose uses NHWC format with [0, 1] normalization
-  auto t = Onnx::nhwc_rgb_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      model_size,
-      model_size,
-      storage);
-
-  Ort::Value tensor_inputs[1] = {std::move(t.value)};
-
-  Ort::Value tensor_outputs[5]{
-      Ort::Value{nullptr},
-      Ort::Value{nullptr},
-      Ort::Value{nullptr},
-      Ort::Value{nullptr},
-      Ort::Value{nullptr}};
-
-  ctx.infer(
-      spec,
-      tensor_inputs,
-      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
-
-  std::optional<Blazepose::BlazePose_fullbody::pose_data> out;
-  Blazepose::BlazePose_fullbody::processOutput(spec, tensor_outputs, out);
-
-  if(out)
+  // --- SSD-anchor detectors (BlazePose / palm / BlazeFace) ---
+  // Candidate anchor configs for this family; pick the one whose generated
+  // anchor count matches the model so ordering stays aligned.
+  std::vector<Onnx::Detection::SsdParams> candidates;
+  float a = 1.f, b = 0.f; // pixel mapping out = px*a + b
+  switch(role.kind)
   {
-    // Setup coordinate transform for mapping back to source image
-    CoordTransform xform;
-    xform.init(in_tex.width, in_tex.height, model_size, model_size);
+    case Onnx::ModelKind::BlazePoseDetector:
+      candidates = {
+          Onnx::Detection::blazePoseParams(model),
+          Onnx::Detection::blazePoseParams(128),
+          Onnx::Detection::blazePoseParams(224)};
+      a = 2.f; b = -1.f; // [-1,1]
+      break;
+    case Onnx::ModelKind::PalmDetector:
+      candidates = {Onnx::Detection::palmParams(model)};
+      a = 1.f; b = 0.f; // [0,1]
+      break;
+    case Onnx::ModelKind::BlazeFaceDetector:
+      candidates = {Onnx::Detection::blazeFaceParams(model)};
+      a = 2.f; b = -1.f; // [-1,1]
+      break;
+    default:
+      return {};
+  }
 
-    DetectedPose detected;
-    detected.keypoints.reserve(33);
-
-    float sum_conf = 0.0f;
-    for (int i = 0; i < 33; ++i)
+  Onnx::Detection::SsdParams params = candidates.front();
+  for(auto& c : candidates)
+    if(num_boxes > 0
+       && static_cast<int>(Onnx::Detection::generateAnchors(c).size())
+              == num_boxes)
     {
-      const auto& kp = out->keypoints[i];
-      // BlazePose outputs pixel coordinates, transform to source image space
-      float sx, sy;
-      xform.modelPixelsToSource(kp.x, kp.y, sx, sy);
-      detected.keypoints.push_back({sx, sy, kp.z / model_size, kp.presence});
-      sum_conf += kp.presence;
+      params = c;
+      break;
     }
-    detected.mean_confidence = sum_conf / 33.0f;
-    outputs.detection.value = std::move(detected);
+  params.input_size = model;
 
-    drawSkeleton(*outputs.detection.value, PoseWorkflow::BlazePose);
-    generateGeometryOutput(*outputs.detection.value, PoseWorkflow::BlazePose);
+  auto lb = Onnx::ROI::letterbox(src, model, model, /*center=*/true);
+
+  Ort::Value input_value{nullptr};
+  {
+    // Detectors are usually NHWC, but some PINTO exports are NCHW.
+    if(role.nhwc)
+    {
+      auto t = nhwcDetectorTensor(
+          spec.inputs[0], lb.img, model, model, det_storage, a, b);
+      input_value = std::move(t.value);
+      std::swap(det_storage, t.storage);
+    }
+    else
+    {
+      // out = px/255*a + b  <=>  (px - mean)/std with std=255/a, mean=-b*std
+      const float std_v = 255.f / a;
+      const float mean_v = -b * std_v;
+      auto t = Onnx::nchw_tensorFromRGBA(
+          spec.inputs[0], lb.img.constBits(), model, model, model, model,
+          det_storage, {mean_v, mean_v, mean_v}, {std_v, std_v, std_v});
+      input_value = std::move(t.value);
+      std::swap(det_storage, t.storage);
+    }
+  }
+
+  Ort::Value ins[1] = {std::move(input_value)};
+  Ort::Value outs[6]{
+      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
+      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr}};
+  const size_t n_out = std::min<size_t>(6, spec.output_names_char.size());
+  dctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+
+  auto dets = Onnx::Detection::decode(
+      std::span<Ort::Value>(outs, n_out), params, 0.5f);
+  dets = Onnx::Detection::nms(std::move(dets), 0.3f);
+  removeLetterbox(dets, lb);
+  return dets;
+}
+
+void PoseDetector::runLandmark(
+    const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
+    const QTransform& M)
+{
+  auto& lctx = *this->ctx;
+  auto spec = lctx.readModelSpec();
+  if(spec.inputs.empty())
+  {
+    passthrough(src);
+    return;
+  }
+
+  int mw = role.input_w > 0 ? role.input_w : 256;
+  int mh = role.input_h > 0 ? role.input_h : 256;
+  if(spec.inputs[0].shape.size() == 4)
+  {
+    if(role.nhwc)
+    {
+      mh = static_cast<int>(spec.inputs[0].shape[1]);
+      mw = static_cast<int>(spec.inputs[0].shape[2]);
+    }
+    else
+    {
+      mh = static_cast<int>(spec.inputs[0].shape[2]);
+      mw = static_cast<int>(spec.inputs[0].shape[3]);
+    }
+  }
+
+  QImage crop = Onnx::ROI::warpCrop(src, M, mw, mh);
+
+  // Build the input tensor (layout + normalization by role).
+  std::optional<Onnx::FloatTensor> t;
+  if(role.nhwc)
+  {
+    t.emplace(Onnx::nhwc_rgb_tensorFromRGBA(
+        spec.inputs[0], crop.constBits(), mw, mh, mw, mh, storage));
+  }
+  else if(role.kind == Onnx::ModelKind::MobileFaceNet)
+  {
+    t.emplace(Onnx::nchw_tensorFromRGBA(
+        spec.inputs[0], crop.constBits(), mw, mh, mw, mh, storage,
+        {0.485f * 255.f, 0.456f * 255.f, 0.406f * 255.f},
+        {0.229f * 255.f, 0.224f * 255.f, 0.225f * 255.f}));
   }
   else
   {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    // Pass through input
-    outputs.image.create(in_tex.width, in_tex.height);
-    memcpy(outputs.image.texture.bytes, in_tex.bytes, in_tex.width * in_tex.height * 4);
-    outputs.image.texture.changed = true;
+    t.emplace(Onnx::nchw_tensorFromRGBA(
+        spec.inputs[0], crop.constBits(), mw, mh, mw, mh, storage,
+        {123.675f, 116.28f, 103.53f}, {58.395f, 57.12f, 57.375f}));
   }
 
-  std::swap(storage, t.storage);
-}
-
-void PoseDetector::runRTMPose()
-{
-  auto& in_tex = inputs.image.texture;
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
-
-  // Detect model size from input shape (NCHW: [N, C, H, W])
-  int model_w = 192, model_h = 256; // default
-  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
-  {
-    model_h = static_cast<int>(spec.inputs[0].shape[2]);
-    model_w = static_cast<int>(spec.inputs[0].shape[3]);
-  }
-
-  // RTMPose uses NCHW format with ImageNet normalization
-  auto t = Onnx::nchw_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      model_w,
-      model_h,
-      storage,
-      {123.675f, 116.28f, 103.53f},
-      {58.395f, 57.12f, 57.375f});
-
-  Ort::Value tensor_outputs[5]{
+  Ort::Value outs[5]{
       Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
       Ort::Value{nullptr}, Ort::Value{nullptr}};
+  const size_t n_out = std::min<size_t>(5, spec.output_names_char.size());
 
-  // Check if model needs bbox input (post-processed models have 2 inputs)
+  // Some RTMPose exports take a second [w,h] bbox input.
+  std::array<int64_t, 2> bbox_wh{mw, mh};
+  std::array<int64_t, 2> bbox_shape{1, 2};
   if(spec.inputs.size() >= 2)
   {
-    // Post-processed model: provide bboxes_width_height as [model_w, model_h]
-    std::array<int64_t, 2> bbox_wh = {model_w, model_h};
-    std::array<int64_t, 2> bbox_shape = {1, 2};
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
     auto bbox_tensor = Ort::Value::CreateTensor<int64_t>(
-        mem_info, bbox_wh.data(), bbox_wh.size(), bbox_shape.data(), bbox_shape.size());
-
-    Ort::Value tensor_inputs[2] = {std::move(t.value), std::move(bbox_tensor)};
-    ctx.infer(
-        spec, tensor_inputs,
-        std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
+        mem_info, bbox_wh.data(), bbox_wh.size(), bbox_shape.data(),
+        bbox_shape.size());
+    Ort::Value ins[2] = {std::move(t->value), std::move(bbox_tensor)};
+    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
   }
   else
   {
-    // SimCC model: single image input
-    Ort::Value tensor_inputs[1] = {std::move(t.value)};
-    ctx.infer(
-        spec, tensor_inputs,
-        std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
+    Ort::Value ins[1] = {std::move(t->value)};
+    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
   }
 
-  // Auto-detect config and format from output shapes
-  auto output_span = std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size());
-  Onnx::RTMPose::OutputFormat format;
-  auto config = Onnx::RTMPose::detectConfig(output_span, &format);
-  config.input_width = model_w;
-  config.input_height = model_h;
+  auto outspan = std::span<Ort::Value>(outs, n_out);
 
-  std::optional<Onnx::RTMPose::PoseResult> result;
-  Onnx::RTMPose::processOutput(spec, output_span, config, result, format);
-
-  if(result)
+  // Decode keypoints in MODEL-PIXEL space (x,y in [0,mw]x[0,mh]).
+  struct MKP
   {
-    // Setup coordinate transform for mapping back to source image
-    CoordTransform xform;
-    xform.init(in_tex.width, in_tex.height, model_w, model_h);
+    float x, y, z, conf;
+  };
+  std::vector<MKP> kps;
 
-    DetectedPose detected;
-    detected.keypoints.reserve(result->keypoints.size());
-    for(const auto& kp : result->keypoints)
+  switch(role.kind)
+  {
+    case Onnx::ModelKind::BlazePoseLandmark:
     {
-      // RTMPose outputs normalized [0,1] coords, transform to source image space
-      float sx, sy;
-      xform.modelToSource(kp.x, kp.y, sx, sy);
-      detected.keypoints.push_back({sx, sy, 0.0f, kp.confidence});
-    }
-    detected.mean_confidence = result->mean_confidence;
-    outputs.detection.value = std::move(detected);
-
-    auto workflow = (config.num_keypoints > 17)
-        ? PoseWorkflow::RTMPose_Whole
-        : PoseWorkflow::RTMPose_COCO;
-    drawSkeleton(*outputs.detection.value, workflow);
-    generateGeometryOutput(*outputs.detection.value, workflow);
-  }
-  else
-  {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    outputs.image.create(in_tex.width, in_tex.height);
-    memcpy(outputs.image.texture.bytes, in_tex.bytes, in_tex.width * in_tex.height * 4);
-    outputs.image.texture.changed = true;
-  }
-
-  std::swap(storage, t.storage);
-}
-
-void PoseDetector::runViTPose()
-{
-  auto& in_tex = inputs.image.texture;
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
-
-  // Detect model size from input shape (NCHW: [N, C, H, W])
-  int model_w = 192, model_h = 256; // default
-  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
-  {
-    model_h = static_cast<int>(spec.inputs[0].shape[2]);
-    model_w = static_cast<int>(spec.inputs[0].shape[3]);
-  }
-
-  // ViTPose uses NCHW format with ImageNet normalization
-  auto t = Onnx::nchw_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      model_w,
-      model_h,
-      storage,
-      {123.675f, 116.28f, 103.53f},
-      {58.395f, 57.12f, 57.375f});
-
-  Ort::Value tensor_inputs[1] = {std::move(t.value)};
-
-  Ort::Value tensor_outputs[5]{
-      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
-      Ort::Value{nullptr}, Ort::Value{nullptr}};
-
-  ctx.infer(
-      spec, tensor_inputs,
-      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
-
-  // ViTPose outputs heatmaps: [1, num_keypoints, hm_h, hm_w]
-  if(spec.output_names_char.empty())
-  {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    return;
-  }
-
-  auto& heatmap_output = tensor_outputs[0];
-  auto shape = heatmap_output.GetTensorTypeAndShapeInfo().GetShape();
-
-  if(shape.size() != 4)
-  {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    return;
-  }
-
-  const int num_keypoints = static_cast<int>(shape[1]);
-  const int hm_h = static_cast<int>(shape[2]);
-  const int hm_w = static_cast<int>(shape[3]);
-  const float* heatmaps = heatmap_output.GetTensorData<float>();
-
-  // Setup coordinate transform for mapping back to source image
-  CoordTransform xform;
-  xform.init(in_tex.width, in_tex.height, model_w, model_h);
-
-  DetectedPose detected;
-  detected.keypoints.reserve(num_keypoints);
-
-  float sum_conf = 0.0f;
-  const float scale_x = 1.0f / hm_w;
-  const float scale_y = 1.0f / hm_h;
-
-  for(int k = 0; k < num_keypoints; ++k)
-  {
-    const float* hm = heatmaps + k * hm_h * hm_w;
-
-    // Find peak
-    int max_idx = 0;
-    float max_val = hm[0];
-    for(int i = 1; i < hm_h * hm_w; ++i)
-    {
-      if(hm[i] > max_val)
+      // Handle every variant: full-body 195 (=39*5), upper-body 155 (=31*5)
+      // or 124 (=31*4). Find the landmark vector output and derive the layout.
+      const float* data = nullptr;
+      int total = 0;
+      for(size_t i = 0; i < outspan.size(); ++i)
       {
-        max_val = hm[i];
-        max_idx = i;
-      }
-    }
-
-    int hm_x = max_idx % hm_w;
-    int hm_y = max_idx / hm_w;
-
-    // Sub-pixel refinement
-    float dx = 0.0f, dy = 0.0f;
-    if(hm_x > 0 && hm_x < hm_w - 1)
-    {
-      dx = 0.25f * (hm[hm_y * hm_w + hm_x + 1] - hm[hm_y * hm_w + hm_x - 1]);
-    }
-    if(hm_y > 0 && hm_y < hm_h - 1)
-    {
-      dy = 0.25f * (hm[(hm_y + 1) * hm_w + hm_x] - hm[(hm_y - 1) * hm_w + hm_x]);
-    }
-
-    // Normalized coordinates in model space
-    float mx = (hm_x + dx + 0.5f) * scale_x;
-    float my = (hm_y + dy + 0.5f) * scale_y;
-
-    // Transform to source image space
-    float sx, sy;
-    xform.modelToSource(std::clamp(mx, 0.0f, 1.0f), std::clamp(my, 0.0f, 1.0f), sx, sy);
-
-    detected.keypoints.push_back({sx, sy, 0.0f, max_val});
-    sum_conf += max_val;
-  }
-
-  detected.mean_confidence = sum_conf / num_keypoints;
-  outputs.detection.value = std::move(detected);
-
-  drawSkeleton(*outputs.detection.value, PoseWorkflow::ViTPose);
-  generateGeometryOutput(*outputs.detection.value, PoseWorkflow::ViTPose);
-
-  std::swap(storage, t.storage);
-}
-
-void PoseDetector::runYOLOPose()
-{
-  auto& in_tex = inputs.image.texture;
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
-
-  // Detect model size from input shape (NCHW: [N, C, H, W])
-  int model_size = 640; // default
-  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
-  {
-    model_size = static_cast<int>(spec.inputs[0].shape[2]);
-  }
-
-  // YOLO uses NCHW format with [0, 1] normalization (divide by 255)
-  auto t = Onnx::nchw_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      model_size,
-      model_size,
-      storage,
-      {0.f, 0.f, 0.f},
-      {255.f, 255.f, 255.f});
-
-  Ort::Value tensor_inputs[1] = {std::move(t.value)};
-
-  Ort::Value tensor_outputs[1]{Ort::Value{nullptr}};
-
-  ctx.infer(spec, tensor_inputs, tensor_outputs);
-
-  // Use YOLO pose processor
-  static const Yolo::YOLO_pose yolo_pose;
-  std::vector<Yolo::YOLO_pose::pose_type> poses;
-  yolo_pose.processOutput(
-      spec,
-      tensor_outputs,
-      poses,
-      100,                      // max_detect
-      inputs.min_confidence,    // min_confidence
-      0, 0,                     // image offset
-      model_size, model_size,   // image size
-      model_size, model_size);  // model size
-
-  if(!poses.empty())
-  {
-    // Setup coordinate transform for mapping back to source image
-    CoordTransform xform;
-    xform.init(in_tex.width, in_tex.height, model_size, model_size);
-
-    // Use the first (highest confidence) detection
-    const auto& pose = poses[0];
-
-    DetectedPose detected;
-    detected.keypoints.reserve(17);
-
-    // YOLO outputs sparse keypoints, fill in all 17 with defaults
-    for(int i = 0; i < 17; ++i)
-    {
-      detected.keypoints.push_back({0.0f, 0.0f, 0.0f, 0.0f});
-    }
-
-    // Fill in detected keypoints (transform from model pixels to source normalized)
-    for(const auto& kp : pose.keypoints)
-    {
-      if(kp.kp >= 0 && kp.kp < 17)
-      {
-        float sx, sy;
-        xform.modelPixelsToSource(kp.x, kp.y, sx, sy);
-        detected.keypoints[kp.kp] = {sx, sy, 0.0f, 1.0f};
-      }
-    }
-    detected.mean_confidence = pose.confidence;
-    outputs.detection.value = std::move(detected);
-
-    drawSkeleton(*outputs.detection.value, PoseWorkflow::YOLOPose);
-    generateGeometryOutput(*outputs.detection.value, PoseWorkflow::YOLOPose);
-  }
-  else
-  {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    outputs.image.create(in_tex.width, in_tex.height);
-    memcpy(outputs.image.texture.bytes, in_tex.bytes, in_tex.width * in_tex.height * 4);
-    outputs.image.texture.changed = true;
-  }
-
-  std::swap(storage, t.storage);
-}
-
-void PoseDetector::runMediaPipeHands()
-{
-  auto& in_tex = inputs.image.texture;
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
-
-  // Detect model size from input shape (NHWC: [N, H, W, C])
-  int model_size = 224; // default
-  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
-  {
-    model_size = static_cast<int>(spec.inputs[0].shape[1]);
-  }
-
-  // MediaPipe Hands uses NHWC format with [0, 1] normalization
-  auto t = Onnx::nhwc_rgb_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      model_size,
-      model_size,
-      storage);
-
-  Ort::Value tensor_inputs[1] = {std::move(t.value)};
-
-  Ort::Value tensor_outputs[5]{
-      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
-      Ort::Value{nullptr}, Ort::Value{nullptr}};
-
-  ctx.infer(
-      spec, tensor_inputs,
-      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
-
-  std::optional<Onnx::MediaPipeHands::HandResult> result;
-  Onnx::MediaPipeHands::processOutput(
-      spec,
-      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()),
-      result);
-
-  if(result)
-  {
-    // Setup coordinate transform for mapping back to source image
-    CoordTransform xform;
-    xform.init(in_tex.width, in_tex.height, model_size, model_size);
-
-    DetectedPose detected;
-    detected.keypoints.reserve(result->landmarks.size());
-
-    for(const auto& lm : result->landmarks)
-    {
-      // MediaPipe outputs normalized [0,1] coords, transform to source image space
-      float sx, sy;
-      xform.modelToSource(lm.x, lm.y, sx, sy);
-      detected.keypoints.push_back({sx, sy, lm.z, 1.0f});
-    }
-    detected.mean_confidence = result->hand_flag;
-    outputs.detection.value = std::move(detected);
-
-    drawSkeleton(*outputs.detection.value, PoseWorkflow::MediaPipeHands);
-    generateGeometryOutput(*outputs.detection.value, PoseWorkflow::MediaPipeHands);
-  }
-  else
-  {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    outputs.image.create(in_tex.width, in_tex.height);
-    memcpy(outputs.image.texture.bytes, in_tex.bytes, in_tex.width * in_tex.height * 4);
-    outputs.image.texture.changed = true;
-  }
-
-  std::swap(storage, t.storage);
-}
-
-void PoseDetector::runFaceMesh()
-{
-  auto& in_tex = inputs.image.texture;
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
-
-  // Detect model size from input shape (NHWC: [N, H, W, C])
-  int model_size = 192; // default
-  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
-  {
-    model_size = static_cast<int>(spec.inputs[0].shape[1]);
-  }
-
-  // FaceMesh uses NHWC format with [0, 1] normalization
-  auto t = Onnx::nhwc_rgb_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      model_size,
-      model_size,
-      storage);
-
-  Ort::Value tensor_inputs[1] = {std::move(t.value)};
-
-  Ort::Value tensor_outputs[5]{
-      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
-      Ort::Value{nullptr}, Ort::Value{nullptr}};
-
-  ctx.infer(
-      spec, tensor_inputs,
-      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
-
-  std::optional<Onnx::FaceMesh::FaceMeshResult> result;
-  Onnx::FaceMesh::processOutput(
-      spec,
-      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()),
-      Onnx::FaceMesh::NUM_LANDMARKS,
-      result);
-
-  if(result)
-  {
-    // Setup coordinate transform for mapping back to source image
-    CoordTransform xform;
-    xform.init(in_tex.width, in_tex.height, model_size, model_size);
-
-    DetectedPose detected;
-    detected.keypoints.reserve(result->landmarks.size());
-
-    for(const auto& lm : result->landmarks)
-    {
-      // FaceMesh outputs normalized [0,1] coords, transform to source image space
-      float sx, sy;
-      xform.modelToSource(lm.x, lm.y, sx, sy);
-      detected.keypoints.push_back({sx, sy, lm.z, 1.0f});
-    }
-    detected.mean_confidence = result->face_flag;
-    outputs.detection.value = std::move(detected);
-
-    drawSkeleton(*outputs.detection.value, PoseWorkflow::FaceMesh);
-    generateGeometryOutput(*outputs.detection.value, PoseWorkflow::FaceMesh);
-  }
-  else
-  {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    outputs.image.create(in_tex.width, in_tex.height);
-    memcpy(outputs.image.texture.bytes, in_tex.bytes, in_tex.width * in_tex.height * 4);
-    outputs.image.texture.changed = true;
-  }
-
-  std::swap(storage, t.storage);
-}
-
-void PoseDetector::runBlazeFace()
-{
-  auto& in_tex = inputs.image.texture;
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
-
-  // Detect model size from input shape (NHWC: [N, H, W, C])
-  int model_size = 128; // default
-  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
-  {
-    model_size = static_cast<int>(spec.inputs[0].shape[1]);
-  }
-
-  // BlazeFace uses NHWC format with [0, 1] normalization
-  auto t = Onnx::nhwc_rgb_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      model_size,
-      model_size,
-      storage);
-
-  Ort::Value tensor_inputs[1] = {std::move(t.value)};
-
-  Ort::Value tensor_outputs[5]{
-      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
-      Ort::Value{nullptr}, Ort::Value{nullptr}};
-
-  ctx.infer(
-      spec, tensor_inputs,
-      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()));
-
-  std::vector<Onnx::BlazeFace::Detection> detections;
-  Onnx::BlazeFace::processOutput(
-      spec,
-      std::span<Ort::Value>(tensor_outputs, spec.output_names_char.size()),
-      model_size,
-      inputs.min_confidence,
-      0.3f, // NMS threshold
-      detections);
-
-  if(!detections.empty())
-  {
-    // Setup coordinate transform for mapping back to source image
-    CoordTransform xform;
-    xform.init(in_tex.width, in_tex.height, model_size, model_size);
-
-    // Use the first (highest confidence) detection
-    const auto& det = detections[0];
-    if (!ossia::safe_isnan(det.score))
-    {
-      DetectedPose detected;
-      detected.keypoints.reserve(6);
-
-      for (int k = 0; k < 6; ++k)
-      {
-        // BlazeFace outputs normalized [0,1] coords, transform to source image space
-        float sx, sy;
-        xform.modelToSource(det.keypoints[k].x, det.keypoints[k].y, sx, sy);
-        detected.keypoints.push_back({sx, sy, 0.0f, det.score});
-      }
-      detected.mean_confidence = det.score;
-      outputs.detection.value = std::move(detected);
-
-      drawSkeleton(*outputs.detection.value, PoseWorkflow::BlazeFace);
-      generateGeometryOutput(
-          *outputs.detection.value, PoseWorkflow::BlazeFace);
-    }
-  }
-  else
-  {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    outputs.image.create(in_tex.width, in_tex.height);
-    memcpy(outputs.image.texture.bytes, in_tex.bytes, in_tex.width * in_tex.height * 4);
-    outputs.image.texture.changed = true;
-  }
-
-  std::swap(storage, t.storage);
-}
-
-void PoseDetector::runMobileFaceNet()
-{
-  auto& in_tex = inputs.image.texture;
-  auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
-
-  // Detect model size from input shape (NCHW: [N, C, H, W])
-  int model_size = 112; // default
-  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
-  {
-    model_size = static_cast<int>(spec.inputs[0].shape[2]);
-  }
-
-  // NCHW format with ImageNet normalization
-  // mean = [0.485, 0.456, 0.406] * 255, std = [0.229, 0.224, 0.225] * 255
-  auto t = Onnx::nchw_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      model_size,
-      model_size,
-      storage,
-      {0.485f * 255.f, 0.456f * 255.f, 0.406f * 255.f},
-      {0.229f * 255.f, 0.224f * 255.f, 0.225f * 255.f});
-
-  Ort::Value tensor_inputs[1] = {std::move(t.value)};
-
-  Ort::Value tensor_outputs[1]{Ort::Value{nullptr}};
-
-  ctx.infer(spec, tensor_inputs, tensor_outputs);
-
-  // MobileFaceNet outputs [1, 68, 2] - 68 landmarks with normalized (x, y) in [0, 1]
-  auto& output = tensor_outputs[0];
-  auto shape = output.GetTensorTypeAndShapeInfo().GetShape();
-
-  if(shape.size() >= 2)
-  {
-    // Setup coordinate transform for mapping back to source image
-    CoordTransform xform;
-    xform.init(in_tex.width, in_tex.height, model_size, model_size);
-
-    const int num_landmarks = static_cast<int>(shape[1]);
-    const float* data = output.GetTensorData<float>();
-
-    DetectedPose detected;
-    detected.keypoints.reserve(num_landmarks);
-
-    for(int i = 0; i < num_landmarks; ++i)
-    {
-      // Output is normalized [0,1], convert to model pixels then to source
-      float mx_pix = data[i * 2] * model_size;
-      float my_pix = data[i * 2 + 1] * model_size;
-      float sx, sy;
-      xform.modelPixelsToSource(mx_pix, my_pix, sx, sy);
-      detected.keypoints.push_back({sx, sy, 0.0f, 1.0f});
-    }
-    detected.mean_confidence = 1.0f; // MobileFaceNet doesn't output confidence
-    outputs.detection.value = std::move(detected);
-
-    drawSkeleton(*outputs.detection.value, PoseWorkflow::MobileFaceNet);
-    generateGeometryOutput(*outputs.detection.value, PoseWorkflow::MobileFaceNet);
-  }
-  else
-  {
-    outputs.detection.value.reset();
-    outputs.geometry.value.clear();
-    outputs.image.create(in_tex.width, in_tex.height);
-    memcpy(outputs.image.texture.bytes, in_tex.bytes, in_tex.width * in_tex.height * 4);
-    outputs.image.texture.changed = true;
-  }
-
-  std::swap(storage, t.storage);
-}
-
-// Detect workflow from model input/output structure
-PoseWorkflow PoseDetector::detectWorkflowFromModel()
-{
-  if(!this->ctx)
-    return PoseWorkflow::BlazePose; // Default fallback
-
-  auto spec = this->ctx->readModelSpec();
-
-  if(spec.inputs.empty())
-    return PoseWorkflow::BlazePose;
-
-  const auto& input = spec.inputs[0];
-  const auto& input_shape = input.shape;
-
-  // Determine if NHWC or NCHW based on input shape
-  // NHWC: [N, H, W, C] where C is typically 3
-  // NCHW: [N, C, H, W] where C is typically 3
-  bool is_nhwc = false;
-  int input_h = 0, input_w = 0;
-
-  if(input_shape.size() == 4)
-  {
-    if(input_shape[3] == 3)
-    {
-      // NHWC format: [N, H, W, 3]
-      is_nhwc = true;
-      input_h = static_cast<int>(input_shape[1]);
-      input_w = static_cast<int>(input_shape[2]);
-    }
-    else if(input_shape[1] == 3)
-    {
-      // NCHW format: [N, 3, H, W]
-      is_nhwc = false;
-      input_h = static_cast<int>(input_shape[2]);
-      input_w = static_cast<int>(input_shape[3]);
-    }
-  }
-
-  // Analyze outputs
-  const auto& outputs = spec.outputs;
-  int num_outputs = static_cast<int>(outputs.size());
-
-  // Check for specific output patterns
-  bool has_simcc = false;
-  bool has_heatmap = false;
-  int64_t total_output_size = 0;
-  int64_t first_output_size = 0;
-  std::vector<int64_t> output_shapes;
-
-  for(const auto& out : outputs)
-  {
-    int64_t size = 1;
-    for(auto dim : out.shape)
-    {
-      if(dim > 0)
-        size *= dim;
-    }
-    output_shapes.push_back(size);
-    total_output_size += size;
-
-    if(output_shapes.size() == 1)
-      first_output_size = size;
-
-    // Check for SimCC pattern: output names contain "simcc"
-    if(out.name.contains("simcc", Qt::CaseInsensitive))
-      has_simcc = true;
-
-    // Check for heatmap pattern: 4D output with shape [N, K, H, W] where H, W are small
-    if(out.shape.size() == 4 && out.shape[2] <= 128 && out.shape[3] <= 128
-       && out.shape[1] > 1 && out.shape[1] <= 150)
-    {
-      has_heatmap = true;
-    }
-  }
-
-  // --- Detection logic ---
-
-  // 1. SimCC models (RTMPose)
-  if(has_simcc)
-  {
-    // Check number of keypoints from simcc_x shape
-    for(const auto& out : outputs)
-    {
-      if(out.name.contains("simcc_x", Qt::CaseInsensitive) && out.shape.size() >= 2)
-      {
-        int num_keypoints = static_cast<int>(out.shape[1]);
-        if(num_keypoints > 50)
-          return PoseWorkflow::RTMPose_Whole;
-        else
-          return PoseWorkflow::RTMPose_COCO;
-      }
-    }
-    return PoseWorkflow::RTMPose_COCO;
-  }
-
-  // 2. NHWC models (MediaPipe family)
-  if(is_nhwc)
-  {
-    // BlazeFace: 128x128 input, outputs with 896 anchors
-    if(input_h == 128 && input_w == 128)
-    {
-      for(const auto& out : outputs)
-      {
-        if(out.shape.size() >= 2 && out.shape[1] == 896)
-          return PoseWorkflow::BlazeFace;
-      }
-    }
-
-    // FaceMesh: 192x192 input, output with 1404 values (468×3)
-    if(input_h == 192 && input_w == 192)
-    {
-      for(const auto& out : outputs)
-      {
-        int64_t size = 1;
-        for(auto dim : out.shape)
-          if(dim > 0)
-            size *= dim;
-        if(size == 1404 || size == 1434) // 468×3 or 478×3 (with iris)
-          return PoseWorkflow::FaceMesh;
-      }
-    }
-
-    // MediaPipe Hands: 224x224 or 256x256 input, output with 63 values (21×3)
-    if((input_h == 224 && input_w == 224) || (input_h == 256 && input_w == 256))
-    {
-      for(const auto& out : outputs)
-      {
-        int64_t size = 1;
-        for(auto dim : out.shape)
-          if(dim > 0)
-            size *= dim;
-        if(size == 63) // 21×3
-          return PoseWorkflow::MediaPipeHands;
-      }
-    }
-
-    // BlazePose: 256x256 input, output with 195 values (39×5)
-    if(input_h == 256 && input_w == 256)
-    {
-      for(const auto& out : outputs)
-      {
-        int64_t size = 1;
-        for(auto dim : out.shape)
-          if(dim > 0)
-            size *= dim;
-        if(size == 195) // 39×5
-          return PoseWorkflow::BlazePose;
-      }
-    }
-
-    // Generic NHWC fallback based on output size
-    if(first_output_size == 1404 || first_output_size == 1434)
-      return PoseWorkflow::FaceMesh;
-    if(first_output_size == 63)
-      return PoseWorkflow::MediaPipeHands;
-    if(first_output_size == 195)
-      return PoseWorkflow::BlazePose;
-
-    return PoseWorkflow::BlazePose; // Default NHWC
-  }
-
-  // 3. NCHW models
-  if(!is_nhwc)
-  {
-    // MobileFaceNet: 112x112 input, output [N, 68, 2]
-    if(input_h == 112 && input_w == 112)
-    {
-      for(const auto& out : outputs)
-      {
-        if(out.shape.size() >= 2 && out.shape[1] == 68)
-          return PoseWorkflow::MobileFaceNet;
-      }
-    }
-
-    // ViTPose: heatmap output
-    if(has_heatmap)
-    {
-      return PoseWorkflow::ViTPose;
-    }
-
-    // YOLO Pose: typically 640x640 input, single output with detection format
-    if(input_h >= 320 && input_w >= 320 && num_outputs == 1)
-    {
-      const auto& out = outputs[0];
-      // YOLO output is typically [1, num_detections, values_per_detection]
-      // or [1, values_per_detection, num_detections]
-      if(out.shape.size() == 3)
-      {
-        // Check if it looks like YOLO pose output (56 = 4 box + 1 conf + 17 kpts × 3)
-        // or similar detection format
-        return PoseWorkflow::YOLOPose;
-      }
-    }
-
-    // RTMPose without simcc in name: check for typical shapes
-    // RTMPose outputs two tensors with matching keypoint dimension
-    if(num_outputs == 2)
-    {
-      const auto& out0 = outputs[0];
-      const auto& out1 = outputs[1];
-      if(out0.shape.size() >= 2 && out1.shape.size() >= 2)
-      {
-        if(out0.shape[1] == out1.shape[1])
+        const int64_t n
+            = outspan[i].GetTensorTypeAndShapeInfo().GetElementCount();
+        if(n == 195 || n == 155 || n == 124)
         {
-          int num_kpts = static_cast<int>(out0.shape[1]);
-          if(num_kpts == 17 || num_kpts == 21 || num_kpts == 133)
+          data = outspan[i].GetTensorData<float>();
+          total = static_cast<int>(n);
+          break;
+        }
+      }
+      if(data)
+      {
+        const int stride = (total % 5 == 0) ? 5 : 4; // x,y,z,vis[,pres]
+        const int K = total / stride;
+        const int body = std::min(K, 33); // first K are body, rest are aux
+        kps.reserve(body);
+        for(int i = 0; i < body; ++i)
+        {
+          const float* kp = data + i * stride;
+          const float vis = 1.0f / (1.0f + std::exp(-kp[3]));
+          const float pres
+              = (stride == 5) ? 1.0f / (1.0f + std::exp(-kp[4])) : vis;
+          kps.push_back({kp[0], kp[1], kp[2] / mw, pres});
+        }
+      }
+      break;
+    }
+    case Onnx::ModelKind::HandLandmark:
+    {
+      std::optional<Onnx::MediaPipeHands::HandResult> r;
+      Onnx::MediaPipeHands::processOutput(spec, outspan, r);
+      if(r)
+      {
+        kps.reserve(r->landmarks.size());
+        for(const auto& lm : r->landmarks)
+          kps.push_back({lm.x * mw, lm.y * mh, lm.z, r->hand_flag});
+      }
+      break;
+    }
+    case Onnx::ModelKind::FaceMeshLandmark:
+    {
+      std::optional<Onnx::FaceMesh::FaceMeshResult> r;
+      Onnx::FaceMesh::processOutput(
+          spec, outspan, Onnx::FaceMesh::NUM_LANDMARKS, r);
+      if(r)
+      {
+        kps.reserve(r->landmarks.size());
+        for(const auto& lm : r->landmarks)
+          kps.push_back({lm.x * mw, lm.y * mh, lm.z, 1.0f});
+      }
+      break;
+    }
+    case Onnx::ModelKind::SimccPose:
+    {
+      Onnx::RTMPose::OutputFormat fmt;
+      auto config = Onnx::RTMPose::detectConfig(outspan, &fmt);
+      config.input_width = mw;
+      config.input_height = mh;
+      std::optional<Onnx::RTMPose::PoseResult> r;
+      Onnx::RTMPose::processOutput(spec, outspan, config, r, fmt);
+      if(r)
+      {
+        kps.reserve(r->keypoints.size());
+        for(const auto& kp : r->keypoints)
+          kps.push_back({kp.x * mw, kp.y * mh, 0.0f, kp.confidence});
+      }
+      break;
+    }
+    case Onnx::ModelKind::HeatmapPose:
+    {
+      if(!outspan.empty())
+      {
+        auto shape = outspan[0].GetTensorTypeAndShapeInfo().GetShape();
+        if(shape.size() == 4)
+        {
+          const int K = static_cast<int>(shape[1]);
+          const int hh = static_cast<int>(shape[2]);
+          const int hw = static_cast<int>(shape[3]);
+          const float* hmaps = outspan[0].GetTensorData<float>();
+          kps.reserve(K);
+          for(int k = 0; k < K; ++k)
           {
-            return (num_kpts > 50) ? PoseWorkflow::RTMPose_Whole : PoseWorkflow::RTMPose_COCO;
+            const float* hm = hmaps + k * hh * hw;
+            int max_idx = 0;
+            float max_val = hm[0];
+            for(int i = 1; i < hh * hw; ++i)
+              if(hm[i] > max_val)
+              {
+                max_val = hm[i];
+                max_idx = i;
+              }
+            const int hx = max_idx % hw;
+            const int hy = max_idx / hw;
+            float dx = 0.f, dy = 0.f;
+            if(hx > 0 && hx < hw - 1)
+              dx = 0.25f * (hm[hy * hw + hx + 1] - hm[hy * hw + hx - 1]);
+            if(hy > 0 && hy < hh - 1)
+              dy = 0.25f * (hm[(hy + 1) * hw + hx] - hm[(hy - 1) * hw + hx]);
+            const float mx = (hx + dx + 0.5f) * mw / hw;
+            const float my = (hy + dy + 0.5f) * mh / hh;
+            kps.push_back({mx, my, 0.0f, max_val});
           }
         }
       }
+      break;
     }
-
-    // RTMPose with post-processing: single output [N, K, 3] where K is keypoint count
-    // The 3 values are (x, y, score) - already decoded from SimCC
-    if(num_outputs == 1)
+    case Onnx::ModelKind::MobileFaceNet:
     {
-      const auto& out = outputs[0];
-      // Check for [N, K, 3] shape where K is typical keypoint count
-      if(out.shape.size() == 3 && out.shape[2] == 3)
+      if(!outspan.empty())
       {
-        int num_kpts = static_cast<int>(out.shape[1]);
-        if(num_kpts == 17 || num_kpts == 21 || num_kpts == 133)
+        auto shape = outspan[0].GetTensorTypeAndShapeInfo().GetShape();
+        if(shape.size() >= 2)
         {
-          return (num_kpts > 50) ? PoseWorkflow::RTMPose_Whole : PoseWorkflow::RTMPose_COCO;
+          const int n = static_cast<int>(shape[1]);
+          const float* data = outspan[0].GetTensorData<float>();
+          kps.reserve(n);
+          for(int i = 0; i < n; ++i)
+            kps.push_back({data[i * 2] * mw, data[i * 2 + 1] * mh, 0.0f, 1.0f});
         }
       }
+      break;
     }
-
-    // ViTPose: 4D heatmap output [N, K, H, W]
-    if(has_heatmap)
-    {
-      return PoseWorkflow::ViTPose;
-    }
-
-    return PoseWorkflow::BlazePose; // Default NCHW fallback
+    default:
+      break;
   }
 
-  return PoseWorkflow::BlazePose; // Ultimate fallback
+  if(t)
+    std::swap(storage, t->storage);
+
+  if(kps.empty())
+  {
+    passthrough(src);
+    return;
+  }
+
+  // Map model-pixel keypoints back through M -> image-normalized [0,1].
+  const float iw = src.width(), ih = src.height();
+  DetectedPose detected;
+  detected.keypoints.reserve(kps.size());
+  float sum_conf = 0.0f;
+  for(const auto& k : kps)
+  {
+    const QPointF p = M.map(QPointF(k.x, k.y));
+    detected.keypoints.push_back(
+        {static_cast<float>(p.x() / iw), static_cast<float>(p.y() / ih), k.z,
+         k.conf});
+    sum_conf += k.conf;
+  }
+  detected.mean_confidence = sum_conf / detected.keypoints.size();
+  applySmoothing(detected);
+  outputs.detection.value = std::move(detected);
+
+  drawSkeleton(*outputs.detection.value, draw);
+  generateGeometryOutput(*outputs.detection.value, draw);
+}
+
+void PoseDetector::runDetectorAsPose(
+    const Onnx::ModelRole& role, const QImage& src)
+{
+  auto dets = runDetector(role, src);
+  if(dets.empty())
+  {
+    passthrough(src);
+    return;
+  }
+
+  const auto& d = dets.front();
+  if(ossia::safe_isnan(d.score))
+  {
+    passthrough(src);
+    return;
+  }
+
+  DetectedPose detected;
+  detected.keypoints.reserve(d.keypoints.size());
+  for(const auto& k : d.keypoints)
+    detected.keypoints.push_back(
+        {static_cast<float>(k.x()), static_cast<float>(k.y()), 0.0f, d.score});
+  detected.mean_confidence = d.score;
+  applySmoothing(detected);
+  outputs.detection.value = std::move(detected);
+
+  const PoseWorkflow draw = workflowForRole(role);
+  drawSkeleton(*outputs.detection.value, draw);
+  generateGeometryOutput(*outputs.detection.value, draw);
+}
+
+void PoseDetector::runYOLOPose(const QImage& src, const QTransform& M)
+{
+  auto& lctx = *this->ctx;
+  auto spec = lctx.readModelSpec();
+
+  int model_size = 640;
+  if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
+    model_size = static_cast<int>(spec.inputs[0].shape[2]);
+
+  auto t = Onnx::nchw_tensorFromRGBA(
+      spec.inputs[0], src.constBits(), src.width(), src.height(), model_size,
+      model_size, storage, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f});
+
+  Ort::Value ins[1] = {std::move(t.value)};
+  Ort::Value outs[1]{Ort::Value{nullptr}};
+  lctx.infer(spec, ins, outs);
+
+  static const Yolo::YOLO_pose yolo_pose;
+  std::vector<Yolo::YOLO_pose::pose_type> poses;
+  yolo_pose.processOutput(
+      spec, outs, poses, 100, inputs.min_confidence, 0, 0, model_size,
+      model_size, model_size, model_size);
+
+  if(poses.empty())
+  {
+    passthrough(src);
+    std::swap(storage, t.storage);
+    return;
+  }
+
+  const float iw = src.width(), ih = src.height();
+  const auto& pose = poses[0];
+  DetectedPose detected;
+  detected.keypoints.assign(17, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
+  for(const auto& kp : pose.keypoints)
+  {
+    if(kp.kp >= 0 && kp.kp < 17)
+    {
+      const QPointF p = M.map(QPointF(kp.x, kp.y));
+      detected.keypoints[kp.kp]
+          = {static_cast<float>(p.x() / iw), static_cast<float>(p.y() / ih),
+             0.0f, 1.0f};
+    }
+  }
+  detected.mean_confidence = pose.confidence;
+  applySmoothing(detected);
+  outputs.detection.value = std::move(detected);
+
+  drawSkeleton(*outputs.detection.value, PoseWorkflow::YOLOPose);
+  generateGeometryOutput(*outputs.detection.value, PoseWorkflow::YOLOPose);
+
+  std::swap(storage, t.storage);
+}
+
+void PoseDetector::runRTMO(const QImage& src)
+{
+  auto& lctx = *this->ctx;
+  auto spec = lctx.readModelSpec();
+  if(spec.inputs.empty())
+  {
+    passthrough(src);
+    return;
+  }
+
+  // NCHW input; RTMO is 640x640.
+  int model = 640;
+  if(spec.inputs[0].shape.size() == 4 && spec.inputs[0].shape[3] > 0)
+    model = static_cast<int>(spec.inputs[0].shape[3]);
+
+  auto lb = Onnx::ROI::letterbox(src, model, model, /*center=*/false);
+
+  Ort::Value input_value{nullptr};
+  {
+    // RTMO: raw BGR, no normalization (like YOLOX).
+    auto t = nchwBgrDetectorTensor(
+        spec.inputs[0], lb.img, model, model, storage, {0, 0, 0}, {1, 1, 1});
+    input_value = std::move(t.value);
+    std::swap(storage, t.storage);
+  }
+
+  Ort::Value ins[1] = {std::move(input_value)};
+  Ort::Value outs[4]{
+      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
+      Ort::Value{nullptr}};
+  const size_t n_out = std::min<size_t>(4, spec.output_names_char.size());
+  lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+
+  // dets [1,N,5] (xyxy+score), keypoints [1,N,K,3] (x,y,score) in model px.
+  const float* dets = nullptr;
+  const float* kpt = nullptr;
+  int N = 0, K = 0;
+  for(size_t i = 0; i < n_out; ++i)
+  {
+    if(!outs[i].IsTensor())
+      continue;
+    auto sh = outs[i].GetTensorTypeAndShapeInfo().GetShape();
+    if(sh.size() == 3 && sh[2] == 5)
+    {
+      dets = outs[i].GetTensorData<float>();
+      N = static_cast<int>(sh[1]);
+    }
+    else if(sh.size() == 4)
+    {
+      kpt = outs[i].GetTensorData<float>();
+      N = static_cast<int>(sh[1]);
+      K = static_cast<int>(sh[2]);
+    }
+  }
+  if(!dets || !kpt || K == 0)
+  {
+    passthrough(src);
+    return;
+  }
+
+  int best = -1;
+  float bestc = std::max(0.3f, static_cast<float>(inputs.min_confidence));
+  for(int i = 0; i < N; ++i)
+    if(dets[i * 5 + 4] > bestc)
+    {
+      bestc = dets[i * 5 + 4];
+      best = i;
+    }
+  if(best < 0)
+  {
+    passthrough(src);
+    return;
+  }
+
+  const float iw = src.width(), ih = src.height();
+  DetectedPose detected;
+  detected.keypoints.reserve(K);
+  for(int k = 0; k < K; ++k)
+  {
+    const float* p = kpt + (static_cast<size_t>(best) * K + k) * 3;
+    detected.keypoints.push_back(
+        {((p[0] - lb.pad_x) / lb.scale) / iw,
+         ((p[1] - lb.pad_y) / lb.scale) / ih, 0.0f, p[2]});
+  }
+  detected.mean_confidence = bestc;
+  applySmoothing(detected);
+  outputs.detection.value = std::move(detected);
+
+  drawSkeleton(*outputs.detection.value, PoseWorkflow::YOLOPose);
+  generateGeometryOutput(*outputs.detection.value, PoseWorkflow::YOLOPose);
 }
 
 void PoseDetector::operator()()
 try
 {
-  if (!available)
+  if(!available)
     return;
-
   if(this->inputs.model.current_model_invalid)
     return;
 
   auto& in_tex = inputs.image.texture;
-
   if(!in_tex.changed)
     return;
-  if (!in_tex.bytes)
+  if(!in_tex.bytes)
     return;
 
-  // Reset context if workflow changed
-  PoseWorkflow current_workflow = inputs.workflow.value;
-  if (current_workflow != m_last_workflow)
+  const bool have_det = !inputs.det_model.current_model_invalid
+                        && inputs.det_model.file.bytes.size() >= 32;
+
+  // Reset contexts on workflow / model change.
+  const PoseWorkflow wf = inputs.workflow.value;
+  if(wf != m_last_workflow)
   {
     ctx.reset();
-    m_last_workflow = current_workflow;
+    det_ctx.reset();
+    m_last_workflow = wf;
   }
-  if (inputs.model.file.filename != m_last_model)
+  if(inputs.model.file.filename != m_last_model)
   {
     ctx.reset();
     m_last_model = std::string(inputs.model.file.filename);
   }
-
-  if (!this->ctx)
+  if(inputs.det_model.file.filename != m_last_det_model)
   {
-    this->ctx = std::make_unique<Onnx::OnnxRunContext>(
-        this->inputs.model.file.bytes);
-
-    // Auto-detect workflow if in Auto mode
-    if (current_workflow == PoseWorkflow::Auto)
-    {
-      m_detected_workflow = detectWorkflowFromModel();
-    }
+    det_ctx.reset();
+    m_last_det_model = std::string(inputs.det_model.file.filename);
   }
 
-  // Use detected workflow if in Auto mode
-  PoseWorkflow effective_workflow = (current_workflow == PoseWorkflow::Auto)
-                                        ? m_detected_workflow
-                                        : current_workflow;
-
-  // Dispatch to workflow-specific handler
-  switch(effective_workflow)
+  if(!this->ctx)
   {
-    case PoseWorkflow::Auto:
-      // Should not reach here, but fallback to BlazePose
-      runBlazePose();
+    this->ctx
+        = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
+    m_landmark_role = Onnx::classify(toModelIO(this->ctx->readModelSpec()));
+  }
+  if(have_det && !this->det_ctx)
+  {
+    this->det_ctx = std::make_unique<Onnx::OnnxRunContext>(
+        this->inputs.det_model.file.bytes);
+    m_detector_role = Onnx::classify(toModelIO(this->det_ctx->readModelSpec()));
+  }
+
+  const Onnx::ModelRole role
+      = (wf == PoseWorkflow::Auto) ? m_landmark_role : roleForWorkflow(wf);
+  const PoseWorkflow draw
+      = (wf == PoseWorkflow::Auto) ? workflowForRole(role) : wf;
+
+  QImage src(
+      reinterpret_cast<const uchar*>(in_tex.bytes), in_tex.width,
+      in_tex.height, QImage::Format_RGBA8888);
+
+  // --- Two-stage: detector + landmark ---
+  if(have_det && role.stage == Onnx::ModelStage::Landmark)
+  {
+    auto dets = runDetector(m_detector_role, src);
+    if(dets.empty())
+    {
+      passthrough(src);
+      return;
+    }
+
+    const auto& d = dets.front();
+    const int mw = role.input_w > 0 ? role.input_w : 256;
+    const int mh = role.input_h > 0 ? role.input_h : 256;
+    QTransform M;
+    switch(role.kind)
+    {
+      case Onnx::ModelKind::BlazePoseLandmark:
+        M = Onnx::ROI::mediapipeTransform(
+            d, in_tex.width, in_tex.height, mw, mh, Onnx::ROI::poseParams());
+        break;
+      case Onnx::ModelKind::HandLandmark:
+        M = Onnx::ROI::mediapipeTransform(
+            d, in_tex.width, in_tex.height, mw, mh, Onnx::ROI::handParams());
+        break;
+      case Onnx::ModelKind::FaceMeshLandmark:
+      case Onnx::ModelKind::MobileFaceNet:
+        M = Onnx::ROI::mediapipeTransform(
+            d, in_tex.width, in_tex.height, mw, mh, Onnx::ROI::faceParams());
+        break;
+      case Onnx::ModelKind::SimccPose:
+      case Onnx::ModelKind::HeatmapPose:
+      default:
+      {
+        const QRectF box(
+            d.box().x() * in_tex.width, d.box().y() * in_tex.height,
+            d.w * in_tex.width, d.h * in_tex.height);
+        M = Onnx::ROI::topdownTransform(box, mw, mh, 1.25f);
+        break;
+      }
+    }
+    runLandmark(role, draw, src, M);
+    return;
+  }
+
+  // --- Single model ---
+  switch(role.stage)
+  {
+    case Onnx::ModelStage::Detector:
+      runDetectorAsPose(role, src);
       break;
-    case PoseWorkflow::BlazePose:
-      runBlazePose();
+    case Onnx::ModelStage::SingleStage:
+    {
+      if(role.kind == Onnx::ModelKind::RtmoPose)
+      {
+        runRTMO(src);
+      }
+      else
+      {
+        const int ms = role.input_w > 0 ? role.input_w : 640;
+        const QTransform M = Onnx::ROI::wholeFrameTransform(
+            in_tex.width, in_tex.height, ms, ms);
+        runYOLOPose(src, M);
+      }
       break;
-    case PoseWorkflow::RTMPose_COCO:
-    case PoseWorkflow::RTMPose_Whole:
-      runRTMPose();
+    }
+    case Onnx::ModelStage::Landmark:
+    default:
+    {
+      const int mw = role.input_w > 0 ? role.input_w : 256;
+      const int mh = role.input_h > 0 ? role.input_h : 256;
+      const QTransform M = Onnx::ROI::wholeFrameTransform(
+          in_tex.width, in_tex.height, mw, mh);
+      runLandmark(role, draw, src, M);
       break;
-    case PoseWorkflow::ViTPose:
-      runViTPose();
-      break;
-    case PoseWorkflow::YOLOPose:
-      runYOLOPose();
-      break;
-    case PoseWorkflow::MediaPipeHands:
-      runMediaPipeHands();
-      break;
-    case PoseWorkflow::FaceMesh:
-      runFaceMesh();
-      break;
-    case PoseWorkflow::BlazeFace:
-      runBlazeFace();
-      break;
-    case PoseWorkflow::MobileFaceNet:
-      runMobileFaceNet();
-      break;
+    }
   }
 }
 catch(...)
