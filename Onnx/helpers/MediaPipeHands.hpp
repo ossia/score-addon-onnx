@@ -106,7 +106,8 @@ struct HandConnections
 inline bool processOutput(
     const ModelSpec& spec,
     std::span<Ort::Value> outputs,
-    std::optional<HandResult>& result)
+    std::optional<HandResult>& result,
+    float presence_thresh = 0.5f)
 {
   result.reset();
 
@@ -158,7 +159,7 @@ inline bool processOutput(
     hand_flag = sigmoid(hand_flag);
   }
 
-  if(hand_flag < 0.5f)
+  if(hand_flag < presence_thresh)
   {
     result.reset();
     return false;
