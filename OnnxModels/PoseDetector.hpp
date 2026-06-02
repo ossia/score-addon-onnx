@@ -1,6 +1,10 @@
 #pragma once
 #include <OnnxModels/Utils.hpp>
 
+#include <Onnx/helpers/Detection.hpp>
+#include <Onnx/helpers/ModelRole.hpp>
+#include <Onnx/helpers/OneEuro.hpp>
+
 #include <halp/controls.hpp>
 #include <halp/file_port.hpp>
 #include <halp/geometry.hpp>
@@ -9,6 +13,9 @@
 
 #include <optional>
 #include <vector>
+
+class QImage;
+class QTransform;
 
 namespace Onnx
 {
@@ -90,6 +97,12 @@ public:
     halp::texture_input<"In"> image;
     ModelPort<"Model"> model;
 
+    // Optional stage-1 detector. When set (and the main model is a landmark
+    // model), the detector locates the ROI on the full frame, the frame is
+    // warp-cropped, and the main model runs inside the crop. Leave empty for
+    // single-stage / whole-frame inference.
+    ModelPort<"Detection Model"> det_model;
+
     struct : halp::combobox_t<"Workflow", PoseWorkflow>
     {
       halp_meta(description, "Pose estimation model type");
@@ -112,6 +125,22 @@ public:
     {
       halp_meta(description, "Output data format for GPU rendering");
     } data_format;
+
+    struct : halp::toggle<"Smoothing">
+    {
+      halp_meta(description, "Temporal One-Euro smoothing of keypoints");
+      bool value = true;
+    } smoothing;
+
+    struct : halp::hslider_f32<"Smoothing Amount", halp::range{0., 1., 0.5}>
+    {
+      halp_meta(description, "0 = responsive, 1 = very smooth");
+    } smoothing_amount;
+
+    struct : halp::toggle<"Async">
+    {
+      halp_meta(description, "Run inference asynchronously");
+    } async;
   } inputs;
 
   struct
@@ -137,33 +166,51 @@ public:
   void operator()();
 
 private:
-  // Workflow-specific inference functions
-  void runBlazePose();
-  void runRTMPose();
-  void runViTPose();
-  void runYOLOPose();
-  void runMediaPipeHands();
-  void runFaceMesh();
-  void runBlazeFace();
-  void runMobileFaceNet();
+  // --- Two-stage building blocks ---
+  // Stage 1: run the detector on the full frame, return detections in
+  // image-normalized [0,1] coordinates (letterbox removed).
+  std::vector<Onnx::Detection::Detection>
+  runDetector(const Onnx::ModelRole& role, const QImage& src);
 
-  // Auto-detection of workflow from model structure
-  PoseWorkflow detectWorkflowFromModel();
+  // Stage 2: run the landmark/pose model on the crop defined by M
+  // (crop-pixels -> image-pixels), then map keypoints back through M.
+  void runLandmark(
+      const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
+      const QTransform& M);
+
+  // Draw a detector's own keypoints/box directly (detector used standalone).
+  void runDetectorAsPose(const Onnx::ModelRole& role, const QImage& src);
+
+  // Single-stage YOLO-pose on the full frame.
+  void runYOLOPose(const QImage& src, const QTransform& M);
+
+  // Single-stage RTMO on the full frame (dets + keypoints, NMS-free).
+  void runRTMO(const QImage& src);
+
+  // Map a manual workflow selection onto a concrete model role.
+  Onnx::ModelRole roleForWorkflow(PoseWorkflow w) const;
 
   // Common visualization
   void drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow);
-
-  // Generate geometry output based on format setting
   void generateGeometryOutput(const DetectedPose& pose, PoseWorkflow workflow);
+  void passthrough(const QImage& src);
 
-  std::unique_ptr<Onnx::OnnxRunContext> ctx;
+  // Temporal One-Euro smoothing of the detected keypoints (in place).
+  void applySmoothing(DetectedPose& pose);
+
+  std::unique_ptr<Onnx::OnnxRunContext> ctx;     // main / landmark model
+  std::unique_ptr<Onnx::OnnxRunContext> det_ctx; // optional stage-1 detector
   boost::container::vector<float> storage;
+  boost::container::vector<float> det_storage;
 
   // Cache for avoiding re-initialization
   PoseWorkflow m_last_workflow{PoseWorkflow::Auto};
-  PoseWorkflow m_detected_workflow{PoseWorkflow::BlazePose};
+  Onnx::ModelRole m_landmark_role;
+  Onnx::ModelRole m_detector_role;
+  Onnx::PoseSmoother m_smoother;
 
   std::string m_last_model;
+  std::string m_last_det_model;
 };
 
 } // namespace OnnxModels
