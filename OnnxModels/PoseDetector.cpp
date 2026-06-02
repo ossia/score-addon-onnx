@@ -788,19 +788,42 @@ void PoseDetector::passthrough(const QImage& src)
       outputs.image.texture.bytes, src.constBits(),
       src.width() * src.height() * 4);
   outputs.image.texture.changed = true;
-  // Lost the subject -> drop temporal state so reacquisition doesn't lurch.
-  m_smoother.reset();
+
+  // Coast: keep temporal state for a few frames so a brief detection dropout
+  // doesn't restart smoothing/tracking and lurch on re-acquisition. Only after
+  // a sustained loss do we drop everything.
+  ++m_lost_frames;
+  if(m_lost_frames > 8)
+  {
+    m_smoother.reset();
+    m_roi_smoother.reset();
+    m_tracking = false;
+    m_last_keypoints.clear();
+  }
 }
 
 void PoseDetector::applySmoothing(DetectedPose& pose)
 {
+  m_lost_frames = 0; // we have a pose this frame
   if(!inputs.smoothing.value || pose.keypoints.empty())
     return;
   const float amt
       = std::clamp(static_cast<float>(inputs.smoothing_amount.value), 0.f, 1.f);
-  // amt 0 -> min_cutoff 3.0 (responsive); amt 1 -> 0.1 (very smooth).
-  const float min_cutoff = 3.0f * (1.0f - amt) + 0.1f * amt;
-  m_smoother.configure(min_cutoff, 0.3f);
+
+  // Log-interpolated cutoff: amt 0 -> ~30 Hz (≈ passthrough), amt 1 -> 0.01 Hz
+  // (very smooth). The old linear 3.0..0.1 floor was ~10x too high, so "max"
+  // barely smoothed (alpha ~0.39 at dt=1).
+  const float min_cutoff = 30.0f * std::pow(0.01f / 30.0f, amt);
+  const float beta = 0.02f; // gentle speed adaptivity
+
+  // Filter the raw normalized coordinates. NOTE: an earlier "scale-aware"
+  // variant divided each coord by the per-frame keypoint-bbox diagonal. Because
+  // the One-Euro STATE is kept in those units while the bbox size changes every
+  // frame, a frame with a small/sparse bbox multiplied the lagged state by a
+  // tiny scale and collapsed *every* point toward (0,0) — the "all points jump
+  // to the top-left" glitch. Scale normalization needs a STABLE per-subject
+  // scale; revisit once per-track IDs (ByteTrack) provide one.
+  m_smoother.configure(min_cutoff, beta);
   m_smoother.ensure(pose.keypoints.size() * 3);
   for(size_t i = 0; i < pose.keypoints.size(); ++i)
   {
@@ -809,6 +832,142 @@ void PoseDetector::applySmoothing(DetectedPose& pose)
     k.y = m_smoother.f[i * 3 + 1].filter(k.y, 1.0f);
     k.z = m_smoother.f[i * 3 + 2].filter(k.z, 1.0f);
   }
+}
+
+// ROI rect (image px) from a detection, mirroring the per-kind dialect choice.
+Onnx::ROI::Rect PoseDetector::detectionRect(
+    const Onnx::ModelRole& role, const Onnx::Detection::Detection& det, int W,
+    int H)
+{
+  const int mw = role.input_w > 0 ? role.input_w : 256;
+  const int mh = role.input_h > 0 ? role.input_h : 256;
+  switch(role.kind)
+  {
+    case Onnx::ModelKind::BlazePoseLandmark:
+      return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::poseParams());
+    case Onnx::ModelKind::HandLandmark:
+      return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::handParams());
+    case Onnx::ModelKind::FaceMeshLandmark:
+    case Onnx::ModelKind::MobileFaceNet:
+      return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::faceParams());
+    default:
+    {
+      const QRectF box(
+          det.box().x() * W, det.box().y() * H, det.w * W, det.h * H);
+      return Onnx::ROI::topdownRect(box, mw, mh, 1.25f);
+    }
+  }
+}
+
+// ROI rect derived from the previous frame's landmarks (MediaPipe tracking
+// loop): bbox of the confident keypoints, expanded, with a rotation taken from
+// a domain-appropriate keypoint pair so the crop follows the subject.
+Onnx::ROI::Rect PoseDetector::roiRectFromKeypoints(
+    PoseWorkflow draw, const std::vector<PoseKeypoint>& kps, int W, int H,
+    int model_w, int model_h)
+{
+  Onnx::ROI::Rect r{};
+  if(kps.empty())
+    return r;
+
+  // bbox of confident keypoints in image px
+  float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
+  for(const auto& k : kps)
+  {
+    if(k.confidence < 0.2f)
+      continue;
+    const float x = k.x * W, y = k.y * H;
+    minx = std::min(minx, x); maxx = std::max(maxx, x);
+    miny = std::min(miny, y); maxy = std::max(maxy, y);
+  }
+  if(maxx < minx)
+    return r;
+  r.cx = 0.5f * (minx + maxx);
+  r.cy = 0.5f * (miny + maxy);
+  const float bw = maxx - minx, bh = maxy - miny;
+
+  // rotation + scale + squareness by domain
+  auto kp = [&](int i) -> QPointF {
+    return (i >= 0 && i < (int)kps.size())
+               ? QPointF(kps[i].x * W, kps[i].y * H)
+               : QPointF(0, 0);
+  };
+  auto mid = [&](int a, int b) {
+    return QPointF((kp(a).x() + kp(b).x()) * 0.5, (kp(a).y() + kp(b).y()) * 0.5);
+  };
+  QPointF p0, p1; // rotation axis p0->p1; target = vertical/up
+  bool rotated = true;
+  float scale = 1.25f, target_deg = 90.f;
+  bool square = true;
+
+  switch(draw)
+  {
+    case PoseWorkflow::BlazePose:
+      p0 = mid(23, 24); p1 = mid(11, 12); scale = 1.25f; // hips->shoulders
+      break;
+    case PoseWorkflow::RTMPose_COCO:
+    case PoseWorkflow::RTMPose_Whole:
+    case PoseWorkflow::ViTPose:
+    case PoseWorkflow::YOLOPose:
+      // top-down (axis-aligned) crop; no rotation, model aspect handled later
+      rotated = false; scale = 1.25f; square = false;
+      break;
+    case PoseWorkflow::MediaPipeHands:
+      p0 = kp(0); p1 = kp(9); scale = 2.0f; // wrist->middle MCP
+      break;
+    case PoseWorkflow::FaceMesh:
+      // eye corners (FaceMesh indices); keeps the face roughly upright
+      p0 = kp(33); p1 = kp(263); scale = 1.5f; target_deg = 0.f;
+      break;
+    case PoseWorkflow::MobileFaceNet:
+      p0 = kp(36); p1 = kp(45); scale = 1.5f; target_deg = 0.f; // eye corners
+      break;
+    default:
+      rotated = false; scale = 1.3f; square = true;
+      break;
+  }
+
+  if(rotated)
+  {
+    const float target = target_deg * float(M_PI) / 180.0f;
+    r.angle = target
+              - std::atan2(-(float(p1.y() - p0.y())), float(p1.x() - p0.x()));
+    const float size = std::max(bw, bh) * scale;
+    r.w = size;
+    r.h = size;
+  }
+  else if(square)
+  {
+    const float size = std::max(bw, bh) * scale;
+    r.w = size; r.h = size; r.angle = 0.f;
+  }
+  else
+  {
+    // top-down: aspect-fix to the model so the crop isn't stretched
+    float sw = bw * scale, sh = bh * scale;
+    const float a = float(model_w) / float(model_h);
+    if(sw > sh * a)
+      sh = sw / a;
+    else
+      sw = sh * a;
+    r.w = sw; r.h = sh; r.angle = 0.f;
+  }
+  return r;
+}
+
+Onnx::ROI::Rect PoseDetector::smoothRoi(Onnx::ROI::Rect r)
+{
+  if(!inputs.track_roi.value && !inputs.smoothing.value)
+    return r;
+  // ROI is smoothed a bit more aggressively than keypoints (it should be very
+  // stable for a still subject); reuse the smoothing amount, biased lower.
+  const float amt
+      = std::clamp(static_cast<float>(inputs.smoothing_amount.value), 0.f, 1.f);
+  const float min_cutoff = 15.0f * std::pow(0.005f / 15.0f, amt);
+  m_roi_smoother.configure(min_cutoff, 0.01f);
+  float v[5] = {r.cx, r.cy, r.w, r.h, r.angle};
+  m_roi_smoother.smooth(v, 1.0f);
+  return Onnx::ROI::Rect{v[0], v[1], v[2], v[3], v[4]};
 }
 
 std::vector<Onnx::Detection::Detection>
@@ -1408,21 +1567,34 @@ try
 
   // Reset contexts on workflow / model change.
   const PoseWorkflow wf = inputs.workflow.value;
+  bool reinit = false;
   if(wf != m_last_workflow)
   {
     ctx.reset();
     det_ctx.reset();
     m_last_workflow = wf;
+    reinit = true;
   }
   if(inputs.model.file.filename != m_last_model)
   {
     ctx.reset();
     m_last_model = std::string(inputs.model.file.filename);
+    reinit = true;
   }
   if(inputs.det_model.file.filename != m_last_det_model)
   {
     det_ctx.reset();
     m_last_det_model = std::string(inputs.det_model.file.filename);
+    reinit = true;
+  }
+  // A model/workflow change invalidates the temporal tracking/smoothing state.
+  if(reinit)
+  {
+    m_tracking = false;
+    m_last_keypoints.clear();
+    m_roi_smoother.reset();
+    m_smoother.reset();
+    m_lost_frames = 0;
   }
 
   if(!this->ctx)
@@ -1450,44 +1622,47 @@ try
   // --- Two-stage: detector + landmark ---
   if(have_det && role.stage == Onnx::ModelStage::Landmark)
   {
-    auto dets = runDetector(m_detector_role, src);
-    if(dets.empty())
-    {
-      passthrough(src);
-      return;
-    }
-
-    const auto& d = dets.front();
     const int mw = role.input_w > 0 ? role.input_w : 256;
     const int mh = role.input_h > 0 ? role.input_h : 256;
-    QTransform M;
-    switch(role.kind)
+
+    // --- ROI: tracking loop (skip detector) vs fresh detection -------------
+    Onnx::ROI::Rect rect;
+    if(inputs.track_roi.value && m_tracking && !m_last_keypoints.empty())
     {
-      case Onnx::ModelKind::BlazePoseLandmark:
-        M = Onnx::ROI::mediapipeTransform(
-            d, in_tex.width, in_tex.height, mw, mh, Onnx::ROI::poseParams());
-        break;
-      case Onnx::ModelKind::HandLandmark:
-        M = Onnx::ROI::mediapipeTransform(
-            d, in_tex.width, in_tex.height, mw, mh, Onnx::ROI::handParams());
-        break;
-      case Onnx::ModelKind::FaceMeshLandmark:
-      case Onnx::ModelKind::MobileFaceNet:
-        M = Onnx::ROI::mediapipeTransform(
-            d, in_tex.width, in_tex.height, mw, mh, Onnx::ROI::faceParams());
-        break;
-      case Onnx::ModelKind::SimccPose:
-      case Onnx::ModelKind::HeatmapPose:
-      default:
-      {
-        const QRectF box(
-            d.box().x() * in_tex.width, d.box().y() * in_tex.height,
-            d.w * in_tex.width, d.h * in_tex.height);
-        M = Onnx::ROI::topdownTransform(box, mw, mh, 1.25f);
-        break;
-      }
+      // Derive the ROI from last frame's landmarks — no detector this frame.
+      rect = roiRectFromKeypoints(
+          draw, m_last_keypoints, in_tex.width, in_tex.height, mw, mh);
     }
+    else
+    {
+      auto dets = runDetector(m_detector_role, src);
+      if(dets.empty())
+      {
+        passthrough(src);
+        return;
+      }
+      rect = detectionRect(role, dets.front(), in_tex.width, in_tex.height);
+      m_roi_smoother.reset(); // fresh acquisition: don't blend across the gap
+    }
+
+    // Stabilize the crop so a still subject yields a still ROI.
+    rect = smoothRoi(rect);
+    const QTransform M = Onnx::ROI::rectToTransform(rect, mw, mh);
     runLandmark(role, draw, src, M);
+
+    // --- Tracking gate: keep tracking only if the landmark model is confident
+    if(inputs.track_roi.value && outputs.detection.value
+       && outputs.detection.value->mean_confidence
+              >= std::max(0.2f, static_cast<float>(inputs.min_confidence)))
+    {
+      m_tracking = true;
+      m_last_keypoints = outputs.detection.value->keypoints;
+    }
+    else
+    {
+      m_tracking = false; // lost -> re-detect next frame
+      m_last_keypoints.clear();
+    }
     return;
   }
 

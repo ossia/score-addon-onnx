@@ -53,10 +53,32 @@ inline MediapipeParams faceParams()
       .alignment_points = false};
 }
 
-// Build the rotated crop->image transform from a normalized detection.
-inline QTransform mediapipeTransform(
-    const Detection::Detection& det, int srcW, int srcH, int model_w,
-    int model_h, const MediapipeParams& p)
+// A region of interest in image pixels: center, full width/height, rotation.
+// This is the smoothable intermediate — temporally filter these 5 scalars, then
+// rebuild the transform, so the crop the landmark model sees stays stable.
+struct Rect
+{
+  float cx{}, cy{}, w{}, h{}, angle{}; // angle in radians
+};
+
+// Rect (image px) -> crop(model px)->image(px) affine.
+//   img = center + R(angle) * ((m/model - 0.5) * (w,h))
+inline QTransform rectToTransform(const Rect& r, int model_w, int model_h)
+{
+  const float ca = std::cos(r.angle), sa = std::sin(r.angle);
+  const float m11 = r.w * ca / model_w;
+  const float m12 = r.w * sa / model_w;
+  const float m21 = -r.h * sa / model_h;
+  const float m22 = r.h * ca / model_h;
+  const float dx = r.cx - 0.5f * r.w * ca + 0.5f * r.h * sa;
+  const float dy = r.cy - 0.5f * r.w * sa - 0.5f * r.h * ca;
+  return QTransform(m11, m12, m21, m22, dx, dy);
+}
+
+// Rotated MediaPipe-style ROI rect from a normalized detection.
+inline Rect mediapipeRect(
+    const Detection::Detection& det, int srcW, int srcH,
+    const MediapipeParams& p)
 {
   const auto& kps = det.keypoints;
   const int ke = std::min<int>(p.kp_end, static_cast<int>(kps.size()) - 1);
@@ -72,8 +94,6 @@ inline QTransform mediapipeTransform(
     y1 = kps[ke].y() * srcH;
   }
 
-  // image Y points down -> negate the y delta for a math-convention angle.
-  // No usable alignment keypoints (e.g. a plain person/bbox detector) -> 0.
   const float target = p.target_angle_deg * float(M_PI) / 180.0f;
   const float angle = (ks >= 0 && ke >= 0)
                           ? target - std::atan2(-(y1 - y0), (x1 - x0))
@@ -94,29 +114,14 @@ inline QTransform mediapipeTransform(
   }
 
   const float ca = std::cos(angle), sa = std::sin(angle);
-
-  // shift along the rotated axes (fraction of pre-scale size)
   cx += ca * (p.shift_x * size) - sa * (p.shift_y * size);
   cy += sa * (p.shift_x * size) + ca * (p.shift_y * size);
 
-  const float w = size * p.scale;
-  const float h = size * p.scale;
-
-  // M maps (mx,my) in [0,model]^2 to image px:
-  //   img = center + R(angle) * ( (m/model - 0.5) * size )
-  // QTransform(m11,m12,m21,m22,dx,dy): x' = m11*x + m21*y + dx
-  const float m11 = w * ca / model_w;
-  const float m12 = w * sa / model_w;
-  const float m21 = -h * sa / model_h;
-  const float m22 = h * ca / model_h;
-  const float dx = cx - 0.5f * w * ca + 0.5f * h * sa;
-  const float dy = cy - 0.5f * w * sa - 0.5f * h * ca;
-  return QTransform(m11, m12, m21, m22, dx, dy);
+  return Rect{cx, cy, size * p.scale, size * p.scale, angle};
 }
 
-// Axis-aligned top-down (mmpose) crop->image transform from a source-pixel bbox.
-inline QTransform topdownTransform(
-    QRectF bbox_px, int model_w, int model_h, float pad = 1.25f)
+// Axis-aligned top-down (mmpose) ROI rect from a source-pixel bbox.
+inline Rect topdownRect(QRectF bbox_px, int model_w, int model_h, float pad)
 {
   const float cx = bbox_px.center().x();
   const float cy = bbox_px.center().y();
@@ -127,8 +132,20 @@ inline QTransform topdownTransform(
     sh = sw / a;
   else
     sw = sh * a;
-  return QTransform(
-      sw / model_w, 0, 0, sh / model_h, cx - 0.5f * sw, cy - 0.5f * sh);
+  return Rect{cx, cy, sw, sh, 0.0f};
+}
+
+inline QTransform mediapipeTransform(
+    const Detection::Detection& det, int srcW, int srcH, int model_w,
+    int model_h, const MediapipeParams& p)
+{
+  return rectToTransform(mediapipeRect(det, srcW, srcH, p), model_w, model_h);
+}
+
+inline QTransform topdownTransform(
+    QRectF bbox_px, int model_w, int model_h, float pad = 1.25f)
+{
+  return rectToTransform(topdownRect(bbox_px, model_w, model_h, pad), model_w, model_h);
 }
 
 // Whole-frame transform matching Images.hpp's KeepAspectRatioByExpanding +

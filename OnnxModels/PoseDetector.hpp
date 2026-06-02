@@ -4,6 +4,7 @@
 #include <Onnx/helpers/Detection.hpp>
 #include <Onnx/helpers/ModelRole.hpp>
 #include <Onnx/helpers/OneEuro.hpp>
+#include <Onnx/helpers/ROI.hpp>
 
 #include <halp/controls.hpp>
 #include <halp/file_port.hpp>
@@ -126,6 +127,15 @@ public:
       halp_meta(description, "Output data format for GPU rendering");
     } data_format;
 
+    struct : halp::toggle<"Track ROI">
+    {
+      halp_meta(
+          description,
+          "Two-stage only: derive the ROI from the previous frame's landmarks "
+          "and skip the detector (faster + far steadier, like MediaPipe)");
+      bool value = true;
+    } track_roi;
+
     struct : halp::toggle<"Smoothing">
     {
       halp_meta(description, "Temporal One-Euro smoothing of keypoints");
@@ -198,6 +208,17 @@ private:
   // Temporal One-Euro smoothing of the detected keypoints (in place).
   void applySmoothing(DetectedPose& pose);
 
+  // ROI as a rect (image px) from a detection, by landmark kind.
+  Onnx::ROI::Rect
+  detectionRect(const Onnx::ModelRole& role,
+                const Onnx::Detection::Detection& det, int W, int H);
+  // ROI rect derived from the previous frame's landmarks (tracking loop).
+  Onnx::ROI::Rect roiRectFromKeypoints(
+      PoseWorkflow draw, const std::vector<PoseKeypoint>& kps, int W, int H,
+      int model_w, int model_h);
+  // Temporally smooth the ROI rect so the crop stays steady.
+  Onnx::ROI::Rect smoothRoi(Onnx::ROI::Rect r);
+
   std::unique_ptr<Onnx::OnnxRunContext> ctx;     // main / landmark model
   std::unique_ptr<Onnx::OnnxRunContext> det_ctx; // optional stage-1 detector
   boost::container::vector<float> storage;
@@ -208,6 +229,12 @@ private:
   Onnx::ModelRole m_landmark_role;
   Onnx::ModelRole m_detector_role;
   Onnx::PoseSmoother m_smoother;
+
+  // Tracking-loop state (two-stage path)
+  bool m_tracking{false};               // valid ROI carried from prev frame?
+  Onnx::RectSmoother m_roi_smoother;    // temporal ROI stabilization
+  std::vector<PoseKeypoint> m_last_keypoints; // image-normalized, prev frame
+  int m_lost_frames{0};                 // consecutive frames without a pose
 
   std::string m_last_model;
   std::string m_last_det_model;
