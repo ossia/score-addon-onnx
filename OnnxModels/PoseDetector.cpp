@@ -1382,99 +1382,47 @@ PoseDetector::runDetector(
   return dets;
 }
 
-float PoseDetector::landmarkKeypoints(
-    const Onnx::ModelRole& role, const QImage& src, const QTransform& M,
-    std::vector<PoseKeypoint>& out)
+namespace
 {
-  out.clear();
-  auto& lctx = *this->ctx;
-  auto spec = lctx.readModelSpec();
-  if(spec.inputs.empty())
-    return -1.f;
+// One decoded landmark in MODEL-PIXEL space (x,y in [0,mw]x[0,mh]).
+struct LandmarkKp
+{
+  float x, y, z, conf;
+};
 
-  int mw = role.input_w > 0 ? role.input_w : 256;
-  int mh = role.input_h > 0 ? role.input_h : 256;
-  if(spec.inputs[0].shape.size() == 4)
-  {
-    if(role.nhwc)
-    {
-      mh = static_cast<int>(spec.inputs[0].shape[1]);
-      mw = static_cast<int>(spec.inputs[0].shape[2]);
-    }
-    else
-    {
-      mh = static_cast<int>(spec.inputs[0].shape[2]);
-      mw = static_cast<int>(spec.inputs[0].shape[3]);
-    }
-  }
-
-  QImage crop = Onnx::ROI::warpCrop(src, M, mw, mh);
-
-  // Build the input tensor (layout + normalization by role).
-  std::optional<Onnx::FloatTensor> t;
+// Build the landmark input tensor for one crop (layout + normalization by role).
+Onnx::FloatTensor makeLandmarkInput(
+    const Onnx::ModelRole& role, Onnx::ModelSpec::Port& port, const QImage& crop,
+    int mw, int mh, boost::container::vector<float>& scratch)
+{
   if(role.nhwc)
-  {
-    t.emplace(Onnx::nhwc_rgb_tensorFromRGBA(
-        spec.inputs[0], crop.constBits(), mw, mh, mw, mh, storage));
-  }
-  else if(role.kind == Onnx::ModelKind::MobileFaceNet)
-  {
-    t.emplace(Onnx::nchw_tensorFromRGBA(
-        spec.inputs[0], crop.constBits(), mw, mh, mw, mh, storage,
+    return Onnx::nhwc_rgb_tensorFromRGBA(
+        port, crop.constBits(), mw, mh, mw, mh, scratch);
+  if(role.kind == Onnx::ModelKind::MobileFaceNet)
+    return Onnx::nchw_tensorFromRGBA(
+        port, crop.constBits(), mw, mh, mw, mh, scratch,
         {0.485f * 255.f, 0.456f * 255.f, 0.406f * 255.f},
-        {0.229f * 255.f, 0.224f * 255.f, 0.225f * 255.f}));
-  }
-  else if(
-      role.kind == Onnx::ModelKind::FaceMeshLandmark
-      || role.kind == Onnx::ModelKind::HandLandmark
-      || role.kind == Onnx::ModelKind::BlazePoseLandmark)
-  {
-    // MediaPipe landmark models want [0,1] regardless of layout. FaceMeshV2 is
-    // exported NCHW (orig FaceMesh is NHWC) — feed it [0,1], not ImageNet.
-    t.emplace(Onnx::nchw_tensorFromRGBA(
-        spec.inputs[0], crop.constBits(), mw, mh, mw, mh, storage,
-        {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f}));
-  }
-  else
-  {
-    t.emplace(Onnx::nchw_tensorFromRGBA(
-        spec.inputs[0], crop.constBits(), mw, mh, mw, mh, storage,
-        {123.675f, 116.28f, 103.53f}, {58.395f, 57.12f, 57.375f}));
-  }
+        {0.229f * 255.f, 0.224f * 255.f, 0.225f * 255.f});
+  if(role.kind == Onnx::ModelKind::FaceMeshLandmark
+     || role.kind == Onnx::ModelKind::HandLandmark
+     || role.kind == Onnx::ModelKind::BlazePoseLandmark)
+    // MediaPipe landmark models want [0,1] regardless of layout.
+    return Onnx::nchw_tensorFromRGBA(
+        port, crop.constBits(), mw, mh, mw, mh, scratch, {0.f, 0.f, 0.f},
+        {255.f, 255.f, 255.f});
+  return Onnx::nchw_tensorFromRGBA(
+      port, crop.constBits(), mw, mh, mw, mh, scratch,
+      {123.675f, 116.28f, 103.53f}, {58.395f, 57.12f, 57.375f});
+}
 
-  Ort::Value outs[5]{
-      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
-      Ort::Value{nullptr}, Ort::Value{nullptr}};
-  const size_t n_out = std::min<size_t>(5, spec.output_names_char.size());
-
-  // Some RTMPose exports take a second [w,h] bbox input.
-  std::array<int64_t, 2> bbox_wh{mw, mh};
-  std::array<int64_t, 2> bbox_shape{1, 2};
-  if(spec.inputs.size() >= 2)
-  {
-    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
-        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
-    auto bbox_tensor = Ort::Value::CreateTensor<int64_t>(
-        mem_info, bbox_wh.data(), bbox_wh.size(), bbox_shape.data(),
-        bbox_shape.size());
-    Ort::Value ins[2] = {std::move(t->value), std::move(bbox_tensor)};
-    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
-  }
-  else
-  {
-    Ort::Value ins[1] = {std::move(t->value)};
-    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
-  }
-
-  auto outspan = std::span<Ort::Value>(outs, n_out);
-
-  // Decode keypoints in MODEL-PIXEL space (x,y in [0,mw]x[0,mh]).
-  struct MKP
-  {
-    float x, y, z, conf;
-  };
-  std::vector<MKP> kps;
-
+// Decode ONE instance's landmark outputs (a [1,...] outspan) into MODEL-PIXEL
+// keypoints. Shared by the single-crop and batched-slice paths.
+void decodeLandmark(
+    const Onnx::ModelRole& role, const Onnx::ModelSpec& spec,
+    std::span<Ort::Value> outspan, int mw, int mh, float min_conf,
+    std::vector<LandmarkKp>& kps)
+{
+  kps.clear();
   switch(role.kind)
   {
     case Onnx::ModelKind::BlazePoseLandmark:
@@ -1514,10 +1462,7 @@ float PoseDetector::landmarkKeypoints(
     case Onnx::ModelKind::HandLandmark:
     {
       std::optional<Onnx::MediaPipeHands::HandResult> r;
-      // Honor Min Confidence as the presence gate (was a hard 0.5 wall that
-      // ignored the slider — a hand at 0.3-0.5 presence showed nothing).
-      Onnx::MediaPipeHands::processOutput(
-          spec, outspan, r, static_cast<float>(inputs.min_confidence));
+      Onnx::MediaPipeHands::processOutput(spec, outspan, r, min_conf);
       if(r)
       {
         kps.reserve(r->landmarks.size());
@@ -1530,8 +1475,7 @@ float PoseDetector::landmarkKeypoints(
     {
       std::optional<Onnx::FaceMesh::FaceMeshResult> r;
       Onnx::FaceMesh::processOutput(
-          spec, outspan, Onnx::FaceMesh::NUM_LANDMARKS, r,
-          static_cast<float>(inputs.min_confidence));
+          spec, outspan, Onnx::FaceMesh::NUM_LANDMARKS, r, min_conf);
       if(r)
       {
         kps.reserve(r->landmarks.size());
@@ -1582,10 +1526,7 @@ float PoseDetector::landmarkKeypoints(
             const int hx = max_idx % hw;
             const int hy = max_idx / hw;
 
-            // DARK sub-pixel refinement (mmpose's heatmap decode): fit the peak
-            // with a 2nd-order Taylor expansion of the log-heatmap and take one
-            // Newton step. Removes the ±½-cell argmax quantization that makes
-            // ViTPose/HRNet keypoints jiggle frame-to-frame. (Crude ±0.25 before.)
+            // DARK sub-pixel refinement (mmpose's heatmap decode).
             float ox = 0.f, oy = 0.f;
             if(hx >= 1 && hx < hw - 1 && hy >= 1 && hy < hh - 1)
             {
@@ -1633,9 +1574,71 @@ float PoseDetector::landmarkKeypoints(
     default:
       break;
   }
+}
+} // namespace
 
-  if(t)
-    std::swap(storage, t->storage);
+float PoseDetector::landmarkKeypoints(
+    const Onnx::ModelRole& role, const QImage& src, const QTransform& M,
+    std::vector<PoseKeypoint>& out)
+{
+  out.clear();
+  auto& lctx = *this->ctx;
+  auto spec = lctx.readModelSpec();
+  if(spec.inputs.empty())
+    return -1.f;
+
+  int mw = role.input_w > 0 ? role.input_w : 256;
+  int mh = role.input_h > 0 ? role.input_h : 256;
+  if(spec.inputs[0].shape.size() == 4)
+  {
+    if(role.nhwc)
+    {
+      mh = static_cast<int>(spec.inputs[0].shape[1]);
+      mw = static_cast<int>(spec.inputs[0].shape[2]);
+    }
+    else
+    {
+      mh = static_cast<int>(spec.inputs[0].shape[2]);
+      mw = static_cast<int>(spec.inputs[0].shape[3]);
+    }
+  }
+
+  QImage crop = Onnx::ROI::warpCrop(src, M, mw, mh);
+  Onnx::FloatTensor t
+      = makeLandmarkInput(role, spec.inputs[0], crop, mw, mh, storage);
+
+  Ort::Value outs[5]{
+      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
+      Ort::Value{nullptr}, Ort::Value{nullptr}};
+  const size_t n_out = std::min<size_t>(5, spec.output_names_char.size());
+
+  // Some RTMPose exports take a second [w,h] bbox input.
+  std::array<int64_t, 2> bbox_wh{mw, mh};
+  std::array<int64_t, 2> bbox_shape{1, 2};
+  if(spec.inputs.size() >= 2)
+  {
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+    auto bbox_tensor = Ort::Value::CreateTensor<int64_t>(
+        mem_info, bbox_wh.data(), bbox_wh.size(), bbox_shape.data(),
+        bbox_shape.size());
+    Ort::Value ins[2] = {std::move(t.value), std::move(bbox_tensor)};
+    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+  }
+  else
+  {
+    Ort::Value ins[1] = {std::move(t.value)};
+    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+  }
+
+  auto outspan = std::span<Ort::Value>(outs, n_out);
+
+  std::vector<LandmarkKp> kps;
+  decodeLandmark(
+      role, spec, outspan, mw, mh, static_cast<float>(inputs.min_confidence),
+      kps);
+
+  std::swap(storage, t.storage);
 
   if(kps.empty())
     return -1.f;
@@ -1653,6 +1656,166 @@ float PoseDetector::landmarkKeypoints(
     sum_conf += k.conf;
   }
   return sum_conf / out.size();
+}
+
+// Landmark every ROI, filling m_instances. Batches all crops into ONE
+// [N,C,H,W] inference when the model's batch dim is dynamic/>=N (the common
+// case); otherwise falls back to one inference per crop. Output decode is
+// identical either way (each instance decoded from its own [1,...] slice).
+void PoseDetector::runLandmarkBatch(
+    const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
+    const std::vector<Onnx::ROI::Rect>& rois)
+{
+  (void)draw;
+  m_instances.clear();
+  if(rois.empty())
+    return;
+  auto& lctx = *this->ctx;
+  auto spec = lctx.readModelSpec();
+  if(spec.inputs.empty())
+    return;
+
+  int mw = role.input_w > 0 ? role.input_w : 256;
+  int mh = role.input_h > 0 ? role.input_h : 256;
+  if(spec.inputs[0].shape.size() == 4)
+  {
+    if(role.nhwc)
+    {
+      mh = static_cast<int>(spec.inputs[0].shape[1]);
+      mw = static_cast<int>(spec.inputs[0].shape[2]);
+    }
+    else
+    {
+      mh = static_cast<int>(spec.inputs[0].shape[2]);
+      mw = static_cast<int>(spec.inputs[0].shape[3]);
+    }
+  }
+
+  const int N = static_cast<int>(rois.size());
+  const int64_t batch_dim
+      = (spec.inputs[0].shape.size() == 4) ? spec.inputs[0].shape[0] : 1;
+  const bool can_batch = N >= 2 && (batch_dim < 0 || batch_dim >= N);
+  const float iw = src.width(), ih = src.height();
+
+  auto pushFromKps = [&](const std::vector<LandmarkKp>& kps,
+                         const QTransform& M) {
+    if(kps.empty())
+      return;
+    DetectedPose pose;
+    pose.keypoints.reserve(kps.size());
+    float sum = 0.f;
+    for(const auto& k : kps)
+    {
+      const QPointF p = M.map(QPointF(k.x, k.y));
+      pose.keypoints.push_back(
+          {static_cast<float>(p.x() / iw), static_cast<float>(p.y() / ih), k.z,
+           k.conf});
+      sum += k.conf;
+    }
+    pose.mean_confidence = sum / pose.keypoints.size();
+    m_instances.push_back(std::move(pose));
+  };
+
+  // Fallback: one inference per ROI (fixed batch dim, or single instance).
+  if(!can_batch)
+  {
+    for(const auto& r : rois)
+    {
+      const QTransform M = Onnx::ROI::rectToTransform(r, mw, mh);
+      const float mc = landmarkKeypoints(role, src, M, m_kp_scratch);
+      if(mc < 0.f || m_kp_scratch.empty())
+        continue;
+      DetectedPose pose;
+      pose.keypoints = m_kp_scratch;
+      pose.mean_confidence = mc;
+      m_instances.push_back(std::move(pose));
+    }
+    return;
+  }
+
+  // --- Batched: pack N crops into one [N,C,H,W] input buffer. ---
+  const int CHW = 3 * mw * mh;
+  m_batch_storage.resize(
+      static_cast<size_t>(N) * CHW, boost::container::default_init);
+  for(int b = 0; b < N; ++b)
+  {
+    const QTransform M = Onnx::ROI::rectToTransform(rois[b], mw, mh);
+    QImage crop = Onnx::ROI::warpCrop(src, M, mw, mh);
+    Onnx::FloatTensor ft
+        = makeLandmarkInput(role, spec.inputs[0], crop, mw, mh, m_tmp_storage);
+    std::memcpy(
+        m_batch_storage.data() + static_cast<size_t>(b) * CHW,
+        ft.storage.data(), static_cast<size_t>(CHW) * sizeof(float));
+    std::swap(m_tmp_storage, ft.storage); // reclaim capacity for next crop
+  }
+
+  std::vector<int64_t> in_shape = spec.inputs[0].shape;
+  if(in_shape.size() == 4)
+    in_shape[0] = N;
+  else
+    in_shape = {N, 3, mh, mw};
+  Ort::Value in0 = Onnx::vec_to_tensor<float>(m_batch_storage, in_shape);
+
+  Ort::Value outs[5]{
+      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
+      Ort::Value{nullptr}, Ort::Value{nullptr}};
+  const size_t n_out = std::min<size_t>(5, spec.output_names_char.size());
+
+  if(spec.inputs.size() >= 2)
+  {
+    // SimCC's second [w,h] input, batched to [N,2].
+    m_bbox.resize(static_cast<size_t>(N) * 2);
+    for(int b = 0; b < N; ++b)
+    {
+      m_bbox[2 * b] = mw;
+      m_bbox[2 * b + 1] = mh;
+    }
+    std::array<int64_t, 2> bshape{N, 2};
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+    auto bbox_tensor = Ort::Value::CreateTensor<int64_t>(
+        mem_info, m_bbox.data(), m_bbox.size(), bshape.data(), bshape.size());
+    Ort::Value ins[2] = {std::move(in0), std::move(bbox_tensor)};
+    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+  }
+  else
+  {
+    Ort::Value ins[1] = {std::move(in0)};
+    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+  }
+
+  // Decode each instance from its [1,...] slice of the batched outputs. The
+  // decoders see exactly the single-instance shapes they already handle.
+  Ort::AllocatorWithDefaultOptions alloc;
+  std::vector<LandmarkKp> kps;
+  for(int b = 0; b < N; ++b)
+  {
+    Ort::Value sl[5]{
+        Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
+        Ort::Value{nullptr}, Ort::Value{nullptr}};
+    for(size_t j = 0; j < n_out; ++j)
+    {
+      auto info = outs[j].GetTensorTypeAndShapeInfo();
+      auto shp = info.GetShape();
+      const size_t total = info.GetElementCount();
+      const bool batched = !shp.empty() && shp[0] == N;
+      const size_t per = batched ? total / static_cast<size_t>(N) : total;
+      if(batched)
+        shp[0] = 1;
+      sl[j] = Ort::Value::CreateTensor<float>(
+          alloc, shp.data(), shp.size());
+      std::memcpy(
+          sl[j].GetTensorMutableData<float>(),
+          outs[j].GetTensorData<float>()
+              + (batched ? static_cast<size_t>(b) * per : 0),
+          per * sizeof(float));
+    }
+    kps.clear();
+    decodeLandmark(
+        role, spec, std::span<Ort::Value>(sl, n_out), mw, mh,
+        static_cast<float>(inputs.min_confidence), kps);
+    pushFromKps(kps, Onnx::ROI::rectToTransform(rois[b], mw, mh));
+  }
 }
 
 void PoseDetector::runLandmark(
@@ -1685,9 +1848,7 @@ void PoseDetector::runMultiInstance(
   const int W = inputs.image.texture.width, H = inputs.image.texture.height;
   const int mw = role.input_w > 0 ? role.input_w : 256;
   const int mh = role.input_h > 0 ? role.input_h : 256;
-  const int max_inst = std::clamp(
-      static_cast<int>(std::lround(static_cast<float>(inputs.max_instances.value))),
-      1, 16);
+  const int max_inst = std::clamp(static_cast<int>(inputs.max_instances.value), 1, 16);
 
   // Per-track ROI feedback (detector-skip) is only steady for the
   // MediaPipe-rotated landmark kinds; top-down (SimCC/heatmap) re-detects.
@@ -1695,27 +1856,15 @@ void PoseDetector::runMultiInstance(
       = role.kind == Onnx::ModelKind::BlazePoseLandmark
         || role.kind == Onnx::ModelKind::HandLandmark
         || role.kind == Onnx::ModelKind::FaceMeshLandmark;
-  constexpr int kDetectCadence = 4;
+  const int detect_cadence
+      = std::max(1, static_cast<int>(inputs.detector_cadence.value));
 
-  m_instances.clear();
-
-  auto pushLandmark = [&](const Onnx::ROI::Rect& r) {
-    if(!rectValid(r, W, H))
-      return;
-    const QTransform M = Onnx::ROI::rectToTransform(r, mw, mh);
-    const float mc = landmarkKeypoints(role, src, M, m_kp_scratch);
-    if(mc < 0.f || m_kp_scratch.empty())
-      return;
-    DetectedPose pose;
-    pose.keypoints = m_kp_scratch;
-    pose.mean_confidence = mc;
-    m_instances.push_back(std::move(pose));
-  };
+  // --- Gather this frame's ROIs (image px), then batch-landmark them. ---
+  m_rois.clear();
 
   const bool use_track_rois = inputs.track_roi.value && roi_trackable
                               && !m_tracker.tracks().empty()
-                              && m_frames_since_detect < kDetectCadence;
-
+                              && m_frames_since_detect < detect_cadence;
   if(use_track_rois)
   {
     ++m_frames_since_detect;
@@ -1727,13 +1876,16 @@ void PoseDetector::runMultiInstance(
       m_kp_scratch.reserve(tk.kpts_smooth.size());
       for(const auto& k : tk.kpts_smooth)
         m_kp_scratch.push_back({k.x, k.y, k.z, k.score});
-      pushLandmark(roiRectFromKeypoints(draw, m_kp_scratch, W, H, mw, mh));
+      const Onnx::ROI::Rect r
+          = roiRectFromKeypoints(draw, m_kp_scratch, W, H, mw, mh);
+      if(rectValid(r, W, H))
+        m_rois.push_back(r);
     }
-    if(m_instances.empty())
-      m_frames_since_detect = kDetectCadence; // force re-detect next frame
+    if(m_rois.empty())
+      m_frames_since_detect = detect_cadence; // force re-detect next frame
   }
 
-  if(m_instances.empty())
+  if(m_rois.empty())
   {
     m_frames_since_detect = 0;
     m_dets = runDetector(m_detector_role, src, role.domain);
@@ -1750,8 +1902,20 @@ void PoseDetector::runMultiInstance(
       m_dets.resize(max_inst);
     }
     for(const auto& d : m_dets)
-      pushLandmark(detectionRect(role, d, W, H));
+    {
+      const Onnx::ROI::Rect r = detectionRect(role, d, W, H);
+      if(rectValid(r, W, H))
+        m_rois.push_back(r);
+    }
   }
+
+  if(m_rois.empty())
+  {
+    passthrough(src);
+    return;
+  }
+
+  runLandmarkBatch(role, draw, src, m_rois); // batched if the model allows
 
   if(m_instances.empty())
   {
@@ -1857,7 +2021,7 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
   // Fixed-stride multi geometry: max_inst slots of [track_id, (x,y,z,conf)*K],
   // zero-padded. Constant layout regardless of Data Format (GPU-friendly).
   const int max_inst = std::clamp(
-      static_cast<int>(std::lround(static_cast<float>(inputs.max_instances.value))),
+      static_cast<int>(inputs.max_instances.value),
       1, 16);
   auto& pg = outputs.poses_geometry.value;
   pg.clear();
@@ -1955,7 +2119,7 @@ void PoseDetector::runYOLOPose(const QImage& src, const QTransform& M)
   {
     const int max_inst = std::clamp(
         static_cast<int>(
-            std::lround(static_cast<float>(inputs.max_instances.value))),
+            inputs.max_instances.value),
         1, 16);
     if(static_cast<int>(poses.size()) > max_inst)
       std::partial_sort(
@@ -2079,7 +2243,7 @@ void PoseDetector::runRTMO(const QImage& src)
     const float thr = std::max(0.3f, static_cast<float>(inputs.min_confidence));
     const int max_inst = std::clamp(
         static_cast<int>(
-            std::lround(static_cast<float>(inputs.max_instances.value))),
+            inputs.max_instances.value),
         1, 16);
     std::vector<std::pair<float, int>> sel;
     sel.reserve(N);
