@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
 
 namespace OnnxModels
 {
@@ -287,32 +288,29 @@ static QColor getAP10KColor(int idx)
   return Colors::right_leg;                      // right back leg
 }
 
-void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
+// Stable, well-distributed color for a track id. Golden-ratio hue stepping so
+// consecutive ids are maximally distinct, and a given id is ALWAYS the same
+// color (id 1 -> the same hue every frame, every session).
+static QColor getTrackColor(int id)
 {
-  auto& in_tex = inputs.image.texture;
+  if(id < 0)
+    return Colors::torso;
+  constexpr double golden = 0.618033988749895;
+  const double hue = std::fmod(0.11 + static_cast<double>(id) * golden, 1.0);
+  return QColor::fromHsvF(
+      static_cast<float>(hue), 0.85f, 1.0f);
+}
+
+// Draw one pose's connections + points with an already-open painter (the output
+// image / compositing is owned by the caller — drawSkeleton or drawAllSkeletons).
+void PoseDetector::drawOnePose(
+    QPainter& p, const DetectedPose& pose, PoseWorkflow workflow, int w, int h)
+{
   const float min_conf = inputs.min_confidence;
   const bool draw_lines = inputs.draw_skeleton.value;
-  const bool skeleton_only = (inputs.output_mode.value == OutputMode::SkeletonOnly);
-
-  // Create output image
-  QImage img;
-  if(skeleton_only)
-  {
-    img = QImage(in_tex.width, in_tex.height, QImage::Format_RGBA8888);
-    img.fill(Qt::black);
-  }
-  else
-  {
-    img = QImage(in_tex.bytes, in_tex.width, in_tex.height, QImage::Format_RGBA8888);
-  }
-
-  QPainter p(&img);
-  p.setRenderHint(QPainter::Antialiasing);
 
   const auto& kps = pose.keypoints;
   const int num_kps = static_cast<int>(kps.size());
-  const int w = in_tex.width;
-  const int h = in_tex.height;
 
   // Helper to convert keypoint to pixel coordinates
   auto toPoint = [&](int idx) -> QPointF {
@@ -323,8 +321,17 @@ void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
   auto safeAlpha
       = [](float conf) -> float { return std::clamp(conf, 0.5f, 1.0f); };
 
+  // When this pose carries a persistent track id, draw the whole individual in
+  // one stable per-id color (id 1 always the same color, etc.). Otherwise fall
+  // back to the per-keypoint-type palette below.
+  const bool use_track_color = pose.track_id >= 0;
+  const QColor track_color
+      = use_track_color ? getTrackColor(pose.track_id) : QColor();
+
   // Select skeleton connections and color function based on workflow
   auto getColor = [&](int idx) -> QColor {
+    if(use_track_color)
+      return track_color;
     switch(workflow)
     {
       case PoseWorkflow::BlazePose:
@@ -417,12 +424,13 @@ void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
               p.drawLine(toPoint(from), toPoint(to));
             }
           };
-          drawContour(Onnx::FaceMesh::FaceContours::face_oval, QColor(200, 200, 255));
-          drawContour(Onnx::FaceMesh::FaceContours::left_eye, QColor(0, 255, 255));
-          drawContour(Onnx::FaceMesh::FaceContours::right_eye, QColor(0, 255, 255));
-          drawContour(Onnx::FaceMesh::FaceContours::lips_outer, QColor(255, 100, 100));
-          drawContour(Onnx::FaceMesh::FaceContours::left_eyebrow, QColor(255, 255, 0));
-          drawContour(Onnx::FaceMesh::FaceContours::right_eyebrow, QColor(255, 255, 0));
+          auto cc = [&](QColor base) { return use_track_color ? track_color : base; };
+          drawContour(Onnx::FaceMesh::FaceContours::face_oval, cc(QColor(200, 200, 255)));
+          drawContour(Onnx::FaceMesh::FaceContours::left_eye, cc(QColor(0, 255, 255)));
+          drawContour(Onnx::FaceMesh::FaceContours::right_eye, cc(QColor(0, 255, 255)));
+          drawContour(Onnx::FaceMesh::FaceContours::lips_outer, cc(QColor(255, 100, 100)));
+          drawContour(Onnx::FaceMesh::FaceContours::left_eyebrow, cc(QColor(255, 255, 0)));
+          drawContour(Onnx::FaceMesh::FaceContours::right_eyebrow, cc(QColor(255, 255, 0)));
         }
         break;
       case PoseWorkflow::MobileFaceNet:
@@ -490,19 +498,70 @@ void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
 
     p.drawEllipse(toPoint(i), radius, radius);
   }
+}
 
-  // Copy to output
-  outputs.image.create(in_tex.width, in_tex.height);
+// Open an output image (black for skeleton-only, else wrapping the input bytes),
+// returning it ready for a QPainter. Shared by the single + multi drawers.
+static QImage makeOutputCanvas(
+    unsigned char* bytes, int w, int h, bool skeleton_only)
+{
+  QImage img;
+  if(skeleton_only)
+  {
+    img = QImage(w, h, QImage::Format_RGBA8888);
+    img.fill(Qt::black);
+  }
+  else
+  {
+    img = QImage(bytes, w, h, QImage::Format_RGBA8888);
+  }
+  return img;
+}
+
+void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
+{
+  auto& in_tex = inputs.image.texture;
+  const int w = in_tex.width, h = in_tex.height;
+  const bool skeleton_only
+      = (inputs.output_mode.value == OutputMode::SkeletonOnly);
+
+  QImage img = makeOutputCanvas(in_tex.bytes, w, h, skeleton_only);
+  {
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing);
+    drawOnePose(p, pose, workflow, w, h);
+  }
+
+  outputs.image.create(w, h);
   memcpy(outputs.image.texture.bytes, img.constBits(), w * h * 4);
   outputs.image.texture.changed = true;
 }
 
-// Generate geometry output based on format setting
-void PoseDetector::generateGeometryOutput(const DetectedPose& pose, PoseWorkflow workflow)
+void PoseDetector::drawAllSkeletons(PoseWorkflow workflow)
 {
-  auto& out = outputs.geometry.value;
-  out.clear();
+  auto& in_tex = inputs.image.texture;
+  const int w = in_tex.width, h = in_tex.height;
+  const bool skeleton_only
+      = (inputs.output_mode.value == OutputMode::SkeletonOnly);
 
+  QImage img = makeOutputCanvas(in_tex.bytes, w, h, skeleton_only);
+  {
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing);
+    for(const auto& pose : m_instances)
+      drawOnePose(p, pose, workflow, w, h);
+  }
+
+  outputs.image.create(w, h);
+  memcpy(outputs.image.texture.bytes, img.constBits(), w * h * 4);
+  outputs.image.texture.changed = true;
+}
+
+// Append one pose's flattened geometry (current Data Format) to `out`. Does NOT
+// clear — the caller owns the buffer (single-pose clears; multi accumulates).
+void PoseDetector::appendGeometry(
+    std::vector<float>& out, const DetectedPose& pose, PoseWorkflow workflow)
+{
   const auto& kps = pose.keypoints;
   if(kps.empty())
     return;
@@ -662,6 +721,14 @@ void PoseDetector::generateGeometryOutput(const DetectedPose& pose, PoseWorkflow
     }
     break;
   }
+}
+
+void PoseDetector::generateGeometryOutput(
+    const DetectedPose& pose, PoseWorkflow workflow)
+{
+  auto& out = outputs.geometry.value;
+  out.clear();
+  appendGeometry(out, pose, workflow);
 }
 
 namespace
@@ -826,6 +893,9 @@ void PoseDetector::passthrough(const QImage& src)
 {
   outputs.detection.value.reset();
   outputs.geometry.value.clear();
+  outputs.poses.value.clear();
+  outputs.poses_geometry.value.clear();
+  outputs.count.value = 0;
   outputs.image.create(src.width(), src.height());
   std::memcpy(
       outputs.image.texture.bytes, src.constBits(),
@@ -1312,17 +1382,15 @@ PoseDetector::runDetector(
   return dets;
 }
 
-void PoseDetector::runLandmark(
-    const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
-    const QTransform& M)
+float PoseDetector::landmarkKeypoints(
+    const Onnx::ModelRole& role, const QImage& src, const QTransform& M,
+    std::vector<PoseKeypoint>& out)
 {
+  out.clear();
   auto& lctx = *this->ctx;
   auto spec = lctx.readModelSpec();
   if(spec.inputs.empty())
-  {
-    passthrough(src);
-    return;
-  }
+    return -1.f;
 
   int mw = role.input_w > 0 ? role.input_w : 256;
   int mh = role.input_h > 0 ? role.input_h : 256;
@@ -1570,30 +1638,253 @@ void PoseDetector::runLandmark(
     std::swap(storage, t->storage);
 
   if(kps.empty())
+    return -1.f;
+
+  // Map model-pixel keypoints back through M -> image-normalized [0,1].
+  const float iw = src.width(), ih = src.height();
+  out.reserve(kps.size());
+  float sum_conf = 0.0f;
+  for(const auto& k : kps)
+  {
+    const QPointF p = M.map(QPointF(k.x, k.y));
+    out.push_back(
+        {static_cast<float>(p.x() / iw), static_cast<float>(p.y() / ih), k.z,
+         k.conf});
+    sum_conf += k.conf;
+  }
+  return sum_conf / out.size();
+}
+
+void PoseDetector::runLandmark(
+    const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
+    const QTransform& M, int track_id)
+{
+  const float mean_conf = landmarkKeypoints(role, src, M, m_kp_scratch);
+  if(mean_conf < 0.f || m_kp_scratch.empty())
   {
     passthrough(src);
     return;
   }
 
-  // Map model-pixel keypoints back through M -> image-normalized [0,1].
-  const float iw = src.width(), ih = src.height();
   DetectedPose detected;
-  detected.keypoints.reserve(kps.size());
-  float sum_conf = 0.0f;
-  for(const auto& k : kps)
-  {
-    const QPointF p = M.map(QPointF(k.x, k.y));
-    detected.keypoints.push_back(
-        {static_cast<float>(p.x() / iw), static_cast<float>(p.y() / ih), k.z,
-         k.conf});
-    sum_conf += k.conf;
-  }
-  detected.mean_confidence = sum_conf / detected.keypoints.size();
+  detected.keypoints = m_kp_scratch;
+  detected.mean_confidence = mean_conf;
+  detected.track_id = track_id; // set BEFORE draw so the id-color applies
   applySmoothing(detected);
   outputs.detection.value = std::move(detected);
 
   drawSkeleton(*outputs.detection.value, draw);
   generateGeometryOutput(*outputs.detection.value, draw);
+}
+
+// Multi-instance two-stage path (Track IDs on): detect top-K (or reuse per-track
+// ROIs on detector-skip frames), landmark each into m_instances, then emit.
+void PoseDetector::runMultiInstance(
+    const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src)
+{
+  const int W = inputs.image.texture.width, H = inputs.image.texture.height;
+  const int mw = role.input_w > 0 ? role.input_w : 256;
+  const int mh = role.input_h > 0 ? role.input_h : 256;
+  const int max_inst = std::clamp(
+      static_cast<int>(std::lround(static_cast<float>(inputs.max_instances.value))),
+      1, 16);
+
+  // Per-track ROI feedback (detector-skip) is only steady for the
+  // MediaPipe-rotated landmark kinds; top-down (SimCC/heatmap) re-detects.
+  const bool roi_trackable
+      = role.kind == Onnx::ModelKind::BlazePoseLandmark
+        || role.kind == Onnx::ModelKind::HandLandmark
+        || role.kind == Onnx::ModelKind::FaceMeshLandmark;
+  constexpr int kDetectCadence = 4;
+
+  m_instances.clear();
+
+  auto pushLandmark = [&](const Onnx::ROI::Rect& r) {
+    if(!rectValid(r, W, H))
+      return;
+    const QTransform M = Onnx::ROI::rectToTransform(r, mw, mh);
+    const float mc = landmarkKeypoints(role, src, M, m_kp_scratch);
+    if(mc < 0.f || m_kp_scratch.empty())
+      return;
+    DetectedPose pose;
+    pose.keypoints = m_kp_scratch;
+    pose.mean_confidence = mc;
+    m_instances.push_back(std::move(pose));
+  };
+
+  const bool use_track_rois = inputs.track_roi.value && roi_trackable
+                              && !m_tracker.tracks().empty()
+                              && m_frames_since_detect < kDetectCadence;
+
+  if(use_track_rois)
+  {
+    ++m_frames_since_detect;
+    for(const auto& tk : m_tracker.tracks())
+    {
+      if(tk.time_since_update != 0 || tk.kpts_smooth.empty())
+        continue;
+      m_kp_scratch.clear();
+      m_kp_scratch.reserve(tk.kpts_smooth.size());
+      for(const auto& k : tk.kpts_smooth)
+        m_kp_scratch.push_back({k.x, k.y, k.z, k.score});
+      pushLandmark(roiRectFromKeypoints(draw, m_kp_scratch, W, H, mw, mh));
+    }
+    if(m_instances.empty())
+      m_frames_since_detect = kDetectCadence; // force re-detect next frame
+  }
+
+  if(m_instances.empty())
+  {
+    m_frames_since_detect = 0;
+    m_dets = runDetector(m_detector_role, src, role.domain);
+    if(m_dets.empty())
+    {
+      passthrough(src);
+      return;
+    }
+    if(static_cast<int>(m_dets.size()) > max_inst)
+    {
+      std::partial_sort(
+          m_dets.begin(), m_dets.begin() + max_inst, m_dets.end(),
+          [](const auto& a, const auto& b) { return a.score > b.score; });
+      m_dets.resize(max_inst);
+    }
+    for(const auto& d : m_dets)
+      pushLandmark(detectionRect(role, d, W, H));
+  }
+
+  if(m_instances.empty())
+  {
+    passthrough(src);
+    return;
+  }
+  emitInstances(draw, /*do_track=*/true);
+}
+
+// Track m_instances, assign ids + per-id smoothed keypoints + colors, draw all,
+// and publish every output port (poses/detection/geometry/poses_geometry/count).
+void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
+{
+  m_lost_frames = 0;
+
+  if(do_track)
+  {
+    // The tracker owns per-id One-Euro smoothing (no cross-identity bleed).
+    Onnx::Track::Config cfg = m_tracker.config();
+    cfg.smooth = inputs.smoothing.value;
+    if(inputs.smoothing.value)
+    {
+      const float amt = std::clamp(
+          static_cast<float>(inputs.smoothing_amount.value), 0.f, 1.f);
+      cfg.smooth_min_cutoff = 5.0f * std::pow(0.02f / 5.0f, amt);
+      cfg.smooth_beta = 1.0f + 4.0f * amt;
+    }
+    m_tracker.configure(cfg);
+
+    m_track_in.clear();
+    m_track_in.reserve(m_instances.size());
+    for(const auto& pose : m_instances)
+    {
+      Onnx::Track::Detection td;
+      float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
+      int n = 0;
+      for(const auto& k : pose.keypoints)
+      {
+        if(k.confidence < 0.2f)
+          continue;
+        ++n;
+        minx = std::min(minx, k.x); maxx = std::max(maxx, k.x);
+        miny = std::min(miny, k.y); maxy = std::max(maxy, k.y);
+      }
+      if(n < 1 || maxx <= minx)
+        td.box = {0.5f, 0.5f, 1e-3f, 1e-3f};
+      else
+        td.box = {0.5f * (minx + maxx), 0.5f * (miny + maxy), maxx - minx,
+                  maxy - miny};
+      td.score = pose.mean_confidence;
+      td.keypoints.reserve(pose.keypoints.size());
+      for(const auto& k : pose.keypoints)
+        td.keypoints.push_back({k.x, k.y, k.z, k.confidence});
+      m_track_in.push_back(std::move(td));
+    }
+
+    const auto ids = m_tracker.update(m_track_in);
+    for(size_t i = 0; i < m_instances.size(); ++i)
+    {
+      const int id = (i < ids.size()) ? ids[i] : -1;
+      m_instances[i].track_id = id;
+      if(id < 0 || !inputs.smoothing.value)
+        continue;
+      for(const auto& tk : m_tracker.tracks())
+      {
+        if(tk.id != id)
+          continue;
+        if(tk.kpts_smooth.size() == m_instances[i].keypoints.size())
+          for(size_t k = 0; k < tk.kpts_smooth.size(); ++k)
+          {
+            m_instances[i].keypoints[k].x = tk.kpts_smooth[k].x;
+            m_instances[i].keypoints[k].y = tk.kpts_smooth[k].y;
+          }
+        break;
+      }
+    }
+  }
+
+  // primary = highest-confidence instance (back-compat single-pose ports)
+  int primary = -1;
+  float best = -1.f;
+  for(size_t i = 0; i < m_instances.size(); ++i)
+    if(m_instances[i].mean_confidence > best)
+    {
+      best = m_instances[i].mean_confidence;
+      primary = static_cast<int>(i);
+    }
+
+  drawAllSkeletons(draw);
+
+  outputs.poses.value = m_instances;
+  if(primary >= 0)
+  {
+    outputs.detection.value = m_instances[primary];
+    generateGeometryOutput(m_instances[primary], draw); // fills outputs.geometry
+  }
+  else
+  {
+    outputs.detection.value.reset();
+    outputs.geometry.value.clear();
+  }
+
+  // Fixed-stride multi geometry: max_inst slots of [track_id, (x,y,z,conf)*K],
+  // zero-padded. Constant layout regardless of Data Format (GPU-friendly).
+  const int max_inst = std::clamp(
+      static_cast<int>(std::lround(static_cast<float>(inputs.max_instances.value))),
+      1, 16);
+  auto& pg = outputs.poses_geometry.value;
+  pg.clear();
+  if(!m_instances.empty())
+  {
+    const int nkpt = static_cast<int>(m_instances[0].keypoints.size());
+    const int stride = 1 + nkpt * 4;
+    pg.assign(static_cast<size_t>(max_inst) * stride, 0.f);
+    int slot = 0;
+    for(const auto& pose : m_instances)
+    {
+      if(slot >= max_inst)
+        break;
+      float* s = pg.data() + static_cast<size_t>(slot) * stride;
+      s[0] = static_cast<float>(pose.track_id);
+      const int K = std::min(nkpt, static_cast<int>(pose.keypoints.size()));
+      for(int k = 0; k < K; ++k)
+      {
+        s[1 + k * 4 + 0] = pose.keypoints[k].x;
+        s[1 + k * 4 + 1] = pose.keypoints[k].y;
+        s[1 + k * 4 + 2] = pose.keypoints[k].z;
+        s[1 + k * 4 + 3] = pose.keypoints[k].confidence;
+      }
+      ++slot;
+    }
+  }
+  outputs.count.value = static_cast<int>(m_instances.size());
 }
 
 void PoseDetector::runDetectorAsPose(
@@ -1658,6 +1949,46 @@ void PoseDetector::runYOLOPose(const QImage& src, const QTransform& M)
   }
 
   const float iw = src.width(), ih = src.height();
+
+  // Multi-instance: YOLO-pose is single-stage but already finds every person.
+  if(inputs.track_ids.value)
+  {
+    const int max_inst = std::clamp(
+        static_cast<int>(
+            std::lround(static_cast<float>(inputs.max_instances.value))),
+        1, 16);
+    if(static_cast<int>(poses.size()) > max_inst)
+      std::partial_sort(
+          poses.begin(), poses.begin() + max_inst, poses.end(),
+          [](const auto& a, const auto& b) { return a.confidence > b.confidence; });
+    const int np = std::min(static_cast<int>(poses.size()), max_inst);
+    m_instances.clear();
+    for(int pi = 0; pi < np; ++pi)
+    {
+      const auto& pp = poses[pi];
+      DetectedPose dp;
+      dp.keypoints.assign(17, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
+      for(const auto& kp : pp.keypoints)
+        if(kp.kp >= 0 && kp.kp < 17)
+        {
+          const QPointF p = M.map(QPointF(kp.x, kp.y));
+          dp.keypoints[kp.kp]
+              = {static_cast<float>(p.x() / iw), static_cast<float>(p.y() / ih),
+                 0.0f, 1.0f};
+        }
+      dp.mean_confidence = pp.confidence;
+      m_instances.push_back(std::move(dp));
+    }
+    std::swap(storage, t.storage);
+    if(m_instances.empty())
+    {
+      passthrough(src);
+      return;
+    }
+    emitInstances(PoseWorkflow::YOLOPose, /*do_track=*/true);
+    return;
+  }
+
   const auto& pose = poses[0];
   DetectedPose detected;
   detected.keypoints.assign(17, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
@@ -1741,6 +2072,50 @@ void PoseDetector::runRTMO(const QImage& src)
     return;
   }
 
+  // Multi-instance: RTMO is NMS-free and returns every person already.
+  if(inputs.track_ids.value)
+  {
+    const float iw = src.width(), ih = src.height();
+    const float thr = std::max(0.3f, static_cast<float>(inputs.min_confidence));
+    const int max_inst = std::clamp(
+        static_cast<int>(
+            std::lround(static_cast<float>(inputs.max_instances.value))),
+        1, 16);
+    std::vector<std::pair<float, int>> sel;
+    sel.reserve(N);
+    for(int i = 0; i < N; ++i)
+      if(dets[i * 5 + 4] > thr)
+        sel.push_back({dets[i * 5 + 4], i});
+    if(static_cast<int>(sel.size()) > max_inst)
+      std::partial_sort(
+          sel.begin(), sel.begin() + max_inst, sel.end(),
+          [](const auto& a, const auto& b) { return a.first > b.first; });
+    const int ns = std::min(static_cast<int>(sel.size()), max_inst);
+    m_instances.clear();
+    for(int si = 0; si < ns; ++si)
+    {
+      const int idx = sel[si].second;
+      DetectedPose dp;
+      dp.keypoints.reserve(K);
+      for(int k = 0; k < K; ++k)
+      {
+        const float* p = kpt + (static_cast<size_t>(idx) * K + k) * 3;
+        dp.keypoints.push_back(
+            {((p[0] - lb.pad_x) / lb.scale) / iw,
+             ((p[1] - lb.pad_y) / lb.scale) / ih, 0.0f, p[2]});
+      }
+      dp.mean_confidence = sel[si].first;
+      m_instances.push_back(std::move(dp));
+    }
+    if(m_instances.empty())
+    {
+      passthrough(src);
+      return;
+    }
+    emitInstances(PoseWorkflow::YOLOPose, /*do_track=*/true);
+    return;
+  }
+
   int best = -1;
   float bestc = std::max(0.3f, static_cast<float>(inputs.min_confidence));
   for(int i = 0; i < N; ++i)
@@ -1819,7 +2194,9 @@ try
     m_last_keypoints.clear();
     m_roi_smoother.reset();
     m_smoother.reset();
+    m_tracker.reset();
     m_lost_frames = 0;
+    m_frames_since_detect = 0;
   }
 
   if(!this->ctx)
@@ -1847,6 +2224,13 @@ try
   // --- Two-stage: detector + landmark ---
   if(have_det && role.stage == Onnx::ModelStage::Landmark)
   {
+    // Track IDs on -> multi-instance pipeline (all people, ids, per-id color).
+    if(inputs.track_ids.value)
+    {
+      runMultiInstance(role, draw, src);
+      return;
+    }
+
     const int mw = role.input_w > 0 ? role.input_w : 256;
     const int mh = role.input_h > 0 ? role.input_h : 256;
 

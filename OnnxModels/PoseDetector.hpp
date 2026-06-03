@@ -4,6 +4,7 @@
 #include <Onnx/helpers/Detection.hpp>
 #include <Onnx/helpers/ModelRole.hpp>
 #include <Onnx/helpers/OneEuro.hpp>
+#include <Onnx/helpers/PoseTracker.hpp>
 #include <Onnx/helpers/ROI.hpp>
 
 #include <halp/controls.hpp>
@@ -17,6 +18,7 @@
 
 class QImage;
 class QTransform;
+class QPainter;
 
 namespace Onnx
 {
@@ -38,8 +40,9 @@ struct DetectedPose
 {
   std::vector<PoseKeypoint> keypoints;
   float mean_confidence;
+  int track_id = -1; // persistent ID across frames (-1 = untracked)
 
-  halp_field_names(keypoints, mean_confidence);
+  halp_field_names(keypoints, mean_confidence, track_id);
 };
 
 // Available pose estimation workflows
@@ -146,6 +149,23 @@ public:
       halp_meta(description, "0 = responsive, 1 = very smooth");
     } smoothing_amount;
 
+    struct : halp::toggle<"Track IDs">
+    {
+      halp_meta(
+          description,
+          "Track every person/hand/face across frames and emit them all with a "
+          "persistent ID + stable per-ID color (ByteTrack: Kalman + two-stage + "
+          "OKS). Enables multi-instance output. Requires a Detection Model.");
+      bool value = false;
+    } track_ids;
+
+    struct : halp::hslider_f32<"Max Instances", halp::range{1., 16., 5.}>
+    {
+      halp_meta(
+          description,
+          "Max simultaneous tracked instances (top-K by score). Track IDs only.");
+    } max_instances;
+
   } inputs;
 
   struct
@@ -163,6 +183,27 @@ public:
       halp_meta(name, "Geometry");
       std::vector<float> value;
     } geometry;
+
+    // --- Multi-instance outputs (populated when Track IDs is on) ---
+    struct
+    {
+      halp_meta(name, "Poses");
+      std::vector<DetectedPose> value; // every tracked instance, each w/ track_id
+    } poses;
+
+    struct
+    {
+      halp_meta(name, "Poses Geometry");
+      // Fixed-stride, zero-padded: Max Instances slots, each = [track_id, then
+      // the same layout as Geometry]. count gives the number of live slots.
+      std::vector<float> value;
+    } poses_geometry;
+
+    struct
+    {
+      halp_meta(name, "Count");
+      int value{}; // number of live tracked instances this frame
+    } count;
   } outputs;
 
   PoseDetector() noexcept;
@@ -182,7 +223,23 @@ private:
   // (crop-pixels -> image-pixels), then map keypoints back through M.
   void runLandmark(
       const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
-      const QTransform& M);
+      const QTransform& M, int track_id = -1);
+
+  // Stage 2 core: run the landmark model on one crop and decode keypoints into
+  // `out` (image-normalized [0,1]); no smoothing/drawing/output. Returns the
+  // mean confidence, or -1 on decode failure. Shared by single + multi paths.
+  float landmarkKeypoints(
+      const Onnx::ModelRole& role, const QImage& src, const QTransform& M,
+      std::vector<PoseKeypoint>& out);
+
+  // --- Multi-instance back-end (Track IDs path) ---
+  // Run the detector (top-K) or per-track ROIs, landmark each, track, per-id
+  // smooth, draw all, and fill the poses / primary / geometry / count outputs.
+  void runMultiInstance(
+      const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src);
+  // Track m_instances, assign ids + per-id smoothed keypoints + colors, then
+  // draw all and publish every output port.
+  void emitInstances(PoseWorkflow draw, bool do_track);
 
   // Draw a detector's own keypoints/box directly (detector used standalone).
   void runDetectorAsPose(const Onnx::ModelRole& role, const QImage& src);
@@ -198,7 +255,16 @@ private:
 
   // Common visualization
   void drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow);
+  // Draw all of m_instances onto one output image (multi-instance path).
+  void drawAllSkeletons(PoseWorkflow workflow);
+  // Draw one pose's connections + points with an already-open painter.
+  void drawOnePose(
+      QPainter& p, const DetectedPose& pose, PoseWorkflow workflow, int w,
+      int h);
   void generateGeometryOutput(const DetectedPose& pose, PoseWorkflow workflow);
+  // Append one pose's flattened geometry (current Data Format) to `out`.
+  void appendGeometry(
+      std::vector<float>& out, const DetectedPose& pose, PoseWorkflow workflow);
   void passthrough(const QImage& src);
 
   // Temporal One-Euro smoothing of the detected keypoints (in place).
@@ -226,6 +292,9 @@ private:
   Onnx::ModelRole m_detector_role;
   Onnx::PoseSmoother m_smoother;
 
+  // Multi-instance persistent-ID tracker (ByteTrack-style; opt-in via Track IDs).
+  Onnx::Track::PoseTracker m_tracker;
+
   // Tracking-loop state (two-stage path)
   bool m_tracking{false};               // valid ROI carried from prev frame?
   Onnx::RectSmoother m_roi_smoother;    // temporal ROI stabilization
@@ -236,6 +305,13 @@ private:
 
   std::string m_last_model;
   std::string m_last_det_model;
+
+  // --- Cached scratch reused every frame (zero steady-state allocation) ---
+  std::vector<DetectedPose> m_instances;          // this frame's instances
+  std::vector<PoseKeypoint> m_kp_scratch;         // landmark decode -> keypoints
+  std::vector<Onnx::Track::Detection> m_track_in; // tracker input
+  std::vector<Onnx::Detection::Detection> m_dets; // detector output (top-K)
+  int m_frames_since_detect{0};                   // detector-cadence counter
 };
 
 } // namespace OnnxModels
