@@ -10,6 +10,7 @@
 #include <halp/controls.hpp>
 #include <halp/file_port.hpp>
 #include <halp/geometry.hpp>
+#include <halp/layout.hpp>
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
 
@@ -97,7 +98,7 @@ public:
   halp_meta(uuid, "f8e7d6c5-b4a3-4291-8c0d-1e2f3a4b5c6d");
   halp_meta(manual_url, "https://ossia.io/score-docs/processes/ai-recognition.html")
 
-  struct
+  struct ins
   {
     halp::texture_input<"In"> image;
     ModelPort<"Model"> model;
@@ -159,12 +160,20 @@ public:
       bool value = false;
     } track_ids;
 
-    struct : halp::hslider_f32<"Max Instances", halp::range{1., 16., 5.}>
+    struct : halp::spinbox_i32<"Max Instances", halp::range{1, 16, 5}>
     {
       halp_meta(
           description,
           "Max simultaneous tracked instances (top-K by score). Track IDs only.");
     } max_instances;
+
+    struct : halp::spinbox_i32<"Detector Cadence", halp::range{1, 30, 4}>
+    {
+      halp_meta(
+          description,
+          "Track ROI: re-run the detector every N frames; reuse per-track ROIs "
+          "in between (1 = detect every frame). Track IDs + Track ROI only.");
+    } detector_cadence;
 
   } inputs;
 
@@ -206,6 +215,51 @@ public:
     } count;
   } outputs;
 
+  // Inspector layout: group the controls into meaningful tabs.
+  struct ui
+  {
+    halp_meta(name, "Pose Detector")
+    halp_meta(layout, halp::layouts::tabs)
+    halp_meta(background, halp::colors::background_mid)
+
+    struct
+    {
+      halp_meta(name, "Models")
+      halp_meta(layout, halp::layouts::vbox)
+      halp::item<&ins::model> model;
+      halp::item<&ins::det_model> det_model;
+      halp::item<&ins::workflow> workflow;
+    } models_tab;
+
+    struct
+    {
+      halp_meta(name, "Output")
+      halp_meta(layout, halp::layouts::vbox)
+      halp::item<&ins::min_confidence> min_confidence;
+      halp::item<&ins::output_mode> output_mode;
+      halp::item<&ins::draw_skeleton> draw_skeleton;
+      halp::item<&ins::data_format> data_format;
+    } output_tab;
+
+    struct
+    {
+      halp_meta(name, "Tracking")
+      halp_meta(layout, halp::layouts::vbox)
+      halp::item<&ins::track_ids> track_ids;
+      halp::item<&ins::max_instances> max_instances;
+      halp::item<&ins::track_roi> track_roi;
+      halp::item<&ins::detector_cadence> detector_cadence;
+    } tracking_tab;
+
+    struct
+    {
+      halp_meta(name, "Smoothing")
+      halp_meta(layout, halp::layouts::vbox)
+      halp::item<&ins::smoothing> smoothing;
+      halp::item<&ins::smoothing_amount> smoothing_amount;
+    } smoothing_tab;
+  };
+
   PoseDetector() noexcept;
   ~PoseDetector();
 
@@ -237,6 +291,11 @@ private:
   // smooth, draw all, and fill the poses / primary / geometry / count outputs.
   void runMultiInstance(
       const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src);
+  // Landmark every ROI into m_instances, batching all crops into one inference
+  // when the model's batch dim allows it (else one inference per crop).
+  void runLandmarkBatch(
+      const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
+      const std::vector<Onnx::ROI::Rect>& rois);
   // Track m_instances, assign ids + per-id smoothed keypoints + colors, then
   // draw all and publish every output port.
   void emitInstances(PoseWorkflow draw, bool do_track);
@@ -311,6 +370,10 @@ private:
   std::vector<PoseKeypoint> m_kp_scratch;         // landmark decode -> keypoints
   std::vector<Onnx::Track::Detection> m_track_in; // tracker input
   std::vector<Onnx::Detection::Detection> m_dets; // detector output (top-K)
+  std::vector<Onnx::ROI::Rect> m_rois;            // ROIs to landmark this frame
+  boost::container::vector<float> m_batch_storage; // packed [N,C,H,W] input
+  boost::container::vector<float> m_tmp_storage;   // per-crop build scratch
+  std::vector<int64_t> m_bbox;                     // batched SimCC [N,2] bbox
   int m_frames_since_detect{0};                   // detector-cadence counter
 };
 
