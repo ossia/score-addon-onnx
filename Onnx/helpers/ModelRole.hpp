@@ -22,6 +22,7 @@ enum class ModelDomain : uint8_t
   Body,
   Hand,
   Face,
+  Animal,
 };
 
 // Concrete model family, derived from input/output signature.
@@ -34,6 +35,8 @@ enum class ModelKind : uint8_t
   PalmDetector,      // NHWC, anchors, 7 kpts (coords 18)
   BlazeFaceDetector, // NHWC, anchors, 6 kpts (coords 16)
   PersonDetector,    // YOLOX / RTMDet end2end (dets[1,N,5] + labels[1,N])
+  MultiClassDetector, // PINTO [N,7] batchno,classid,score,xyxy (Gold-YOLO etc.)
+  YoloxDetector,      // raw YOLOX/COCO grid [1,A,5+C] (person/animal classes)
 
   // Stage-2 landmark / pose
   BlazePoseLandmark, // NHWC 256, output 124/155/195
@@ -221,6 +224,15 @@ inline ModelRole classify(const ModelIO& spec)
           ModelKind::RtmoPose, ModelStage::SingleStage, ModelDomain::Body, nk);
   }
 
+  // --- A1b) PINTO multi-class end2end detector: one [N,7] output ------------
+  // (batchno, classid, score, x1,y1,x2,y2 — col order varies, read by name).
+  // Used as a body/person detector (class 0). Covers Gold-YOLO / YOLOX-Body-*
+  // / YOLOv9-Wholebody / DEIM-Wholebody families.
+  if(num_outputs == 1 && outs[0].rank == 2 && outs[0].last == 7)
+    return setKind(
+        ModelKind::MultiClassDetector, ModelStage::Detector,
+        ModelDomain::Body, 0);
+
   // --- A2) End2end person/object detector: dets [1,N,5] + labels [1,N] ------
   {
     bool has_dets = false, has_labels = false;
@@ -279,7 +291,13 @@ inline ModelRole classify(const ModelIO& spec)
         nk = static_cast<int>(o.port->shape[1]);
         break;
       }
-    ModelDomain dom = (nk == 21) ? ModelDomain::Hand : ModelDomain::Body;
+    // 21 -> hand; a SQUARE 17-kpt SimCC (256x256) is RTMPose-Animal (AP10K),
+    // whereas human body RTMPose is 256x192; otherwise body (17/26/133).
+    ModelDomain dom = ModelDomain::Body;
+    if(nk == 21)
+      dom = ModelDomain::Hand;
+    else if(nk == 17 && W > 0 && W == H)
+      dom = ModelDomain::Animal;
     return setKind(ModelKind::SimccPose, ModelStage::Landmark, dom, nk);
   }
 
@@ -326,6 +344,14 @@ inline ModelRole classify(const ModelIO& spec)
             ModelKind::YoloPose, ModelStage::SingleStage, ModelDomain::Body,
             nk);
     }
+    // Not a pose head: a big-grid [1,A,5+C] is a raw YOLOX object detector
+    // (e.g. COCO 85 = 4+1+80). Used as a person/animal detector.
+    const int A = static_cast<int>(s[1]), F = static_cast<int>(s[2]);
+    const int grid = std::max(A, F), feat = std::min(A, F);
+    if(grid >= 1000 && feat >= 6 && feat <= 100)
+      return setKind(
+          ModelKind::YoloxDetector, ModelStage::Detector, ModelDomain::Unknown,
+          0);
   }
 
   // --- G) Fallbacks by input resolution ------------------------------------

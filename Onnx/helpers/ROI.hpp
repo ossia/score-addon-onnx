@@ -45,11 +45,20 @@ inline MediapipeParams handParams()
       .kp_start = 0, .kp_end = 2, .target_angle_deg = 90.0f, .scale = 2.6f,
       .shift_y = -0.5f, .alignment_points = false};
 }
-// face_detection -> face_landmark ROI
+// face_detection -> face_landmark ROI (FaceMesh: a bit of margin around the box)
 inline MediapipeParams faceParams()
 {
   return MediapipeParams{
       .kp_start = 0, .kp_end = 1, .target_angle_deg = 0.0f, .scale = 1.5f,
+      .alignment_points = false};
+}
+// face_detection -> MobileFaceNet (dlib-68) ROI. MobileFaceNet is trained on a
+// TIGHT aligned face crop, so a loose 1.5x ROI makes its landmarks overshoot/
+// offset the real face. Keep the crop close to the detection box.
+inline MediapipeParams mobileFaceParams()
+{
+  return MediapipeParams{
+      .kp_start = 0, .kp_end = 1, .target_angle_deg = 0.0f, .scale = 1.1f,
       .alignment_points = false};
 }
 

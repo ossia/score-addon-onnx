@@ -53,6 +53,7 @@ enum class PoseWorkflow
   RTMPose_Whole, // RTMPose WholeBody (133 keypoints, NCHW, SimCC)
   ViTPose,       // ViTPose (17 keypoints, NCHW, heatmaps)
   YOLOPose,      // YOLO Pose (17 keypoints, NCHW, direct output)
+  AnimalPose,    // AP10K/APT36K quadruped (17 keypoints, RTMPose/ViTPose)
 
   // Hand
   MediaPipeHands, // MediaPipe Hands (21 keypoints, NHWC, direct landmarks)
@@ -98,12 +99,6 @@ public:
     halp::texture_input<"In"> image;
     ModelPort<"Model"> model;
 
-    // Optional stage-1 detector. When set (and the main model is a landmark
-    // model), the detector locates the ROI on the full frame, the frame is
-    // warp-cropped, and the main model runs inside the crop. Leave empty for
-    // single-stage / whole-frame inference.
-    ModelPort<"Detection Model"> det_model;
-
     struct : halp::combobox_t<"Workflow", PoseWorkflow>
     {
       halp_meta(description, "Pose estimation model type");
@@ -127,13 +122,17 @@ public:
       halp_meta(description, "Output data format for GPU rendering");
     } data_format;
 
+
+    ModelPort<"Detection Model"> det_model;
+
     struct : halp::toggle<"Track ROI">
     {
       halp_meta(
           description,
           "Two-stage only: derive the ROI from the previous frame's landmarks "
-          "and skip the detector (faster + far steadier, like MediaPipe)");
-      bool value = true;
+          "and skip the detector (faster + steadier, like MediaPipe). "
+          "Experimental — feedback can drift on some models; off by default.");
+      bool value = false;
     } track_roi;
 
     struct : halp::toggle<"Smoothing">
@@ -147,10 +146,6 @@ public:
       halp_meta(description, "0 = responsive, 1 = very smooth");
     } smoothing_amount;
 
-    struct : halp::toggle<"Async">
-    {
-      halp_meta(description, "Run inference asynchronously");
-    } async;
   } inputs;
 
   struct
@@ -179,8 +174,9 @@ private:
   // --- Two-stage building blocks ---
   // Stage 1: run the detector on the full frame, return detections in
   // image-normalized [0,1] coordinates (letterbox removed).
-  std::vector<Onnx::Detection::Detection>
-  runDetector(const Onnx::ModelRole& role, const QImage& src);
+  std::vector<Onnx::Detection::Detection> runDetector(
+      const Onnx::ModelRole& role, const QImage& src,
+      Onnx::ModelDomain target = Onnx::ModelDomain::Body);
 
   // Stage 2: run the landmark/pose model on the crop defined by M
   // (crop-pixels -> image-pixels), then map keypoints back through M.
@@ -235,6 +231,8 @@ private:
   Onnx::RectSmoother m_roi_smoother;    // temporal ROI stabilization
   std::vector<PoseKeypoint> m_last_keypoints; // image-normalized, prev frame
   int m_lost_frames{0};                 // consecutive frames without a pose
+  Onnx::ROI::Rect m_prev_roi{};         // last smoothed ROI (plausibility check)
+  bool m_have_prev_roi{false};
 
   std::string m_last_model;
   std::string m_last_det_model;
