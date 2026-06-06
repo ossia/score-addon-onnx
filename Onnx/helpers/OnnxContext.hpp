@@ -290,19 +290,26 @@ struct OnnxRunContext
   {
     try
     {
+      // Counts MUST come from the caller-provided spans, not the model's full
+      // declared name lists: callers pass fixed-size stack arrays sized to the
+      // outputs they actually read. Using the full declared count would make ORT
+      // write/read past those arrays for a model with more I/O than expected.
       session.Run(
           Ort::RunOptions{nullptr},
           spec.input_names_char.data(),
           input_tensors.data(),
-          spec.input_names_char.size(),
+          input_tensors.size(),
           spec.output_names_char.data(),
           output_values.data(),
-          spec.output_names_char.size());
+          output_values.size());
     }
     catch (const Ort::Exception& exception)
     {
+      // Per-frame failure (bad/odd output shape on a frame, ORT hiccup): log and
+      // rethrow so the node's operator() catch skips this frame. NEVER exit() —
+      // that would kill the whole host process on a single transient throw.
       qDebug() << "ERROR running model inference: " << exception.what();
-      exit(-1);
+      throw;
     }
   }
 };

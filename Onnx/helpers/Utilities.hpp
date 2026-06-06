@@ -12,9 +12,9 @@
 namespace Onnx
 {
 
-static int calculate_product(const std::vector<std::int64_t>& v)
+inline std::int64_t calculate_product(const std::vector<std::int64_t>& v)
 {
-  int total = 1;
+  std::int64_t total = 1;
   for (auto& i : v)
     total *= i;
   return total;
