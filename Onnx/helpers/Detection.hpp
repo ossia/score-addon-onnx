@@ -22,7 +22,8 @@ struct Detection
 {
   float xc{}, yc{}, w{}, h{};       // center-form, normalized [0,1] in model square
   float score{};                    // [0,1]
-  int class_id{};                   // detector class (0 for single-class/SSD)
+  int class_id{-1};                 // detector class id; -1 = none/unknown
+                                    // (SSD/single-class leave it; multi-class set it)
   std::vector<QPointF> keypoints;   // alignment keypoints, normalized [0,1]
 
   QRectF box() const noexcept
@@ -342,20 +343,27 @@ inline std::vector<Detection> decodeYoloxGrid(
 {
   const float* d = nullptr;
   int A = 0, F = 0;
+  int64_t total = 0;
   for(auto& o : outputs)
   {
     if(!o.IsTensor())
       continue;
-    auto sh = o.GetTensorTypeAndShapeInfo().GetShape();
+    auto info = o.GetTensorTypeAndShapeInfo();
+    auto sh = info.GetShape();
     if(sh.size() == 3)
     {
       A = static_cast<int>(sh[1]);
       F = static_cast<int>(sh[2]);
+      total = static_cast<int64_t>(info.GetElementCount());
       d = o.GetTensorData<float>();
     }
   }
   if(!d || F < 6)
     return {};
+  // Clamp the anchor count to what the buffer actually holds (a dynamic/negative
+  // A, or a declared A*F larger than the real element count, would over-read).
+  if(A < 0 || static_cast<int64_t>(A) * F > total)
+    A = static_cast<int>(total / F);
   const int C = F - 5;
 
   std::vector<Detection> dets;

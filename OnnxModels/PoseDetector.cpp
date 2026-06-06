@@ -158,7 +158,6 @@ static const QColor right_arm{255, 0, 255}; // Magenta
 static const QColor left_leg{0, 255, 0};    // Green
 static const QColor right_leg{255, 128, 0}; // Orange
 static const QColor face{200, 200, 255};    // Light blue
-static const QColor hand{255, 200, 100};    // Light orange
 } // namespace Colors
 
 PoseDetector::PoseDetector() noexcept
@@ -301,6 +300,13 @@ static QColor getTrackColor(int id)
       static_cast<float>(hue), 0.85f, 1.0f);
 }
 
+// NaN/Inf-robust finiteness check. Uses ossia's bit-pattern variants because
+// std::isnan/isinf are compiled away under -ffast-math / -ffinite-math-only.
+static inline bool finitef(float v) noexcept
+{
+  return !ossia::safe_isnan(v) && !ossia::safe_isinf(v);
+}
+
 // Fill pose.box (top-left normalized form) from the confident keypoints' bbox,
 // unless it is already set (box-only detections set it from the detector).
 static void fillBoxFromKeypoints(DetectedPose& pose)
@@ -433,13 +439,18 @@ void PoseDetector::drawOnePose(
         // FaceMesh has too many points for skeleton lines, just draw contours
         // Draw face oval, eyes, lips as closed contours
         {
-          auto drawContour = [&](const auto& indices, QColor color) {
+          // `closed` contours (oval/eyes/lips) wrap the last point back to the
+          // first; open ones (eyebrows) stop at the last segment.
+          auto drawContour = [&](const auto& indices, QColor color, bool closed) {
             color.setAlphaF(0.8f);
             p.setPen(QPen(color, 1));
-            for(size_t i = 0; i + 1 < indices.size(); ++i)
+            const size_t n = indices.size();
+            for(size_t i = 0; i < n; ++i)
             {
+              if(!closed && i + 1 >= n)
+                break;
               int from = indices[i];
-              int to = indices[i + 1];
+              int to = indices[(i + 1) % n];
               if(from < 0 || to < 0)
                 continue;
               if(from >= num_kps || to >= num_kps)
@@ -448,12 +459,12 @@ void PoseDetector::drawOnePose(
             }
           };
           auto cc = [&](QColor base) { return use_track_color ? track_color : base; };
-          drawContour(Onnx::FaceMesh::FaceContours::face_oval, cc(QColor(200, 200, 255)));
-          drawContour(Onnx::FaceMesh::FaceContours::left_eye, cc(QColor(0, 255, 255)));
-          drawContour(Onnx::FaceMesh::FaceContours::right_eye, cc(QColor(0, 255, 255)));
-          drawContour(Onnx::FaceMesh::FaceContours::lips_outer, cc(QColor(255, 100, 100)));
-          drawContour(Onnx::FaceMesh::FaceContours::left_eyebrow, cc(QColor(255, 255, 0)));
-          drawContour(Onnx::FaceMesh::FaceContours::right_eyebrow, cc(QColor(255, 255, 0)));
+          drawContour(Onnx::FaceMesh::FaceContours::face_oval, cc(QColor(200, 200, 255)), true);
+          drawContour(Onnx::FaceMesh::FaceContours::left_eye, cc(QColor(0, 255, 255)), true);
+          drawContour(Onnx::FaceMesh::FaceContours::right_eye, cc(QColor(0, 255, 255)), true);
+          drawContour(Onnx::FaceMesh::FaceContours::lips_outer, cc(QColor(255, 100, 100)), true);
+          drawContour(Onnx::FaceMesh::FaceContours::left_eyebrow, cc(QColor(255, 255, 0)), false);
+          drawContour(Onnx::FaceMesh::FaceContours::right_eyebrow, cc(QColor(255, 255, 0)), false);
         }
         break;
       case PoseWorkflow::MobileFaceNet:
@@ -759,18 +770,24 @@ void PoseDetector::appendGeometry(
 
         case PoseWorkflow::FaceMesh:
         {
-          // FaceMesh uses contour indices, generate lines from contours
-          auto addContour = [&](const auto& indices)
+          // FaceMesh uses contour indices, generate lines from contours.
+          // Closed contours (oval/eyes/lips) wrap back to the first point.
+          auto addContour = [&](const auto& indices, bool closed)
           {
-            for (size_t i = 0; i + 1 < indices.size(); ++i)
-              addLine(indices[i], indices[i + 1]);
+            const size_t n = indices.size();
+            for (size_t i = 0; i < n; ++i)
+            {
+              if (!closed && i + 1 >= n)
+                break;
+              addLine(indices[i], indices[(i + 1) % n]);
+            }
           };
-          addContour(Onnx::FaceMesh::FaceContours::face_oval);
-          addContour(Onnx::FaceMesh::FaceContours::left_eye);
-          addContour(Onnx::FaceMesh::FaceContours::right_eye);
-          addContour(Onnx::FaceMesh::FaceContours::lips_outer);
-          addContour(Onnx::FaceMesh::FaceContours::left_eyebrow);
-          addContour(Onnx::FaceMesh::FaceContours::right_eyebrow);
+          addContour(Onnx::FaceMesh::FaceContours::face_oval, true);
+          addContour(Onnx::FaceMesh::FaceContours::left_eye, true);
+          addContour(Onnx::FaceMesh::FaceContours::right_eye, true);
+          addContour(Onnx::FaceMesh::FaceContours::lips_outer, true);
+          addContour(Onnx::FaceMesh::FaceContours::left_eyebrow, false);
+          addContour(Onnx::FaceMesh::FaceContours::right_eyebrow, false);
           break;
         }
 
@@ -874,9 +891,13 @@ Onnx::FloatTensor nhwcDetectorTensor(
       dst[di++] = (row[4 * x + 2] / 255.f) * a + b;
     }
   }
+  // One image; force batch to 1 so the tensor element count matches `storage`.
+  std::vector<std::int64_t> shape = port.shape;
+  if(!shape.empty())
+    shape[0] = 1;
   Onnx::FloatTensor f{
       .storage = {},
-      .value = Onnx::vec_to_tensor<float>(storage, port.shape)};
+      .value = Onnx::vec_to_tensor<float>(storage, shape)};
   f.storage = std::move(storage);
   return f;
 }
@@ -908,9 +929,13 @@ Onnx::FloatTensor nchwBgrDetectorTensor(
       r_plane[p] = (R - mean_bgr[2]) / std_bgr[2];
     }
   }
+  // One image; force batch to 1 so the tensor element count matches `storage`.
+  std::vector<std::int64_t> shape = port.shape;
+  if(!shape.empty())
+    shape[0] = 1;
   Onnx::FloatTensor f{
       .storage = {},
-      .value = Onnx::vec_to_tensor<float>(storage, port.shape)};
+      .value = Onnx::vec_to_tensor<float>(storage, shape)};
   f.storage = std::move(storage);
   return f;
 }
@@ -1589,12 +1614,19 @@ void decodeLandmark(
     {
       if(!outspan.empty())
       {
-        auto shape = outspan[0].GetTensorTypeAndShapeInfo().GetShape();
+        auto info = outspan[0].GetTensorTypeAndShapeInfo();
+        auto shape = info.GetShape();
         if(shape.size() == 4)
         {
-          const int K = static_cast<int>(shape[1]);
           const int hh = static_cast<int>(shape[2]);
           const int hw = static_cast<int>(shape[3]);
+          // hw==0 would divide by zero (max_idx % hw); a declared K larger than
+          // the real buffer would over-read -> clamp to actual element count.
+          if(hh <= 0 || hw <= 0)
+            break;
+          const int64_t total = static_cast<int64_t>(info.GetElementCount());
+          const int K = static_cast<int>(std::min<int64_t>(
+              shape[1] > 0 ? shape[1] : 0, total / (static_cast<int64_t>(hh) * hw)));
           const float* hmaps = outspan[0].GetTensorData<float>();
           kps.reserve(K);
           for(int k = 0; k < K; ++k)
@@ -1883,7 +1915,16 @@ void PoseDetector::runLandmarkBatch(
       auto info = outs[j].GetTensorTypeAndShapeInfo();
       auto shp = info.GetShape();
       const size_t total = info.GetElementCount();
-      const bool batched = !shp.empty() && shp[0] == N;
+      // Treat as batched only if the model's DECLARED leading dim is the batch
+      // axis (dynamic, or == N), it resolved to N, and the buffer divides evenly.
+      // This avoids mis-slicing an output whose fixed leading dim coincidentally
+      // equals the instance count (e.g. a constant [num_keypoints, ...]).
+      const int64_t decl0
+          = (j < spec.outputs.size() && !spec.outputs[j].shape.empty())
+                ? spec.outputs[j].shape[0]
+                : -1;
+      const bool batched = !shp.empty() && shp[0] == N && (decl0 <= 0 || decl0 == N)
+                           && (total % static_cast<size_t>(N)) == 0;
       const size_t per = batched ? total / static_cast<size_t>(N) : total;
       if(batched)
         shp[0] = 1;
@@ -2051,16 +2092,27 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
     {
       Onnx::Track::Detection td;
       // Tracker box (center form) from the pose bbox; keypoints (if any) feed
-      // the OKS cue, otherwise the tracker leans on IoU + Re-ID.
-      if(pose.box.w > 0.f && pose.box.h > 0.f)
-        td.box = {pose.box.x + pose.box.w * 0.5f, pose.box.y + pose.box.h * 0.5f,
-                  pose.box.w, pose.box.h};
+      // the OKS cue, otherwise the tracker leans on IoU + Re-ID. A non-finite
+      // box (a NaN model coordinate reaching here) would poison the Kalman state
+      // permanently, so neutralize it: degenerate box + zero score (won't birth
+      // or match). Index alignment with m_instances must be preserved, so we
+      // sanitize rather than skip.
+      const auto& pb = pose.box;
+      const bool box_ok = finitef(pb.x) && finitef(pb.y) && finitef(pb.w)
+                          && finitef(pb.h) && pb.w > 0.f && pb.h > 0.f;
+      if(box_ok)
+        td.box = {pb.x + pb.w * 0.5f, pb.y + pb.h * 0.5f, pb.w, pb.h};
       else
         td.box = {0.5f, 0.5f, 1e-3f, 1e-3f};
-      td.score = pose.mean_confidence;
+      td.score = box_ok ? pose.mean_confidence : 0.f;
       td.keypoints.reserve(pose.keypoints.size());
       for(const auto& k : pose.keypoints)
-        td.keypoints.push_back({k.x, k.y, k.z, k.confidence});
+      {
+        if(finitef(k.x) && finitef(k.y))
+          td.keypoints.push_back({k.x, k.y, k.z, k.confidence});
+        else // neutralize a NaN keypoint without breaking OKS's equal-size need
+          td.keypoints.push_back({td.box.cx, td.box.cy, 0.f, 0.f});
+      }
       m_track_in.push_back(std::move(td));
     }
 
@@ -2131,7 +2183,12 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
   pg.clear();
   if(!m_instances.empty())
   {
-    const int nkpt = static_cast<int>(m_instances[0].keypoints.size());
+    // Stride from the MAX keypoint count across instances so a mixed-K frame
+    // (e.g. body + hand) never truncates the richer instances; shorter ones
+    // zero-pad. (Today all instances share K, but don't bake that in.)
+    int nkpt = 0;
+    for(const auto& p : m_instances)
+      nkpt = std::max(nkpt, static_cast<int>(p.keypoints.size()));
     const int stride = HEADER + nkpt * 4;
     pg.assign(static_cast<size_t>(max_inst) * stride, 0.f);
     int slot = 0;

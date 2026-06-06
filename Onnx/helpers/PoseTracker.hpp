@@ -144,7 +144,8 @@ public:
 
   void predict(State& mean, Cov& cov) const
   {
-    const float h = mean(3);
+    const float h = std::max(1e-3f, mean(3)); // floor: a 0/neg/NaN height would
+                                              // make R/Q singular -> inverse NaN
     State s;
     s << _spw * h, _spw * h, 1e-2f, _spw * h, _svw * h, _svw * h, 1e-5f,
         _svw * h;
@@ -155,7 +156,8 @@ public:
 
   void update(State& mean, Cov& cov, const Meas& m) const
   {
-    const float h = mean(3);
+    const float h = std::max(1e-3f, mean(3)); // floor: a 0/neg/NaN height would
+                                              // make R/Q singular -> inverse NaN
     Meas s;
     s << _spw * h, _spw * h, 1e-1f, _spw * h;
     const Eigen::Matrix4f R = (s.array() * s.array()).matrix().asDiagonal();
@@ -173,7 +175,8 @@ public:
   // gate naturally permit larger jumps after longer occlusions.
   float gatingDistance(const State& mean, const Cov& cov, const Meas& m) const
   {
-    const float h = mean(3);
+    const float h = std::max(1e-3f, mean(3)); // floor: a 0/neg/NaN height would
+                                              // make R/Q singular -> inverse NaN
     Meas s;
     s << _spw * h, _spw * h, 1e-1f, _spw * h;
     const Eigen::Matrix4f R = (s.array() * s.array()).matrix().asDiagonal();

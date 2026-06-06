@@ -34,7 +34,12 @@ inline FloatTensor nchw_tensorFromARGB(
     std::array<float, 3> mean,
     std::array<float, 3> std)
 {
-  auto& input_shape = port.shape;
+  // One image: force the batch dim to 1. The model's declared shape may carry a
+  // dynamic (-1) or >1 batch, which would make the tensor's element count differ
+  // from the single-image buffer we fill below (ORT OOB read / create failure).
+  std::vector<std::int64_t> input_shape = port.shape;
+  if(!input_shape.empty())
+    input_shape[0] = 1;
   QImage img
       = QImage(source_bits, source_w, source_h, QImage::Format_RGBA8888);
   img = std::move(img).scaled(
@@ -90,7 +95,12 @@ inline FloatTensor nchw_tensorFromRGBA(
     std::array<float, 3> mean,
     std::array<float, 3> std)
 {
-  auto& input_shape = port.shape;
+  // One image: force the batch dim to 1. The model's declared shape may carry a
+  // dynamic (-1) or >1 batch, which would make the tensor's element count differ
+  // from the single-image buffer we fill below (ORT OOB read / create failure).
+  std::vector<std::int64_t> input_shape = port.shape;
+  if(!input_shape.empty())
+    input_shape[0] = 1;
   QImage img
       = QImage(source_bits, source_w, source_h, QImage::Format_RGBA8888);
   img = img.scaled(
@@ -144,7 +154,12 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
     int model_h,
     boost::container::vector<float>& input_tensor_values)
 {
-  auto& input_shape = port.shape;
+  // One image: force the batch dim to 1. The model's declared shape may carry a
+  // dynamic (-1) or >1 batch, which would make the tensor's element count differ
+  // from the single-image buffer we fill below (ORT OOB read / create failure).
+  std::vector<std::int64_t> input_shape = port.shape;
+  if(!input_shape.empty())
+    input_shape[0] = 1;
   QImage img
       = QImage(source_bits, source_w, source_h, QImage::Format_RGBA8888);
   img = img.scaled(

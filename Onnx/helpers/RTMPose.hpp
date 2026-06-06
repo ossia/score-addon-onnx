@@ -233,8 +233,13 @@ inline bool processOutput(
     // Coordinates are in pixel space relative to model input
     const float* data = outputs[0].GetTensorData<float>();
 
-    keypoints.resize(config.num_keypoints);
-    for(int k = 0; k < config.num_keypoints; ++k)
+    // Trust the actual element count, not the declared K: a dynamic-dim model
+    // can resolve to fewer floats than the shape implied -> clamp before reading.
+    const int64_t n = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
+    const int K = static_cast<int>(
+        std::min<int64_t>(config.num_keypoints, n / 3));
+    keypoints.resize(K);
+    for(int k = 0; k < K; ++k)
     {
       // x, y are in pixel coordinates, normalize to [0, 1]
       float x = data[k * 3 + 0] / config.input_width;
@@ -255,10 +260,21 @@ inline bool processOutput(
     const float* simcc_x = outputs[0].GetTensorData<float>();
     const float* simcc_y = outputs[1].GetTensorData<float>();
 
+    // Clamp the keypoint count to what each buffer actually holds: the x/y
+    // tensors can have a different (dynamic) K than detectConfig inferred, so
+    // reading num_keypoints*bins from the smaller buffer would run off the end.
+    const int64_t nx = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
+    const int64_t ny = outputs[1].GetTensorTypeAndShapeInfo().GetElementCount();
+    int nk = config.num_keypoints;
+    if(config.simcc_bins_x > 0)
+      nk = static_cast<int>(std::min<int64_t>(nk, nx / config.simcc_bins_x));
+    if(config.simcc_bins_y > 0)
+      nk = static_cast<int>(std::min<int64_t>(nk, ny / config.simcc_bins_y));
+
     keypoints = SimCC::decode(
         simcc_x,
         simcc_y,
-        config.num_keypoints,
+        nk,
         config.simcc_bins_x,
         config.simcc_bins_y,
         config.input_width,
@@ -266,14 +282,15 @@ inline bool processOutput(
         config.split_ratio);
   }
 
-  // Calculate mean confidence
+  // Calculate mean confidence (compute before the move below).
   float sum_conf = 0.0f;
   for(const auto& kp : keypoints)
     sum_conf += kp.confidence;
+  const float mean_conf
+      = keypoints.empty() ? 0.f : sum_conf / static_cast<float>(keypoints.size());
 
   result = PoseResult{
-      .keypoints = std::move(keypoints),
-      .mean_confidence = sum_conf / config.num_keypoints};
+      .keypoints = std::move(keypoints), .mean_confidence = mean_conf};
 
   return true;
 }
