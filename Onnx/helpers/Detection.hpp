@@ -22,6 +22,7 @@ struct Detection
 {
   float xc{}, yc{}, w{}, h{};       // center-form, normalized [0,1] in model square
   float score{};                    // [0,1]
+  int class_id{};                   // detector class (0 for single-class/SSD)
   std::vector<QPointF> keypoints;   // alignment keypoints, normalized [0,1]
 
   QRectF box() const noexcept
@@ -267,6 +268,7 @@ inline std::vector<Detection> decodeEnd2End(
                 y2 = d[3] * inv;
     Detection det;
     det.score = score;
+    det.class_id = lbl;
     det.xc = (x1 + x2) * 0.5f;
     det.yc = (y1 + y2) * 0.5f;
     det.w = x2 - x1;
@@ -318,6 +320,7 @@ inline std::vector<Detection> decodeMultiClass(
                 x2 = r[c_x1 + 2] * iw, y2 = r[c_x1 + 3] * ih;
     Detection det;
     det.score = score;
+    det.class_id = static_cast<int>(r[1] + 0.5f);
     det.xc = (x1 + x2) * 0.5f;
     det.yc = (y1 + y2) * 0.5f;
     det.w = x2 - x1;
@@ -384,6 +387,7 @@ inline std::vector<Detection> decodeYoloxGrid(
         const float w = std::exp(r[2]) * s, h = std::exp(r[3]) * s;
         Detection det;
         det.score = score;
+        det.class_id = bc;
         det.xc = cx / in_w;
         det.yc = cy / in_h;
         det.w = w / in_w;

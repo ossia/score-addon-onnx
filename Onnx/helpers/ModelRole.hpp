@@ -49,6 +49,9 @@ enum class ModelKind : uint8_t
   // Single-stage
   YoloPose, // 640, single output width 5+K*3
   RtmoPose, // 640, dets[1,N,5] + keypoints[1,N,K,3] (NMS-free)
+
+  // Appearance ReID (loaded in its own port; one image in, one feature vector out)
+  ReidEmbedder,
 };
 
 struct ModelRole
@@ -292,12 +295,16 @@ inline ModelRole classify(const ModelIO& spec)
         break;
       }
     // 21 -> hand; a SQUARE 17-kpt SimCC (256x256) is RTMPose-Animal (AP10K),
-    // whereas human body RTMPose is 256x192; otherwise body (17/26/133).
+    // whereas human body RTMPose is 256x192. A SQUARE SimCC with a face-landmark
+    // count (RTMPose-Face is 106 = LaPa; also 68/98) is a face model. Otherwise
+    // body (17/26/133).
     ModelDomain dom = ModelDomain::Body;
     if(nk == 21)
       dom = ModelDomain::Hand;
     else if(nk == 17 && W > 0 && W == H)
       dom = ModelDomain::Animal;
+    else if(W > 0 && W == H && (nk == 106 || nk == 98 || nk == 68))
+      dom = ModelDomain::Face;
     return setKind(ModelKind::SimccPose, ModelStage::Landmark, dom, nk);
   }
 
@@ -375,6 +382,86 @@ inline ModelRole classify(const ModelIO& spec)
           ModelDomain::Body, 33);
   }
   return r; // Unknown
+}
+
+// --- Generic ReID / appearance-embedding model --------------------------------
+// One image input -> one feature vector. Geometry (layout, size, embed dim,
+// batchability) is read from the ONNX shapes here; channel order + normalization
+// are NOT inferable from the graph and are chosen by a separate preprocessing
+// control (see PoseDetector's "Re-ID Preprocess"). Pair-comparison exports
+// (two image inputs, or a "similarit*" output) are rejected.
+struct ReidSpec
+{
+  bool valid = false;
+  bool nhwc = false;
+  int in_w = 0, in_h = 0;
+  int embed_dim = 0;      // flattened non-batch size of the feature output
+  int out_index = 0;      // which output is the feature vector
+  bool batchable = false; // input batch dim dynamic (or unspecified)
+};
+
+inline ReidSpec classifyReid(const ModelIO& spec)
+{
+  ReidSpec rs;
+  if(spec.inputs.empty() || spec.outputs.empty())
+    return rs;
+
+  // Exactly one image-like input (reject base+target pair-comparison variants).
+  int image_inputs = 0, img_idx = -1;
+  for(int i = 0; i < static_cast<int>(spec.inputs.size()); ++i)
+  {
+    const auto& s = spec.inputs[i].shape;
+    if(s.size() == 4 && (s[1] == 3 || s[3] == 3))
+    {
+      ++image_inputs;
+      if(img_idx < 0)
+        img_idx = i;
+    }
+  }
+  if(image_inputs != 1)
+    return rs;
+
+  const auto& in = spec.inputs[img_idx].shape;
+  if(in[3] == 3)
+  {
+    rs.nhwc = true;
+    rs.in_h = static_cast<int>(in[1]);
+    rs.in_w = static_cast<int>(in[2]);
+  }
+  else
+  {
+    rs.nhwc = false;
+    rs.in_h = static_cast<int>(in[2]);
+    rs.in_w = static_cast<int>(in[3]);
+  }
+  rs.batchable = (in[0] <= 0);
+
+  // Pick the feature output: largest non-batch flatten in a plausible embed
+  // range. Any "similarit*" output marks a pair-comparison model -> reject.
+  int best_idx = -1;
+  int64_t best_dim = 0;
+  for(int i = 0; i < static_cast<int>(spec.outputs.size()); ++i)
+  {
+    const auto& o = spec.outputs[i];
+    if(detail::nameContains(o.name, "similar"))
+      return rs;
+    int64_t d = 1;
+    for(size_t k = 1; k < o.shape.size(); ++k)
+      if(o.shape[k] > 0)
+        d *= o.shape[k];
+    if(o.shape.size() >= 2 && d >= 32 && d <= 8192 && d > best_dim)
+    {
+      best_dim = d;
+      best_idx = i;
+    }
+  }
+  if(best_idx < 0)
+    return rs;
+
+  rs.out_index = best_idx;
+  rs.embed_dim = static_cast<int>(best_dim);
+  rs.valid = (rs.in_w > 0 && rs.in_h > 0);
+  return rs;
 }
 
 } // namespace Onnx
