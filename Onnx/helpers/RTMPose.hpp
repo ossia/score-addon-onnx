@@ -98,6 +98,12 @@ inline std::vector<Keypoint> decode(
     int input_height,
     float split_ratio = 2.0f)
 {
+  // Degenerate shapes (e.g. a dynamic dim that didn't resolve) must not allocate
+  // a huge/negative vector or index out of bounds.
+  if(num_keypoints <= 0 || num_keypoints > 1024 || bins_x <= 0 || bins_y <= 0
+     || input_width <= 0 || input_height <= 0)
+    return {};
+
   std::vector<Keypoint> keypoints(num_keypoints);
 
   for(int k = 0; k < num_keypoints; ++k)
@@ -217,6 +223,9 @@ inline bool processOutput(
     return false;
 
   std::vector<Keypoint> keypoints;
+
+  if(config.num_keypoints <= 0 || config.num_keypoints > 1024)
+    return false;
 
   if(format == OutputFormat::PostProcessed)
   {

@@ -37,13 +37,22 @@ struct PoseKeypoint
   halp_field_names(x, y, z, confidence);
 };
 
+// Axis-aligned bounding box, normalized [0,1], top-left form.
+struct BoundingBox
+{
+  float x{}, y{}, w{}, h{};
+  halp_field_names(x, y, w, h);
+};
+
 struct DetectedPose
 {
-  std::vector<PoseKeypoint> keypoints;
+  std::vector<PoseKeypoint> keypoints; // empty for box-only detections
   float mean_confidence;
   int track_id = -1; // persistent ID across frames (-1 = untracked)
+  BoundingBox box;   // always filled: detector box, or the keypoint bbox
+  int class_id = -1; // detector class (-1 = n/a, e.g. landmark-only output)
 
-  halp_field_names(keypoints, mean_confidence, track_id);
+  halp_field_names(keypoints, mean_confidence, track_id, box, class_id);
 };
 
 // Available pose estimation workflows
@@ -66,7 +75,22 @@ enum class PoseWorkflow
   FaceMesh,      // MediaPipe FaceMesh (468 keypoints, NHWC, direct landmarks)
   BlazeFace,     // BlazeFace detection (6 keypoints, NHWC, anchor-based)
   MobileFaceNet, // MobileFaceNet (68 dlib landmarks, NCHW)
+  RTMPoseFace,   // RTMPose-Face (106 LaPa landmarks, NCHW square, SimCC)
 
+  // Detection-only
+  BoxDetection,  // Bounding boxes from the Detection Model (no landmark stage)
+};
+
+// ReID input preprocessing (the part not inferable from the ONNX graph).
+// Auto picks by input size: 112->ArcFace, 128->RawBGR, else ImageNet-RGB.
+enum class ReidPreprocess : uint8_t
+{
+  Auto,
+  ImageNetRGB,  // (x/255 - mean)/std, RGB  (OSNet, FastReID)
+  RawBGR,       // x in [0,255], BGR        (OpenVINO person/face-reid)
+  RawRGB,       // x in [0,255], RGB
+  ZeroOneRGB,   // x/255, RGB
+  ArcFaceRGB,   // (x-127.5)/128, RGB       (ArcFace)
 };
 
 // Output visualization mode
@@ -94,14 +118,15 @@ public:
   halp_meta(author, "MediaPipe, MMPose, ONNX Runtime");
   halp_meta(
       description,
-      "Unified keypoint detection for body pose, hands, and face landmarks");
+      "Unified keypoint detection for body pose, hands, and face landmarks, "
+      "plus bounding-box object detection and multi-object tracking");
   halp_meta(uuid, "f8e7d6c5-b4a3-4291-8c0d-1e2f3a4b5c6d");
   halp_meta(manual_url, "https://ossia.io/score-docs/processes/ai-recognition.html")
 
   struct ins
   {
     halp::texture_input<"In"> image;
-    ModelPort<"Model"> model;
+    ModelPort<"Landmark Model"> model;
 
     struct : halp::combobox_t<"Workflow", PoseWorkflow>
     {
@@ -175,6 +200,94 @@ public:
           "in between (1 = detect every frame). Track IDs + Track ROI only.");
     } detector_cadence;
 
+    ModelPort<"Re-ID Model"> reid_model;
+
+    struct : halp::toggle<"Re-ID">
+    {
+      halp_meta(
+          description,
+          "Blend an appearance embedding (any ReID model in the Re-ID Model "
+          "port) into tracking so IDs survive long occlusion / re-entry. "
+          "Track IDs only.");
+      bool value = false;
+    } reid;
+
+    struct : halp::hslider_f32<"Re-ID Weight", halp::range{0., 1., 0.25}>
+    {
+      halp_meta(description, "How strongly appearance influences association.");
+    } reid_weight;
+
+    struct : halp::enum_t<ReidPreprocess, "Re-ID Preprocess">
+    {
+      halp_meta(
+          description,
+          "Input normalization for the Re-ID model (not inferable from the "
+          "graph). Auto guesses from input size.");
+    } reid_preprocess;
+
+    // Appended after reid_preprocess to keep existing presets' port indices
+    // (1..17) stable; these two are 18 and 19.
+    struct : halp::toggle<"Draw Boxes">
+    {
+      halp_meta(
+          description,
+          "Draw each instance's bounding box (always on in Box Detection).");
+      bool value = false;
+    } draw_boxes;
+
+    struct : halp::spinbox_i32<"Detection Class", halp::range{-1, 90, -1}>
+    {
+      halp_meta(
+          description,
+          "Box Detection: keep only this class id (-1 = all). Multi-class "
+          "detectors only (COCO ids); ignored by single-class detectors.");
+    } detection_class;
+
+    struct : halp::toggle<"Draw Landmarks">
+    {
+      halp_meta(
+          description,
+          "Draw the keypoint dots (independent of the skeleton lines).");
+      bool value = true;
+    } draw_landmarks;
+
+    // --- Tracking plausibility gates (anti-jitter; Track IDs only) ---
+    struct : halp::combobox_t<"Motion Gate", Onnx::Track::MotionGate>
+    {
+      halp_meta(
+          description,
+          "Reject an id->detection match that is an implausible jump: None, "
+          "MaxSpeed (an id can't cross the frame in one step), or Mahalanobis "
+          "(Kalman gating distance, gap-aware). An appearance/ReID match can "
+          "still re-acquire across the gate.");
+    } motion_gate;
+
+    struct : halp::hslider_f32<"Max Speed", halp::range{0.25, 6., 2.}>
+    {
+      halp_meta(
+          description,
+          "MaxSpeed gate budget: max per-frame center move, in units of the "
+          "track's box size (scaled by how long it was lost). Lower = stricter.");
+    } max_speed;
+
+    struct : halp::toggle<"Birth Gate">
+    {
+      halp_meta(
+          description,
+          "Suppress spurious new ids whose box sits mostly inside an existing "
+          "tracked person (e.g. a raised arm read as a second person).");
+      bool value = false;
+    } birth_gate;
+
+    struct : halp::toggle<"Strict Confirmation">
+    {
+      halp_meta(
+          description,
+          "Delete a tentative id the first frame it fails to re-appear "
+          "(DeepSORT n_init), so a one-frame detection never persists.");
+      bool value = false;
+    } strict_confirm;
+
   } inputs;
 
   struct
@@ -229,6 +342,7 @@ public:
       halp::item<&ins::model> model;
       halp::item<&ins::det_model> det_model;
       halp::item<&ins::workflow> workflow;
+      halp::item<&ins::detection_class> detection_class;
     } models_tab;
 
     struct
@@ -238,6 +352,8 @@ public:
       halp::item<&ins::min_confidence> min_confidence;
       halp::item<&ins::output_mode> output_mode;
       halp::item<&ins::draw_skeleton> draw_skeleton;
+      halp::item<&ins::draw_landmarks> draw_landmarks;
+      halp::item<&ins::draw_boxes> draw_boxes;
       halp::item<&ins::data_format> data_format;
     } output_tab;
 
@@ -249,7 +365,21 @@ public:
       halp::item<&ins::max_instances> max_instances;
       halp::item<&ins::track_roi> track_roi;
       halp::item<&ins::detector_cadence> detector_cadence;
+      halp::item<&ins::motion_gate> motion_gate;
+      halp::item<&ins::max_speed> max_speed;
+      halp::item<&ins::birth_gate> birth_gate;
+      halp::item<&ins::strict_confirm> strict_confirm;
     } tracking_tab;
+
+    struct
+    {
+      halp_meta(name, "Re-ID")
+      halp_meta(layout, halp::layouts::vbox)
+      halp::item<&ins::reid_model> reid_model;
+      halp::item<&ins::reid> reid;
+      halp::item<&ins::reid_weight> reid_weight;
+      halp::item<&ins::reid_preprocess> reid_preprocess;
+    } reid_tab;
 
     struct
     {
@@ -269,9 +399,11 @@ private:
   // --- Two-stage building blocks ---
   // Stage 1: run the detector on the full frame, return detections in
   // image-normalized [0,1] coordinates (letterbox removed).
+  // keep_class: -2 = use the target-domain default class filter (person/animal),
+  // -1 = keep all classes, >=0 = keep only that class id.
   std::vector<Onnx::Detection::Detection> runDetector(
       const Onnx::ModelRole& role, const QImage& src,
-      Onnx::ModelDomain target = Onnx::ModelDomain::Body);
+      Onnx::ModelDomain target = Onnx::ModelDomain::Body, int keep_class = -2);
 
   // Stage 2: run the landmark/pose model on the crop defined by M
   // (crop-pixels -> image-pixels), then map keypoints back through M.
@@ -299,6 +431,9 @@ private:
   // Track m_instances, assign ids + per-id smoothed keypoints + colors, then
   // draw all and publish every output port.
   void emitInstances(PoseWorkflow draw, bool do_track);
+  // Crop each entry of m_track_in, run the Re-ID model (batched if it allows),
+  // and write an L2-normalized embedding into each m_track_in[i].embedding.
+  void embedInstances();
 
   // Draw a detector's own keypoints/box directly (detector used standalone).
   void runDetectorAsPose(const Onnx::ModelRole& role, const QImage& src);
@@ -308,6 +443,10 @@ private:
 
   // Single-stage RTMO on the full frame (dets + keypoints, NMS-free).
   void runRTMO(const QImage& src);
+
+  // Detection-only: run the Detection Model, emit boxes as keypoint-less poses
+  // (optionally tracked). Drawn as rectangles; box lives in each pose's metadata.
+  void runBoxDetection(const Onnx::ModelRole& detRole, const QImage& src);
 
   // Map a manual workflow selection onto a concrete model role.
   Onnx::ModelRole roleForWorkflow(PoseWorkflow w) const;
@@ -342,6 +481,7 @@ private:
 
   std::unique_ptr<Onnx::OnnxRunContext> ctx;     // main / landmark model
   std::unique_ptr<Onnx::OnnxRunContext> det_ctx; // optional stage-1 detector
+  std::unique_ptr<Onnx::OnnxRunContext> reid_ctx; // optional appearance ReID
   boost::container::vector<float> storage;
   boost::container::vector<float> det_storage;
 
@@ -362,8 +502,13 @@ private:
   Onnx::ROI::Rect m_prev_roi{};         // last smoothed ROI (plausibility check)
   bool m_have_prev_roi{false};
 
+  Onnx::ReidSpec m_reid_spec;
+  boost::container::vector<float> m_reid_batch; // packed [N,3,H,W] reid input
+  boost::container::vector<float> m_reid_tmp;   // per-crop reid build scratch
+
   std::string m_last_model;
   std::string m_last_det_model;
+  std::string m_last_reid_model;
 
   // --- Cached scratch reused every frame (zero steady-state allocation) ---
   std::vector<DetectedPose> m_instances;          // this frame's instances
