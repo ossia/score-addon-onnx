@@ -276,6 +276,7 @@ target_sources(score_addon_onnx_models
     Onnx/helpers/ModelSpec.hpp
     Onnx/helpers/OnnxBase.hpp
     Onnx/helpers/OnnxContext.hpp
+    Onnx/helpers/Profile.hpp
     Onnx/helpers/BlazeFace.hpp
     Onnx/helpers/FaceMesh.hpp
     Onnx/helpers/MediaPipeHands.hpp
@@ -313,4 +314,11 @@ if(NOT WIN32)
       ocos_operators
       onnxruntime_extensions
   )
+endif()
+
+# Per-frame pose pipeline profiler (readspec/warp/resize/tensorbuild/infer
+# breakdown to stderr). Off by default; enable with -DSCORE_ONNX_PROFILE=ON.
+option(SCORE_ONNX_PROFILE "Profile the ONNX pose pipeline per frame" OFF)
+if(SCORE_ONNX_PROFILE)
+  target_compile_definitions(score_addon_onnx_models PRIVATE ONNX_PROFILE)
 endif()
