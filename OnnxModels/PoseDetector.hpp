@@ -517,14 +517,8 @@ private:
   std::vector<Onnx::Detection::Detection> m_dets; // detector output (top-K)
   std::vector<Onnx::ROI::Rect> m_rois;            // ROIs to landmark this frame
   boost::container::vector<float> m_batch_storage; // packed [N,C,H,W] input
-  boost::container::vector<float> m_tmp_storage;   // per-crop build scratch
   std::vector<int64_t> m_bbox;                     // batched SimCC [N,2] bbox
   int m_frames_since_detect{0};                   // detector-cadence counter
-
-  // Reused RGBA scratch for warped crops / letterboxed detector input (model
-  // sized, tight stride = w*4). Avoids per-frame allocation.
-  std::vector<uint8_t> m_crop_rgba;
-  std::vector<uint8_t> m_det_rgba;
 };
 
 } // namespace OnnxModels

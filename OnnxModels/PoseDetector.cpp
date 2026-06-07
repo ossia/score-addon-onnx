@@ -896,90 +896,53 @@ Onnx::FloatTensor finalizeTensor(
   return f;
 }
 
-// NHWC float tensor from a model-sized RGBA buffer (stride bytes/row): out =
-// px*a + b ([0,1]: a=1,b=0 ; [-1,1]: a=2,b=-1).
-Onnx::FloatTensor nhwcDetectorTensor(
-    Onnx::ModelSpec::Port& port, const uint8_t* ptr, int stride, int mw, int mh,
-    boost::container::vector<float>& storage, float a, float b)
+// Normalization + layout for the fused samplers: out = (channel - mean)*invstd.
+struct NormSpec
 {
-  ONNX_PROF_SCOPE(TensorBuild);
-  storage.resize(3 * mw * mh, boost::container::default_init);
-  float* dst = storage.data();
-  int di = 0;
-  for(int y = 0; y < mh; ++y)
-  {
-    const uint8_t* row = ptr + static_cast<size_t>(y) * stride;
-    for(int x = 0; x < mw; ++x)
-    {
-      dst[di++] = (row[4 * x + 0] / 255.f) * a + b;
-      dst[di++] = (row[4 * x + 1] / 255.f) * a + b;
-      dst[di++] = (row[4 * x + 2] / 255.f) * a + b;
-    }
-  }
+  Onnx::TensorLayout layout{Onnx::TensorLayout::NchwRgb};
+  std::array<float, 3> mean{0, 0, 0};
+  std::array<float, 3> invstd{1, 1, 1};
+};
+
+inline NormSpec normMeanStd(
+    Onnx::TensorLayout layout, std::array<float, 3> mean, std::array<float, 3> std)
+{
+  return {layout, mean, {1.f / std[0], 1.f / std[1], 1.f / std[2]}};
+}
+// out = (px/255)*a + b  <=>  (px - mean)/std  with std = 255/a, mean = -b*std.
+inline NormSpec normAB(Onnx::TensorLayout layout, float a, float b)
+{
+  const float s = 255.f / a;
+  return normMeanStd(layout, {-b * s, -b * s, -b * s}, {s, s, s});
+}
+
+// Fused: sample src through M (output px -> src px), normalize per `ns`, into a
+// reused float buffer, then finalize to an Ort tensor (batch forced to 1). No
+// intermediate RGBA buffer, no second normalize pass.
+Onnx::FloatTensor fusedAffineTensor(
+    Onnx::ModelSpec::Port& port, const Onnx::ImageView& src,
+    const Onnx::Affine& M, int mw, int mh, const NormSpec& ns,
+    boost::container::vector<float>& storage)
+{
+  storage.resize(static_cast<size_t>(3) * mw * mh, boost::container::default_init);
+  Onnx::sampleAffineToTensor(
+      ns.layout, src, M, mw, mh, ns.mean.data(), ns.invstd.data(), storage.data());
   return finalizeTensor(port, storage);
 }
 
-// NCHW float tensor, BGR plane order (YOLOX/RTMDet/RTMO). mean/std in BGR;
-// out = (px - mean)/std.
-Onnx::FloatTensor nchwBgrDetectorTensor(
-    Onnx::ModelSpec::Port& port, const uint8_t* ptr, int stride, int mw, int mh,
-    boost::container::vector<float>& storage, std::array<float, 3> mean_bgr,
-    std::array<float, 3> std_bgr)
+// Fused: aspect-preserving letterbox + normalize into a reused buffer, finalize.
+Onnx::FloatTensor fusedLetterboxTensor(
+    Onnx::ModelSpec::Port& port, const Onnx::ImageView& src, int mw, int mh,
+    bool center, const NormSpec& ns, boost::container::vector<float>& storage,
+    Onnx::LetterboxInfo& lb_out)
 {
-  ONNX_PROF_SCOPE(TensorBuild);
-  storage.resize(3 * mw * mh, boost::container::default_init);
-  float* b_plane = storage.data();
-  float* g_plane = b_plane + mw * mh;
-  float* r_plane = g_plane + mw * mh;
-  int p = 0;
-  for(int y = 0; y < mh; ++y)
-  {
-    const uint8_t* row = ptr + static_cast<size_t>(y) * stride;
-    for(int x = 0; x < mw; ++x, ++p)
-    {
-      const float R = row[4 * x + 0], G = row[4 * x + 1], B = row[4 * x + 2];
-      b_plane[p] = (B - mean_bgr[0]) / std_bgr[0];
-      g_plane[p] = (G - mean_bgr[1]) / std_bgr[1];
-      r_plane[p] = (R - mean_bgr[2]) / std_bgr[2];
-    }
-  }
+  storage.resize(static_cast<size_t>(3) * mw * mh, boost::container::default_init);
+  lb_out = Onnx::letterboxToTensor(
+      ns.layout, src, mw, mh, center, /*pad=*/0, ns.mean.data(),
+      ns.invstd.data(), storage.data());
   return finalizeTensor(port, storage);
 }
 
-// NCHW float tensor, RGB plane order (landmark models). mean/std in RGB.
-Onnx::FloatTensor nchwRgbDetectorTensor(
-    Onnx::ModelSpec::Port& port, const uint8_t* ptr, int stride, int mw, int mh,
-    boost::container::vector<float>& storage, std::array<float, 3> mean_rgb,
-    std::array<float, 3> std_rgb)
-{
-  ONNX_PROF_SCOPE(TensorBuild);
-  storage.resize(3 * mw * mh, boost::container::default_init);
-  float* r_plane = storage.data();
-  float* g_plane = r_plane + mw * mh;
-  float* b_plane = g_plane + mw * mh;
-  int p = 0;
-  for(int y = 0; y < mh; ++y)
-  {
-    const uint8_t* row = ptr + static_cast<size_t>(y) * stride;
-    for(int x = 0; x < mw; ++x, ++p)
-    {
-      r_plane[p] = (row[4 * x + 0] - mean_rgb[0]) / std_rgb[0];
-      g_plane[p] = (row[4 * x + 1] - mean_rgb[1]) / std_rgb[1];
-      b_plane[p] = (row[4 * x + 2] - mean_rgb[2]) / std_rgb[2];
-    }
-  }
-  return finalizeTensor(port, storage);
-}
-
-// Letterbox src into a reused tight RGBA buffer (w*h*4). Returns scale + pad.
-Onnx::LetterboxInfo letterboxInto(
-    const Onnx::ImageView& src, int w, int h, bool center,
-    std::vector<uint8_t>& buf)
-{
-  buf.resize(static_cast<size_t>(w) * h * 4);
-  Onnx::MutableImageView dst{buf.data(), w, h, 4, w * 4};
-  return Onnx::letterbox(src, dst, 0, center);
-}
 } // namespace
 
 Onnx::ModelRole PoseDetector::roleForWorkflow(PoseWorkflow w) const
@@ -1345,7 +1308,6 @@ PoseDetector::runDetector(
   // letterbox, dets+labels output. ---
   if(role.kind == Onnx::ModelKind::PersonDetector)
   {
-    auto lb = letterboxInto(src, model, model, /*center=*/false, m_det_rgba);
     // Heuristic: small input (<=320) -> RTMDet (mean/std); else YOLOX (raw).
     std::array<float, 3> mean_bgr{0, 0, 0}, std_bgr{1, 1, 1};
     if(model <= 320)
@@ -1353,10 +1315,13 @@ PoseDetector::runDetector(
       mean_bgr = {103.53f, 116.28f, 123.675f};
       std_bgr = {57.375f, 57.12f, 58.395f};
     }
+    Onnx::LetterboxInfo lb;
     Ort::Value input_value{nullptr};
     {
-      auto t = nchwBgrDetectorTensor(
-          spec.inputs[0], m_det_rgba.data(), model * 4, model, model, det_storage, mean_bgr, std_bgr);
+      auto t = fusedLetterboxTensor(
+          spec.inputs[0], src, model, model, /*center=*/false,
+          normMeanStd(Onnx::TensorLayout::NchwBgr, mean_bgr, std_bgr),
+          det_storage, lb);
       input_value = std::move(t.value);
       std::swap(det_storage, t.storage);
     }
@@ -1381,11 +1346,13 @@ PoseDetector::runDetector(
   {
     const int mw = model;
     const int mh = role.input_h > 0 ? role.input_h : model;
-    auto lb = letterboxInto(src, mw, mh, /*center=*/false, m_det_rgba);
+    Onnx::LetterboxInfo lb;
     Ort::Value input_value{nullptr};
     {
-      auto t = nchwBgrDetectorTensor(
-          spec.inputs[0], m_det_rgba.data(), mw * 4, mw, mh, det_storage, {0, 0, 0}, {1, 1, 1});
+      auto t = fusedLetterboxTensor(
+          spec.inputs[0], src, mw, mh, /*center=*/false,
+          normMeanStd(Onnx::TensorLayout::NchwBgr, {0, 0, 0}, {1, 1, 1}),
+          det_storage, lb);
       input_value = std::move(t.value);
       std::swap(det_storage, t.storage);
     }
@@ -1423,13 +1390,14 @@ PoseDetector::runDetector(
     if(target == Onnx::ModelDomain::Animal) { cls_lo = 14; cls_hi = 23; }
     if(keep_class == -1) { cls_lo = 0; cls_hi = 100000; }      // all classes
     else if(keep_class >= 0) { cls_lo = cls_hi = keep_class; } // one class
-    auto lb = letterboxInto(src, mw, mh, /*center=*/false, m_det_rgba);
+    Onnx::LetterboxInfo lb;
     Ort::Value input_value{nullptr};
     {
       // This PINTO YOLOX-COCO export wants BGR [0,1] (raw 0-255 gives garbage).
-      auto t = nchwBgrDetectorTensor(
-          spec.inputs[0], m_det_rgba.data(), mw * 4, mw, mh, det_storage, {0, 0, 0},
-          {255.f, 255.f, 255.f});
+      auto t = fusedLetterboxTensor(
+          spec.inputs[0], src, mw, mh, /*center=*/false,
+          normMeanStd(Onnx::TensorLayout::NchwBgr, {0, 0, 0}, {255.f, 255.f, 255.f}),
+          det_storage, lb);
       input_value = std::move(t.value);
       std::swap(det_storage, t.storage);
     }
@@ -1489,29 +1457,18 @@ PoseDetector::runDetector(
     }
   params.input_size = model;
 
-  auto lb = letterboxInto(src, model, model, /*center=*/true, m_det_rgba);
-
+  Onnx::LetterboxInfo lb;
   Ort::Value input_value{nullptr};
   {
-    // Detectors are usually NHWC, but some PINTO exports are NCHW.
-    if(role.nhwc)
-    {
-      auto t = nhwcDetectorTensor(
-          spec.inputs[0], m_det_rgba.data(), model * 4, model, model, det_storage, a, b);
-      input_value = std::move(t.value);
-      std::swap(det_storage, t.storage);
-    }
-    else
-    {
-      // out = px/255*a + b  <=>  (px - mean)/std with std=255/a, mean=-b*std
-      const float std_v = 255.f / a;
-      const float mean_v = -b * std_v;
-      auto t = nchwRgbDetectorTensor(
-          spec.inputs[0], m_det_rgba.data(), model * 4, model, model,
-          det_storage, {mean_v, mean_v, mean_v}, {std_v, std_v, std_v});
-      input_value = std::move(t.value);
-      std::swap(det_storage, t.storage);
-    }
+    // Detectors are usually NHWC, but some PINTO exports are NCHW. Both want
+    // out = (px/255)*a + b; only the layout differs.
+    const auto layout
+        = role.nhwc ? Onnx::TensorLayout::NhwcRgb : Onnx::TensorLayout::NchwRgb;
+    auto t = fusedLetterboxTensor(
+        spec.inputs[0], src, model, model, /*center=*/true, normAB(layout, a, b),
+        det_storage, lb);
+    input_value = std::move(t.value);
+    std::swap(det_storage, t.storage);
   }
 
   Ort::Value ins[1] = {std::move(input_value)};
@@ -1536,29 +1493,25 @@ struct LandmarkKp
   float x, y, z, conf;
 };
 
-// Build the landmark input tensor from a model-sized RGBA buffer (stride
-// bytes/row), choosing layout + normalization by role.
-Onnx::FloatTensor makeLandmarkInput(
-    const Onnx::ModelRole& role, Onnx::ModelSpec::Port& port,
-    const uint8_t* rgba, int stride, int mw, int mh,
-    boost::container::vector<float>& scratch)
+// Layout + normalization for a landmark model's input crop (used by the fused
+// sampler to write the model input directly, no intermediate RGBA buffer).
+NormSpec landmarkNorm(const Onnx::ModelRole& role)
 {
   if(role.nhwc)
-    return nhwcDetectorTensor(port, rgba, stride, mw, mh, scratch, 1.f, 0.f);
+    return normAB(Onnx::TensorLayout::NhwcRgb, 1.f, 0.f);
   if(role.kind == Onnx::ModelKind::MobileFaceNet)
-    return nchwRgbDetectorTensor(
-        port, rgba, stride, mw, mh, scratch,
+    return normMeanStd(
+        Onnx::TensorLayout::NchwRgb,
         {0.485f * 255.f, 0.456f * 255.f, 0.406f * 255.f},
         {0.229f * 255.f, 0.224f * 255.f, 0.225f * 255.f});
   if(role.kind == Onnx::ModelKind::FaceMeshLandmark
      || role.kind == Onnx::ModelKind::HandLandmark
      || role.kind == Onnx::ModelKind::BlazePoseLandmark)
     // MediaPipe landmark models want [0,1] regardless of layout.
-    return nchwRgbDetectorTensor(
-        port, rgba, stride, mw, mh, scratch, {0.f, 0.f, 0.f},
-        {255.f, 255.f, 255.f});
-  return nchwRgbDetectorTensor(
-      port, rgba, stride, mw, mh, scratch, {123.675f, 116.28f, 103.53f},
+    return normMeanStd(
+        Onnx::TensorLayout::NchwRgb, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f});
+  return normMeanStd(
+      Onnx::TensorLayout::NchwRgb, {123.675f, 116.28f, 103.53f},
       {58.395f, 57.12f, 57.375f});
 }
 
@@ -1757,11 +1710,8 @@ float PoseDetector::landmarkKeypoints(
     }
   }
 
-  m_crop_rgba.resize(static_cast<size_t>(mw) * mh * 4);
-  Onnx::MutableImageView crop{m_crop_rgba.data(), mw, mh, 4, mw * 4};
-  Onnx::ROI::warpCrop(src, M, crop);
-  Onnx::FloatTensor t = makeLandmarkInput(
-      role, spec.inputs[0], m_crop_rgba.data(), mw * 4, mw, mh, storage);
+  Onnx::FloatTensor t = fusedAffineTensor(
+      spec.inputs[0], src, M, mw, mh, landmarkNorm(role), storage);
 
   Ort::Value outs[5]{
       Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
@@ -1889,18 +1839,14 @@ void PoseDetector::runLandmarkBatch(
   const int CHW = 3 * mw * mh;
   m_batch_storage.resize(
       static_cast<size_t>(N) * CHW, boost::container::default_init);
+  const NormSpec ns = landmarkNorm(role);
   for(int b = 0; b < N; ++b)
   {
     const Onnx::Affine M = Onnx::ROI::rectToAffine(rois[b], mw, mh);
-    m_crop_rgba.resize(static_cast<size_t>(mw) * mh * 4);
-    Onnx::MutableImageView crop{m_crop_rgba.data(), mw, mh, 4, mw * 4};
-    Onnx::ROI::warpCrop(src, M, crop);
-    Onnx::FloatTensor ft = makeLandmarkInput(
-        role, spec.inputs[0], m_crop_rgba.data(), mw * 4, mw, mh, m_tmp_storage);
-    std::memcpy(
-        m_batch_storage.data() + static_cast<size_t>(b) * CHW,
-        ft.storage.data(), static_cast<size_t>(CHW) * sizeof(float));
-    std::swap(m_tmp_storage, ft.storage); // reclaim capacity for next crop
+    // Sample+normalize the crop straight into its [N,C,H,W] slice.
+    Onnx::sampleAffineToTensor(
+        ns.layout, src, M, mw, mh, ns.mean.data(), ns.invstd.data(),
+        m_batch_storage.data() + static_cast<size_t>(b) * CHW);
   }
 
   std::vector<int64_t> in_shape = spec.inputs[0].shape;
@@ -2304,26 +2250,20 @@ void PoseDetector::embedInstances()
       break;
   }
 
-  // One model-sized RGBA crop -> normalized floats (NCHW RGB/BGR, or NHWC RGB).
-  auto buildInput = [&](const uint8_t* rgba, int stride,
-                        boost::container::vector<float>& scr)
-      -> Onnx::FloatTensor {
-    if(m_reid_spec.nhwc)
-      return nhwcDetectorTensor(spec.inputs[0], rgba, stride, mw, mh, scr, 1.f, 0.f);
-    if(bgr)
-      return nchwBgrDetectorTensor(spec.inputs[0], rgba, stride, mw, mh, scr, mean, stdv);
-    return nchwRgbDetectorTensor(spec.inputs[0], rgba, stride, mw, mh, scr, mean, stdv);
-  };
+  // Layout + normalization for the reid model input (NCHW RGB/BGR or NHWC RGB).
+  const NormSpec rns = m_reid_spec.nhwc
+      ? normAB(Onnx::TensorLayout::NhwcRgb, 1.f, 0.f)
+      : normMeanStd(
+          bgr ? Onnx::TensorLayout::NchwBgr : Onnx::TensorLayout::NchwRgb, mean,
+          stdv);
 
-  // Warp track i's box into m_crop_rgba (model-sized, tight RGBA).
-  auto cropFor = [&](int i) {
+  // Affine mapping track i's (padded) box -> model-crop pixels.
+  auto affineFor = [&](int i) -> Onnx::Affine {
     const auto& b = m_track_in[i].box; // normalized center form
     const Onnx::Rect box_px{
         (b.cx - b.w * 0.5f) * W, (b.cy - b.h * 0.5f) * H, b.w * W, b.h * H};
     const Onnx::ROI::Rect r = Onnx::ROI::topdownRect(box_px, mw, mh, 1.1f);
-    m_crop_rgba.resize(static_cast<size_t>(mw) * mh * 4);
-    Onnx::MutableImageView crop{m_crop_rgba.data(), mw, mh, 4, mw * 4};
-    Onnx::ROI::warpCrop(src, Onnx::ROI::rectToAffine(r, mw, mh), crop);
+    return Onnx::ROI::rectToAffine(r, mw, mh);
   };
 
   auto storeRow = [&](int i, const float* row) {
@@ -2341,14 +2281,9 @@ void PoseDetector::embedInstances()
     const int CHW = 3 * mw * mh;
     m_reid_batch.resize(static_cast<size_t>(N) * CHW, boost::container::default_init);
     for(int i = 0; i < N; ++i)
-    {
-      cropFor(i);
-      Onnx::FloatTensor ft = buildInput(m_crop_rgba.data(), mw * 4, m_reid_tmp);
-      std::memcpy(
-          m_reid_batch.data() + static_cast<size_t>(i) * CHW, ft.storage.data(),
-          static_cast<size_t>(CHW) * sizeof(float));
-      std::swap(m_reid_tmp, ft.storage);
-    }
+      Onnx::sampleAffineToTensor(
+          rns.layout, src, affineFor(i), mw, mh, rns.mean.data(),
+          rns.invstd.data(), m_reid_batch.data() + static_cast<size_t>(i) * CHW);
     std::vector<int64_t> in_shape = spec.inputs[0].shape;
     if(in_shape.size() == 4) in_shape[0] = N;
     else in_shape = {N, 3, mh, mw};
@@ -2370,8 +2305,8 @@ void PoseDetector::embedInstances()
   {
     for(int i = 0; i < N; ++i)
     {
-      cropFor(i);
-      Onnx::FloatTensor ft = buildInput(m_crop_rgba.data(), mw * 4, m_reid_tmp);
+      Onnx::FloatTensor ft = fusedAffineTensor(
+          spec.inputs[0], src, affineFor(i), mw, mh, rns, m_reid_tmp);
       Ort::Value outs[4]{
           Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
           Ort::Value{nullptr}};
@@ -2429,12 +2364,10 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
 
   // Cover-resize the whole frame through M (model px -> image px), the same
   // affine the keypoint mapback below uses, so input and output geometry agree.
-  m_det_rgba.resize(static_cast<size_t>(model_size) * model_size * 4);
-  Onnx::MutableImageView dst{m_det_rgba.data(), model_size, model_size, 4, 0};
-  Onnx::ROI::warpCrop(src, M, dst);
-  auto t = nchwRgbDetectorTensor(
-      spec.inputs[0], m_det_rgba.data(), model_size * 4, model_size, model_size,
-      storage, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f});
+  auto t = fusedAffineTensor(
+      spec.inputs[0], src, M, model_size, model_size,
+      normMeanStd(Onnx::TensorLayout::NchwRgb, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f}),
+      storage);
 
   Ort::Value ins[1] = {std::move(t.value)};
   Ort::Value outs[1]{Ort::Value{nullptr}};
@@ -2529,14 +2462,14 @@ void PoseDetector::runRTMO(const Onnx::ImageView& src)
   if(spec.inputs[0].shape.size() == 4 && spec.inputs[0].shape[3] > 0)
     model = static_cast<int>(spec.inputs[0].shape[3]);
 
-  auto lb = letterboxInto(src, model, model, /*center=*/false, m_det_rgba);
-
+  Onnx::LetterboxInfo lb;
   Ort::Value input_value{nullptr};
   {
     // RTMO: raw BGR, no normalization (like YOLOX).
-    auto t = nchwBgrDetectorTensor(
-        spec.inputs[0], m_det_rgba.data(), model * 4, model, model, storage,
-        {0, 0, 0}, {1, 1, 1});
+    auto t = fusedLetterboxTensor(
+        spec.inputs[0], src, model, model, /*center=*/false,
+        normMeanStd(Onnx::TensorLayout::NchwBgr, {0, 0, 0}, {1, 1, 1}), storage,
+        lb);
     input_value = std::move(t.value);
     std::swap(storage, t.storage);
   }
