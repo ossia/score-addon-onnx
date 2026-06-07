@@ -191,6 +191,38 @@ static Rgba getCOCOColor(int idx)
   return Colors::torso;
 }
 
+// controlnet_aux OpenPose palette, keyed by COCO-18 keypoint index (verified
+// vs open_pose/util.py `colors`). This drives an OpenPose ControlNet for Stable
+// Diffusion. NOTE: distinct from CMU's COCO palette below (rotated by one); use
+// THIS one for ControlNet.
+static Rgba getOpenPoseColor18(int idx)
+{
+  static constexpr unsigned char c[18][3] = {
+      {255, 0, 0},   {255, 85, 0},   {255, 170, 0}, {255, 255, 0},
+      {170, 255, 0}, {85, 255, 0},   {0, 255, 0},   {0, 255, 85},
+      {0, 255, 170}, {0, 255, 255},  {0, 170, 255}, {0, 85, 255},
+      {0, 0, 255},   {85, 0, 255},   {170, 0, 255}, {255, 0, 255},
+      {255, 0, 170}, {255, 0, 85}};
+  if(idx < 0 || idx >= 18)
+    return Colors::torso;
+  return Onnx::rgb8(c[idx][0], c[idx][1], c[idx][2]);
+}
+
+// Official CMU OpenPose BODY_25 palette, keyed by BODY_25 keypoint index
+// (verified vs poseParametersRender.hpp POSE_BODY_25_COLORS_RENDER_GPU).
+static Rgba getOpenPoseColor25(int idx)
+{
+  static constexpr unsigned char c[25][3] = {
+      {255, 0, 85},  {255, 0, 0},   {255, 85, 0},  {255, 170, 0}, {255, 255, 0},
+      {170, 255, 0}, {85, 255, 0},  {0, 255, 0},   {255, 0, 0},   {0, 255, 85},
+      {0, 255, 170}, {0, 255, 255}, {0, 170, 255}, {0, 85, 255},  {0, 0, 255},
+      {255, 0, 170}, {170, 0, 255}, {255, 0, 255}, {85, 0, 255},  {0, 0, 255},
+      {0, 0, 255},   {0, 0, 255},   {0, 255, 255}, {0, 255, 255}, {0, 255, 255}};
+  if(idx < 0 || idx >= 25)
+    return Colors::torso;
+  return Onnx::rgb8(c[idx][0], c[idx][1], c[idx][2]);
+}
+
 // Get body part color for BlazePose
 static Rgba getBlazePoseColor(int idx)
 {
@@ -355,13 +387,27 @@ void PoseDetector::drawOnePose(
   const Rgba track_color
       = use_track_color ? getTrackColor(pose.track_id) : Rgba{};
 
+  // OpenPose targets: render with the official palette, opaque, thicker sticks,
+  // so the overlay can drive an OpenPose ControlNet (use Skeleton-only output
+  // for the required black background). Per-id track color overrides it.
+  const bool openpose_render
+      = m_remap_active && !use_track_color
+        && (m_active_target == Onnx::Skel::TargetSkeleton::OpenPoseCoco18
+            || m_active_target == Onnx::Skel::TargetSkeleton::OpenPoseBody25);
+
   // Select skeleton connections and color function based on workflow
   auto getColor = [&](int idx) -> Rgba {
     if(use_track_color)
       return track_color;
     if(m_remap_active) // remapped indices don't match the native palettes
+    {
+      if(m_active_target == Onnx::Skel::TargetSkeleton::OpenPoseCoco18)
+        return getOpenPoseColor18(idx);
+      if(m_active_target == Onnx::Skel::TargetSkeleton::OpenPoseBody25)
+        return getOpenPoseColor25(idx);
       return Onnx::hsv(
           static_cast<float>(idx) / std::max(1, num_kps), 0.6f, 1.0f);
+    }
     switch(workflow)
     {
       case PoseWorkflow::BlazePose:
@@ -411,14 +457,38 @@ void PoseDetector::drawOnePose(
         if(conf < min_conf)
           continue;
 
-        Rgba color = Onnx::withAlpha(getColor(from), safeAlpha(conf));
-        ov.lineWidth(2.f);
+        Rgba color = openpose_render
+                         ? getColor(from)
+                         : Onnx::withAlpha(getColor(from), safeAlpha(conf));
+        ov.lineWidth(openpose_render ? 4.f : 2.f);
         ov.color(color);
         ov.line(toPoint(from), toPoint(to));
       }
     };
 
-    if(m_remap_active) // remapped layout -> target edge table
+    if(m_remap_active
+       && m_active_target == Onnx::Skel::TargetSkeleton::OpenPoseCoco18)
+    {
+      // Exact OpenPose/ControlNet limbs: limb i uses palette color i at 60%
+      // intensity (controlnet_aux), keypoint dots full intensity (below). The
+      // edge list is in limbSeq order so index i lines up with the palette.
+      const auto bones = Onnx::Skel::edgesFor(m_active_target);
+      ov.lineWidth(4.f);
+      for(int i = 0; i < static_cast<int>(bones.size()); ++i)
+      {
+        const auto& b = bones[i];
+        if(b.a < 0 || b.b < 0 || b.a >= num_kps || b.b >= num_kps)
+          continue;
+        if(kps[b.a].confidence <= 0.f || kps[b.b].confidence <= 0.f)
+          continue;
+        if(std::min(kps[b.a].confidence, kps[b.b].confidence) < min_conf)
+          continue;
+        const Rgba k = getOpenPoseColor18(i);
+        ov.color(Rgba{k.r * 0.6f, k.g * 0.6f, k.b * 0.6f, 1.f});
+        ov.line(toPoint(b.a), toPoint(b.b));
+      }
+    }
+    else if(m_remap_active) // other remapped layouts: endpoint color
     {
       drawConnections(Onnx::Skel::edgesFor(m_active_target), num_kps);
     }
@@ -505,12 +575,16 @@ void PoseDetector::drawOnePose(
     if(conf < min_conf)
       continue;
 
-    Rgba color = Onnx::withAlpha(getColor(i), safeAlpha(conf));
+    Rgba color = openpose_render
+                     ? getColor(i)
+                     : Onnx::withAlpha(getColor(i), safeAlpha(conf));
     ov.color(color);
 
     // Size based on keypoint importance
     int radius = 4;
-    if(workflow == PoseWorkflow::RTMPose_Whole)
+    if(openpose_render)
+      radius = 4; // uniform OpenPose dots
+    else if(workflow == PoseWorkflow::RTMPose_Whole)
     {
       if(i <= 16)
         radius = 4;
