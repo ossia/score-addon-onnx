@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <utility>
 
 namespace OnnxModels
@@ -358,6 +359,9 @@ void PoseDetector::drawOnePose(
   auto getColor = [&](int idx) -> Rgba {
     if(use_track_color)
       return track_color;
+    if(m_remap_active) // remapped indices don't match the native palettes
+      return Onnx::hsv(
+          static_cast<float>(idx) / std::max(1, num_kps), 0.6f, 1.0f);
     switch(workflow)
     {
       case PoseWorkflow::BlazePose:
@@ -399,6 +403,10 @@ void PoseDetector::drawOnePose(
         if(from >= num_kps || to >= num_kps || from >= max_idx || to >= max_idx)
           continue;
 
+        // Skip edges touching a missing/zero-confidence joint (e.g. (0,0,0)
+        // unmappable joints from a remap) even when min_conf == 0.
+        if(kps[from].confidence <= 0.f || kps[to].confidence <= 0.f)
+          continue;
         float conf = std::min(kps[from].confidence, kps[to].confidence);
         if(conf < min_conf)
           continue;
@@ -410,6 +418,11 @@ void PoseDetector::drawOnePose(
       }
     };
 
+    if(m_remap_active) // remapped layout -> target edge table
+    {
+      drawConnections(Onnx::Skel::edgesFor(m_active_target), num_kps);
+    }
+    else
     switch(workflow)
     {
       case PoseWorkflow::BlazePose:
@@ -585,6 +598,60 @@ static void fillCanvas(
   }
 }
 
+// Native keypoint layout the emitted pose carries, by workflow (+ keypoint
+// count to disambiguate the COCO-body/hand share). nullopt => no remap source.
+static std::optional<Onnx::Skel::SourceSkeleton>
+sourceFor(PoseWorkflow wf, int num_kps)
+{
+  using S = Onnx::Skel::SourceSkeleton;
+  switch(wf)
+  {
+    case PoseWorkflow::BlazePose: return S::BlazePose33;
+    case PoseWorkflow::MediaPipeHands: return S::Hands21;
+    case PoseWorkflow::FaceMesh: return S::FaceMesh468;
+    case PoseWorkflow::MobileFaceNet: return S::Dlib68;
+    case PoseWorkflow::RTMPose_COCO:
+    case PoseWorkflow::RTMPose_Whole:
+    case PoseWorkflow::ViTPose:
+    case PoseWorkflow::YOLOPose:
+      return (num_kps == 21) ? S::Hands21 : S::Coco17;
+    default: return std::nullopt; // BlazeFace/RTMPoseFace/Animal/Box: no remap
+  }
+}
+
+void PoseDetector::setRemapState(PoseWorkflow wf, int num_kps)
+{
+  const auto tgt = inputs.skeleton_type.value;
+  m_active_target = tgt;
+  const auto src = sourceFor(wf, num_kps);
+  m_remap_active = (tgt != Onnx::Skel::TargetSkeleton::Native) && src.has_value()
+                   && !Onnx::Skel::mappingFor(*src, tgt).empty();
+  if(src)
+    m_remap_src = *src;
+}
+
+void PoseDetector::remapPose(DetectedPose& pose)
+{
+  if(Onnx::Skel::remap<PoseKeypoint>(
+         m_remap_src, m_active_target,
+         std::span<const PoseKeypoint>(
+             pose.keypoints.data(), pose.keypoints.size()),
+         m_remap_scratch))
+    std::swap(pose.keypoints, m_remap_scratch); // reuse old buffer next call
+}
+
+void PoseDetector::finalizeSingle(PoseWorkflow wf)
+{
+  if(!outputs.detection.value)
+    return;
+  setRemapState(
+      wf, static_cast<int>(outputs.detection.value->keypoints.size()));
+  if(m_remap_active)
+    remapPose(*outputs.detection.value);
+  drawSkeleton(*outputs.detection.value, wf);
+  generateGeometryOutput(*outputs.detection.value, wf);
+}
+
 void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
 {
   ONNX_PROF_SCOPE(Draw);
@@ -701,6 +768,17 @@ void PoseDetector::appendGeometry(
         out.push_back(kps[to].y);
         out.push_back(kps[to].z);
       };
+
+      // Remapped layout -> target edge table (addLine already skips edges
+      // touching a missing/low-confidence joint).
+      if(m_remap_active)
+      {
+        const auto bones = Onnx::Skel::edgesFor(m_active_target);
+        out.reserve(bones.size() * 6);
+        for(const auto& b : bones)
+          addLine(b.a, b.b);
+        break;
+      }
 
       // Select skeleton based on workflow
       switch (workflow)
@@ -1950,9 +2028,7 @@ void PoseDetector::runLandmark(
   applySmoothing(detected);
   fillBoxFromKeypoints(detected);
   outputs.detection.value = std::move(detected);
-
-  drawSkeleton(*outputs.detection.value, draw);
-  generateGeometryOutput(*outputs.detection.value, draw);
+  finalizeSingle(draw);
 }
 
 // Multi-instance two-stage path (Track IDs on): detect top-K (or reuse per-track
@@ -2134,6 +2210,17 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
       }
     }
   }
+
+  // Remap every instance to the chosen target skeleton, AFTER tracking/
+  // smoothing (which ran on the native layout). The overlay and every output
+  // port below then share the remapped layout.
+  setRemapState(
+      draw, m_instances.empty()
+                ? 0
+                : static_cast<int>(m_instances.front().keypoints.size()));
+  if(m_remap_active)
+    for(auto& pose : m_instances)
+      remapPose(pose);
 
   // primary = highest-confidence instance (back-compat single-pose ports)
   int primary = -1;
@@ -2354,8 +2441,7 @@ void PoseDetector::runDetectorAsPose(
   outputs.detection.value = std::move(detected);
 
   const PoseWorkflow draw = workflowForRole(role);
-  drawSkeleton(*outputs.detection.value, draw);
-  generateGeometryOutput(*outputs.detection.value, draw);
+  finalizeSingle(draw);
 }
 
 void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M)
@@ -2445,9 +2531,7 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
   applySmoothing(detected);
   fillBoxFromKeypoints(detected);
   outputs.detection.value = std::move(detected);
-
-  drawSkeleton(*outputs.detection.value, PoseWorkflow::YOLOPose);
-  generateGeometryOutput(*outputs.detection.value, PoseWorkflow::YOLOPose);
+  finalizeSingle(PoseWorkflow::YOLOPose);
 
   std::swap(storage, t.storage);
 }
@@ -2585,9 +2669,7 @@ void PoseDetector::runRTMO(const Onnx::ImageView& src)
   applySmoothing(detected);
   fillBoxFromKeypoints(detected);
   outputs.detection.value = std::move(detected);
-
-  drawSkeleton(*outputs.detection.value, PoseWorkflow::YOLOPose);
-  generateGeometryOutput(*outputs.detection.value, PoseWorkflow::YOLOPose);
+  finalizeSingle(PoseWorkflow::YOLOPose);
 }
 
 void PoseDetector::runBoxDetection(

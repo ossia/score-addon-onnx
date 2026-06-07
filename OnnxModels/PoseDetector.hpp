@@ -7,6 +7,7 @@
 #include <Onnx/helpers/OneEuro.hpp>
 #include <Onnx/helpers/PoseTracker.hpp>
 #include <Onnx/helpers/ROI.hpp>
+#include <Onnx/helpers/SkeletonFormats.hpp>
 
 #include <halp/controls.hpp>
 #include <halp/file_port.hpp>
@@ -288,6 +289,15 @@ public:
       bool value = false;
     } strict_confirm;
 
+    struct : halp::combobox_t<"Skeleton", Onnx::Skel::TargetSkeleton>
+    {
+      halp_meta(
+          description,
+          "Remap output keypoints (overlay + ports) to a standard skeleton "
+          "layout. Native = the model's own layout; unsupported (e.g. animal "
+          "-> human) falls back to Native.");
+    } skeleton_type;
+
   } inputs;
 
   struct
@@ -355,6 +365,7 @@ public:
       halp::item<&ins::draw_landmarks> draw_landmarks;
       halp::item<&ins::draw_boxes> draw_boxes;
       halp::item<&ins::data_format> data_format;
+      halp::item<&ins::skeleton_type> skeleton_type;
     } output_tab;
 
     struct
@@ -460,6 +471,13 @@ private:
       Overlay& ov, const DetectedPose& pose, PoseWorkflow workflow, int w,
       int h);
   void generateGeometryOutput(const DetectedPose& pose, PoseWorkflow workflow);
+
+  // Skeleton remap: set m_remap_* from the control + workflow, remap a pose's
+  // keypoints in place (native -> target), and finalize a single-instance pose
+  // (remap + draw + geometry). Remap drives both overlay and output ports.
+  void setRemapState(PoseWorkflow workflow, int num_kps);
+  void remapPose(DetectedPose& pose);
+  void finalizeSingle(PoseWorkflow workflow);
   // Append one pose's flattened geometry (current Data Format) to `out`.
   void appendGeometry(
       std::vector<float>& out, const DetectedPose& pose, PoseWorkflow workflow);
@@ -519,6 +537,12 @@ private:
   boost::container::vector<float> m_batch_storage; // packed [N,C,H,W] input
   std::vector<int64_t> m_bbox;                     // batched SimCC [N,2] bbox
   int m_frames_since_detect{0};                   // detector-cadence counter
+
+  // Skeleton remap state (recomputed per emit from the Skeleton control).
+  bool m_remap_active{false};
+  Onnx::Skel::SourceSkeleton m_remap_src{Onnx::Skel::SourceSkeleton::Coco17};
+  Onnx::Skel::TargetSkeleton m_active_target{Onnx::Skel::TargetSkeleton::Native};
+  std::vector<PoseKeypoint> m_remap_scratch; // reused remap output buffer
 };
 
 } // namespace OnnxModels
