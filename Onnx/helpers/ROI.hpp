@@ -1,20 +1,17 @@
 #pragma once
 #include <Onnx/helpers/Detection.hpp>
-
-#include <QImage>
-#include <QPainter>
-#include <QTransform>
+#include <Onnx/helpers/ImageOps.hpp>
 
 #include <algorithm>
 #include <cmath>
 
 // Region-of-interest construction shared by every two-stage pose pipeline.
 //
-// All ROIs collapse to a single affine `QTransform M` that maps a point in the
-// landmark model's input space (pixels, [0,model_w]x[0,model_h]) to the
-// original image (pixels). The same M:
-//   - warps the source image into the model crop (via M.inverted()),
-//   - maps decoded keypoints back to the image (via M.map()).
+// All ROIs collapse to a single affine that maps a point in the landmark
+// model's input space (pixels, [0,model_w]x[0,model_h]) to the original image
+// (pixels). The same affine:
+//   - warps the source image into the model crop (warpAffine samples src at it),
+//   - maps decoded keypoints back to the image (applyAffine).
 // See TWO_STAGE_ARCHITECTURE.md §3.
 namespace Onnx::ROI
 {
@@ -64,24 +61,23 @@ inline MediapipeParams mobileFaceParams()
 
 // A region of interest in image pixels: center, full width/height, rotation.
 // This is the smoothable intermediate — temporally filter these 5 scalars, then
-// rebuild the transform, so the crop the landmark model sees stays stable.
+// rebuild the affine, so the crop the landmark model sees stays stable.
 struct Rect
 {
   float cx{}, cy{}, w{}, h{}, angle{}; // angle in radians
 };
 
-// Rect (image px) -> crop(model px)->image(px) affine.
-//   img = center + R(angle) * ((m/model - 0.5) * (w,h))
-inline QTransform rectToTransform(const Rect& r, int model_w, int model_h)
+// Rect (image px) -> crop(model px)->image(px) affine (dst->src; identical to
+// the old QTransform, so it also maps decoded keypoints back via applyAffine).
+inline Affine rectToAffine(const Rect& r, int model_w, int model_h)
 {
-  const float ca = std::cos(r.angle), sa = std::sin(r.angle);
-  const float m11 = r.w * ca / model_w;
-  const float m12 = r.w * sa / model_w;
-  const float m21 = -r.h * sa / model_h;
-  const float m22 = r.h * ca / model_h;
-  const float dx = r.cx - 0.5f * r.w * ca + 0.5f * r.h * sa;
-  const float dy = r.cy - 0.5f * r.w * sa - 0.5f * r.h * ca;
-  return QTransform(m11, m12, m21, m22, dx, dy);
+  return affineFromRoi(r.cx, r.cy, r.w, r.h, r.angle, model_w, model_h);
+}
+
+// Apply an affine (model px -> image px) to a point.
+inline Vec2 applyAffine(const Affine& a, float x, float y)
+{
+  return {a.m0 * x + a.m1 * y + a.m2, a.m3 * x + a.m4 * y + a.m5};
 }
 
 // Rotated MediaPipe-style ROI rect from a normalized detection.
@@ -97,10 +93,10 @@ inline Rect mediapipeRect(
   float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
   if(ks >= 0 && ke >= 0)
   {
-    x0 = kps[ks].x() * srcW;
-    y0 = kps[ks].y() * srcH;
-    x1 = kps[ke].x() * srcW;
-    y1 = kps[ke].y() * srcH;
+    x0 = kps[ks].x * srcW;
+    y0 = kps[ks].y * srcH;
+    x1 = kps[ke].x * srcW;
+    y1 = kps[ke].y * srcH;
   }
 
   const float target = p.target_angle_deg * float(M_PI) / 180.0f;
@@ -129,13 +125,15 @@ inline Rect mediapipeRect(
   return Rect{cx, cy, size * p.scale, size * p.scale, angle};
 }
 
-// Axis-aligned top-down (mmpose) ROI rect from a source-pixel bbox.
-inline Rect topdownRect(QRectF bbox_px, int model_w, int model_h, float pad)
+// Axis-aligned top-down (mmpose) ROI rect from a source-pixel bbox (top-left
+// x,y,w,h).
+inline Rect topdownRect(
+    const Onnx::Rect& bbox_px, int model_w, int model_h, float pad)
 {
-  const float cx = bbox_px.center().x();
-  const float cy = bbox_px.center().y();
-  float sw = bbox_px.width() * pad;
-  float sh = bbox_px.height() * pad;
+  const float cx = bbox_px.x + bbox_px.w * 0.5f;
+  const float cy = bbox_px.y + bbox_px.h * 0.5f;
+  float sw = bbox_px.w * pad;
+  float sh = bbox_px.h * pad;
   const float a = float(model_w) / float(model_h);
   if(sw > sh * a)
     sh = sw / a;
@@ -144,80 +142,38 @@ inline Rect topdownRect(QRectF bbox_px, int model_w, int model_h, float pad)
   return Rect{cx, cy, sw, sh, 0.0f};
 }
 
-inline QTransform mediapipeTransform(
+inline Affine mediapipeAffine(
     const Detection::Detection& det, int srcW, int srcH, int model_w,
     int model_h, const MediapipeParams& p)
 {
-  return rectToTransform(mediapipeRect(det, srcW, srcH, p), model_w, model_h);
+  return rectToAffine(mediapipeRect(det, srcW, srcH, p), model_w, model_h);
 }
 
-inline QTransform topdownTransform(
-    QRectF bbox_px, int model_w, int model_h, float pad = 1.25f)
+inline Affine topdownAffine(
+    const Onnx::Rect& bbox_px, int model_w, int model_h, float pad = 1.25f)
 {
-  return rectToTransform(topdownRect(bbox_px, model_w, model_h, pad), model_w, model_h);
+  return rectToAffine(topdownRect(bbox_px, model_w, model_h, pad), model_w, model_h);
 }
 
-// Whole-frame transform matching Images.hpp's KeepAspectRatioByExpanding +
-// center-crop preprocessing (used when no detector is present).
-inline QTransform
-wholeFrameTransform(int srcW, int srcH, int model_w, int model_h)
+// Whole-frame affine matching ImageOps cover-resize (KeepAspectRatioByExpanding
+// + center-crop) — used for keypoint mapback when no detector is present.
+inline Affine wholeFrameAffine(int srcW, int srcH, int model_w, int model_h)
 {
-  const float scale
-      = std::max(float(model_w) / srcW, float(model_h) / srcH);
+  const float scale = std::max(float(model_w) / srcW, float(model_h) / srcH);
   const float scaled_w = srcW * scale, scaled_h = srcH * scale;
   const float crop_x = (scaled_w - model_w) * 0.5f;
   const float crop_y = (scaled_h - model_h) * 0.5f;
   // img_px = (m_px + crop) / scale
-  return QTransform(
-      1.0f / scale, 0, 0, 1.0f / scale, crop_x / scale, crop_y / scale);
+  return Affine{
+      1.0f / scale, 0.f, crop_x / scale, 0.f, 1.0f / scale, crop_y / scale};
 }
 
-// Aspect-preserving resize into a model_w x model_h square with padding.
-// center=true (MediaPipe): pad split both sides. center=false (YOLOX/RTMDet):
-// paste top-left, pad bottom-right.
-struct LetterboxResult
+// Render the source image into dst (a model-sized RGBA buffer) through M
+// (model px -> image px), bilinear. Replaces the old QPainter warpCrop.
+inline void warpCrop(
+    const ImageView& src, const Affine& M, const MutableImageView& dst)
 {
-  QImage img;
-  float scale{1};
-  float pad_x{0};
-  float pad_y{0};
-};
-
-inline LetterboxResult letterbox(
-    const QImage& src, int model_w, int model_h, bool center = true)
-{
-  LetterboxResult lb;
-  lb.scale = std::min(
-      float(model_w) / src.width(), float(model_h) / src.height());
-  const int nw = static_cast<int>(src.width() * lb.scale);
-  const int nh = static_cast<int>(src.height() * lb.scale);
-  lb.pad_x = center ? (model_w - nw) * 0.5f : 0.0f;
-  lb.pad_y = center ? (model_h - nh) * 0.5f : 0.0f;
-
-  lb.img = QImage(model_w, model_h, QImage::Format_RGBA8888);
-  lb.img.fill(Qt::black);
-  QPainter p(&lb.img);
-  p.setRenderHint(QPainter::SmoothPixmapTransform);
-  p.drawImage(QRectF(lb.pad_x, lb.pad_y, nw, nh), src);
-  return lb;
-}
-
-// Render the source image into a model_w x model_h crop defined by M.
-inline QImage
-warpCrop(const QImage& src, const QTransform& M, int model_w, int model_h)
-{
-  QImage crop(model_w, model_h, QImage::Format_RGBA8888);
-  crop.fill(Qt::black);
-  bool ok = false;
-  const QTransform inv = M.inverted(&ok); // image -> crop
-  if(ok)
-  {
-    QPainter p(&crop);
-    p.setRenderHint(QPainter::SmoothPixmapTransform);
-    p.setTransform(inv);
-    p.drawImage(0, 0, src);
-  }
-  return crop;
+  warpAffine(src, dst, M);
 }
 
 } // namespace Onnx::ROI

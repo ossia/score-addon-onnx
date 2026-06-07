@@ -1,9 +1,7 @@
 #pragma once
+#include <Onnx/helpers/CoreTypes.hpp>
 #include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/Utilities.hpp>
-
-#include <QPointF>
-#include <QRectF>
 
 #include <algorithm>
 #include <cmath>
@@ -24,11 +22,11 @@ struct Detection
   float score{};                    // [0,1]
   int class_id{-1};                 // detector class id; -1 = none/unknown
                                     // (SSD/single-class leave it; multi-class set it)
-  std::vector<QPointF> keypoints;   // alignment keypoints, normalized [0,1]
+  std::vector<Onnx::Vec2> keypoints; // alignment keypoints, normalized [0,1]
 
-  QRectF box() const noexcept
+  Onnx::Rect box() const noexcept // top-left x,y,w,h
   {
-    return QRectF(xc - w * 0.5f, yc - h * 0.5f, w, h);
+    return {xc - w * 0.5f, yc - h * 0.5f, w, h};
   }
 };
 
@@ -43,9 +41,9 @@ struct SsdParams
 // Canonical SsdAnchorsCalculator anchor generation (fixed_anchor_size=true).
 // Same-stride layers are merged so their anchors are emitted consecutively per
 // cell — matching the model's output ordering. Returns anchor centers in [0,1].
-inline std::vector<QPointF> generateAnchors(const SsdParams& p)
+inline std::vector<Onnx::Vec2> generateAnchors(const SsdParams& p)
 {
-  std::vector<QPointF> anchors;
+  std::vector<Onnx::Vec2> anchors;
   const int n = static_cast<int>(p.strides.size());
   int i = 0;
   while(i < n)
@@ -65,7 +63,7 @@ inline std::vector<QPointF> generateAnchors(const SsdParams& p)
         const float cx = (x + p.anchor_offset) / fm;
         const float cy = (y + p.anchor_offset) / fm;
         for(int a = 0; a < per_cell; ++a)
-          anchors.push_back(QPointF(cx, cy));
+          anchors.push_back({cx, cy});
       }
     i = j;
   }
@@ -143,14 +141,14 @@ inline std::vector<Detection> decode(
 
     Detection d;
     d.score = s;
-    d.xc = a.x() + box[0] * inv;
-    d.yc = a.y() + box[1] * inv;
+    d.xc = a.x + box[0] * inv;
+    d.yc = a.y + box[1] * inv;
     d.w = box[2] * inv;
     d.h = box[3] * inv;
     d.keypoints.reserve(num_kp);
     for(int k = 0; k < num_kp; ++k)
-      d.keypoints.push_back(QPointF(
-          a.x() + box[4 + 2 * k] * inv, a.y() + box[4 + 2 * k + 1] * inv));
+      d.keypoints.push_back(
+          {a.x + box[4 + 2 * k] * inv, a.y + box[4 + 2 * k + 1] * inv});
     dets.push_back(std::move(d));
   }
   return dets;
