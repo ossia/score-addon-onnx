@@ -587,6 +587,7 @@ static void fillCanvas(
 
 void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
 {
+  ONNX_PROF_SCOPE(Draw);
   auto& in_tex = inputs.image.texture;
   const int w = in_tex.width, h = in_tex.height;
   const bool skeleton_only
@@ -606,6 +607,7 @@ void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
 
 void PoseDetector::drawAllSkeletons(PoseWorkflow workflow)
 {
+  ONNX_PROF_SCOPE(Draw);
   auto& in_tex = inputs.image.texture;
   const int w = in_tex.width, h = in_tex.height;
   const bool skeleton_only
@@ -922,11 +924,13 @@ inline NormSpec normAB(Onnx::TensorLayout layout, float a, float b)
 Onnx::FloatTensor fusedAffineTensor(
     Onnx::ModelSpec::Port& port, const Onnx::ImageView& src,
     const Onnx::Affine& M, int mw, int mh, const NormSpec& ns,
-    boost::container::vector<float>& storage)
+    boost::container::vector<float>& storage,
+    Onnx::prof::Bucket prof_bucket = Onnx::prof::WarpCrop)
 {
   storage.resize(static_cast<size_t>(3) * mw * mh, boost::container::default_init);
   Onnx::sampleAffineToTensor(
-      ns.layout, src, M, mw, mh, ns.mean.data(), ns.invstd.data(), storage.data());
+      ns.layout, src, M, mw, mh, ns.mean.data(), ns.invstd.data(),
+      storage.data(), prof_bucket);
   return finalizeTensor(port, storage);
 }
 
@@ -999,6 +1003,7 @@ Onnx::ModelRole PoseDetector::roleForWorkflow(PoseWorkflow w) const
 
 void PoseDetector::passthrough(const Onnx::ImageView& src)
 {
+  ONNX_PROF_SCOPE(Draw);
   outputs.detection.value.reset();
   outputs.geometry.value.clear();
   outputs.poses.value.clear();
@@ -2367,7 +2372,7 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
   auto t = fusedAffineTensor(
       spec.inputs[0], src, M, model_size, model_size,
       normMeanStd(Onnx::TensorLayout::NchwRgb, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f}),
-      storage);
+      storage, Onnx::prof::WarpDet);
 
   Ort::Value ins[1] = {std::move(t.value)};
   Ort::Value outs[1]{Ort::Value{nullptr}};

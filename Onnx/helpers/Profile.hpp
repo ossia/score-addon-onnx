@@ -5,8 +5,34 @@
 // an averaged breakdown to stderr every PRINT_EVERY frames.
 //
 // Buckets are sequential and non-overlapping within a frame, so their sum is
-// <= Total; the remainder (decode + tracking + drawing + overhead) is printed
-// as "other".
+// <= Total; the remainder (decode + tracking + overhead) is printed as "other".
+
+// The bucket enum is always defined (even with profiling off) so it can be
+// passed as a function parameter (e.g. to tag a fused sampler as det vs crop);
+// only the timing machinery below is gated on ONNX_PROFILE.
+namespace Onnx::prof
+{
+enum Bucket
+{
+  ReadSpec = 0, // per-frame ORT model introspection
+  WarpDet,      // fused sample+normalize of the WHOLE frame (detector/RTMO/YOLO)
+  WarpCrop,     // fused sample+normalize of per-ROI crops (landmark / reid)
+  Resize,       // LANCIR resize (unused by the pose path now)
+  TensorBuild,  // legacy normalize pass (now folded into Warp; reads ~0)
+  Infer,        // ORT session.Run
+  Draw,         // fillCanvas (input->output copy) + ctx overlay rasterization
+  Total,        // whole processed frame
+  NBuckets
+};
+
+inline const char* name(int b)
+{
+  static const char* n[]
+      = {"readspec", "warp:det", "warp:crop", "resize",
+         "tensorbuild", "infer", "draw", "TOTAL"};
+  return n[b];
+}
+} // namespace Onnx::prof
 
 #if defined(ONNX_PROFILE)
   #include <array>
@@ -15,24 +41,6 @@
 
 namespace Onnx::prof
 {
-enum Bucket
-{
-  ReadSpec = 0, // per-frame ORT model introspection
-  Warp,         // warpAffine (ROI crops, cover-resize)
-  Resize,       // LANCIR resize (letterbox detector input)
-  TensorBuild,  // RGBA -> normalized planar/interleaved float
-  Infer,        // ORT session.Run
-  Total,        // whole processed frame
-  NBuckets
-};
-
-inline const char* name(int b)
-{
-  static const char* n[]
-      = {"readspec", "warp", "resize", "tensorbuild", "infer", "TOTAL"};
-  return n[b];
-}
-
 struct Accum
 {
   std::array<double, NBuckets> us{};
@@ -97,12 +105,19 @@ struct FrameScope
   #define ONNX_PROF_CAT(a, b) ONNX_PROF_CAT2(a, b)
   #define ONNX_PROF_SCOPE(bucket) \
     ::Onnx::prof::Scope ONNX_PROF_CAT(_onnx_prof_, __LINE__)(::Onnx::prof::bucket)
+  // Scope on a runtime Bucket value (already-qualified expression).
+  #define ONNX_PROF_SCOPE_VAR(bucketExpr) \
+    ::Onnx::prof::Scope ONNX_PROF_CAT(_onnx_prof_, __LINE__)(bucketExpr)
   #define ONNX_PROF_FRAME() \
     ::Onnx::prof::FrameScope ONNX_PROF_CAT(_onnx_frame_, __LINE__)
 #else
   #define ONNX_PROF_SCOPE(bucket) \
     do                            \
     {                             \
+    } while(0)
+  #define ONNX_PROF_SCOPE_VAR(bucketExpr) \
+    do                                    \
+    {                                     \
     } while(0)
   #define ONNX_PROF_FRAME() \
     do                      \
