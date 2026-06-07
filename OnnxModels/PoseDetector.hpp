@@ -17,8 +17,6 @@
 #include <optional>
 #include <vector>
 
-class QImage;
-class QTransform;
 
 namespace Onnx
 {
@@ -403,31 +401,31 @@ private:
   // keep_class: -2 = use the target-domain default class filter (person/animal),
   // -1 = keep all classes, >=0 = keep only that class id.
   std::vector<Onnx::Detection::Detection> runDetector(
-      const Onnx::ModelRole& role, const QImage& src,
+      const Onnx::ModelRole& role, const Onnx::ImageView& src,
       Onnx::ModelDomain target = Onnx::ModelDomain::Body, int keep_class = -2);
 
   // Stage 2: run the landmark/pose model on the crop defined by M
   // (crop-pixels -> image-pixels), then map keypoints back through M.
   void runLandmark(
-      const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
-      const QTransform& M, int track_id = -1);
+      const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
+      const Onnx::Affine& M, int track_id = -1);
 
   // Stage 2 core: run the landmark model on one crop and decode keypoints into
   // `out` (image-normalized [0,1]); no smoothing/drawing/output. Returns the
   // mean confidence, or -1 on decode failure. Shared by single + multi paths.
   float landmarkKeypoints(
-      const Onnx::ModelRole& role, const QImage& src, const QTransform& M,
+      const Onnx::ModelRole& role, const Onnx::ImageView& src, const Onnx::Affine& M,
       std::vector<PoseKeypoint>& out);
 
   // --- Multi-instance back-end (Track IDs path) ---
   // Run the detector (top-K) or per-track ROIs, landmark each, track, per-id
   // smooth, draw all, and fill the poses / primary / geometry / count outputs.
   void runMultiInstance(
-      const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src);
+      const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src);
   // Landmark every ROI into m_instances, batching all crops into one inference
   // when the model's batch dim allows it (else one inference per crop).
   void runLandmarkBatch(
-      const Onnx::ModelRole& role, PoseWorkflow draw, const QImage& src,
+      const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
       const std::vector<Onnx::ROI::Rect>& rois);
   // Track m_instances, assign ids + per-id smoothed keypoints + colors, then
   // draw all and publish every output port.
@@ -437,17 +435,17 @@ private:
   void embedInstances();
 
   // Draw a detector's own keypoints/box directly (detector used standalone).
-  void runDetectorAsPose(const Onnx::ModelRole& role, const QImage& src);
+  void runDetectorAsPose(const Onnx::ModelRole& role, const Onnx::ImageView& src);
 
   // Single-stage YOLO-pose on the full frame.
-  void runYOLOPose(const QImage& src, const QTransform& M);
+  void runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M);
 
   // Single-stage RTMO on the full frame (dets + keypoints, NMS-free).
-  void runRTMO(const QImage& src);
+  void runRTMO(const Onnx::ImageView& src);
 
   // Detection-only: run the Detection Model, emit boxes as keypoint-less poses
   // (optionally tracked). Drawn as rectangles; box lives in each pose's metadata.
-  void runBoxDetection(const Onnx::ModelRole& detRole, const QImage& src);
+  void runBoxDetection(const Onnx::ModelRole& detRole, const Onnx::ImageView& src);
 
   // Map a manual workflow selection onto a concrete model role.
   Onnx::ModelRole roleForWorkflow(PoseWorkflow w) const;
@@ -464,7 +462,7 @@ private:
   // Append one pose's flattened geometry (current Data Format) to `out`.
   void appendGeometry(
       std::vector<float>& out, const DetectedPose& pose, PoseWorkflow workflow);
-  void passthrough(const QImage& src);
+  void passthrough(const Onnx::ImageView& src);
 
   // Temporal One-Euro smoothing of the detected keypoints (in place).
   void applySmoothing(DetectedPose& pose);
@@ -521,6 +519,11 @@ private:
   boost::container::vector<float> m_tmp_storage;   // per-crop build scratch
   std::vector<int64_t> m_bbox;                     // batched SimCC [N,2] bbox
   int m_frames_since_detect{0};                   // detector-cadence counter
+
+  // Reused RGBA scratch for warped crops / letterboxed detector input (model
+  // sized, tight stride = w*4). Avoids per-frame allocation.
+  std::vector<uint8_t> m_crop_rgba;
+  std::vector<uint8_t> m_det_rgba;
 };
 
 } // namespace OnnxModels
