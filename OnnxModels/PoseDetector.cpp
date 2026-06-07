@@ -1162,9 +1162,13 @@ void PoseDetector::passthrough(const Onnx::ImageView& src)
   outputs.poses_geometry.value.clear();
   outputs.count.value = 0;
   outputs.image.create(src.w, src.h);
-  std::memcpy(
-      outputs.image.texture.bytes, src.data,
-      static_cast<size_t>(src.w) * src.h * 4);
+  // Honor Skeleton-only here too: fill black on a no-detection frame instead of
+  // copying the input (otherwise the raw frame flashes through during dropouts).
+  const bool skeleton_only
+      = (inputs.output_mode.value == OutputMode::SkeletonOnly);
+  fillCanvas(
+      reinterpret_cast<unsigned char*>(outputs.image.texture.bytes), src.data,
+      src.w, src.h, skeleton_only);
   outputs.image.texture.changed = true;
 
   // Coast: keep temporal state for a few frames so a brief detection dropout
