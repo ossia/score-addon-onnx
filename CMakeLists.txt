@@ -302,6 +302,21 @@ if(NOT MSVC)
 endif()
 target_link_libraries(score_addon_onnx_models PRIVATE score_onnx_ctx_overlay)
 
+# Image-processing hot path (per-pixel bilinear sample / normalize / warp /
+# letterbox / Lanczos resize). Built as its own static lib forced to -O3 even in
+# Debug builds, because these tight float loops run 5-15x slower at -Og/-O0 and
+# would otherwise dominate the frame in a developer build. Header-only inlining
+# would pull them back into the -Og host TU, so they live in ImageOps.cpp.
+add_library(score_onnx_imageops STATIC Onnx/helpers/ImageOps.cpp)
+target_include_directories(score_onnx_imageops PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(score_onnx_imageops PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC)
+  target_compile_options(score_onnx_imageops PRIVATE -O3)
+else()
+  target_compile_options(score_onnx_imageops PRIVATE /O2)
+endif()
+target_link_libraries(score_addon_onnx_models PRIVATE score_onnx_imageops)
+
 # Link
 target_link_libraries(score_addon_onnx_models
     PUBLIC
@@ -320,5 +335,10 @@ endif()
 # breakdown to stderr). Off by default; enable with -DSCORE_ONNX_PROFILE=ON.
 option(SCORE_ONNX_PROFILE "Profile the ONNX pose pipeline per frame" OFF)
 if(SCORE_ONNX_PROFILE)
+  # Both targets need the define: the frame scope lives in the main target, the
+  # warp/resize scopes live in the imageops lib. The profiler accumulator is an
+  # inline thread_local in Profile.hpp, so it's a single shared instance across
+  # both TUs.
   target_compile_definitions(score_addon_onnx_models PRIVATE ONNX_PROFILE)
+  target_compile_definitions(score_onnx_imageops PRIVATE ONNX_PROFILE)
 endif()
