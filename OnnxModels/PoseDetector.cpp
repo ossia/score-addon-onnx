@@ -149,16 +149,17 @@ static constexpr std::array<std::pair<int, int>, 17> ap10k = {{
 // clang-format on
 } // namespace Skeletons
 
-// Color schemes for different body parts
+// Color schemes for different body parts (float RGBA in [0,1]).
+using Onnx::Rgba;
 namespace Colors
 {
-static const QColor head{255, 255, 0};      // Yellow
-static const QColor torso{255, 255, 255};   // White
-static const QColor left_arm{0, 255, 255};  // Cyan
-static const QColor right_arm{255, 0, 255}; // Magenta
-static const QColor left_leg{0, 255, 0};    // Green
-static const QColor right_leg{255, 128, 0}; // Orange
-static const QColor face{200, 200, 255};    // Light blue
+static const Rgba head = Onnx::rgb8(255, 255, 0);      // Yellow
+static const Rgba torso = Onnx::rgb8(255, 255, 255);   // White
+static const Rgba left_arm = Onnx::rgb8(0, 255, 255);  // Cyan
+static const Rgba right_arm = Onnx::rgb8(255, 0, 255); // Magenta
+static const Rgba left_leg = Onnx::rgb8(0, 255, 0);    // Green
+static const Rgba right_leg = Onnx::rgb8(255, 128, 0); // Orange
+static const Rgba face = Onnx::rgb8(200, 200, 255);    // Light blue
 } // namespace Colors
 
 PoseDetector::PoseDetector() noexcept
@@ -170,7 +171,7 @@ PoseDetector::PoseDetector() noexcept
 PoseDetector::~PoseDetector() = default;
 
 // Get body part color based on keypoint index for COCO format
-static QColor getCOCOColor(int idx)
+static Rgba getCOCOColor(int idx)
 {
   if(idx == 0)
     return Colors::head; // Nose
@@ -192,7 +193,7 @@ static QColor getCOCOColor(int idx)
 }
 
 // Get body part color for BlazePose
-static QColor getBlazePoseColor(int idx)
+static Rgba getBlazePoseColor(int idx)
 {
   if(idx <= 10)
     return Colors::head; // Face landmarks
@@ -212,73 +213,73 @@ static QColor getBlazePoseColor(int idx)
 }
 
 // Get body part color for WholeBody 133
-static QColor getWholeBodyColor(int idx)
+static Rgba getWholeBodyColor(int idx)
 {
   if(idx <= 16)
     return getCOCOColor(idx); // Body keypoints same as COCO
   else if(idx <= 22)
-    return Colors::left_leg.lighter(120); // Feet
+    return Onnx::lighter(Colors::left_leg, 120); // Feet
   else if(idx <= 90)
     return Colors::face; // Face landmarks
   else if(idx <= 111)
-    return Colors::left_arm.lighter(120); // Left hand
+    return Onnx::lighter(Colors::left_arm, 120); // Left hand
   else
-    return Colors::right_arm.lighter(120); // Right hand
+    return Onnx::lighter(Colors::right_arm, 120); // Right hand
 }
 
 // Get finger color for hand keypoints
-static QColor getHandColor(int idx)
+static Rgba getHandColor(int idx)
 {
   if (idx <= 4)
-    return QColor(255, 100, 100); // Thumb - red
+    return Onnx::rgb8(255, 100, 100); // Thumb - red
   else if (idx <= 8)
-    return QColor(100, 255, 100); // Index - green
+    return Onnx::rgb8(100, 255, 100); // Index - green
   else if (idx <= 12)
-    return QColor(100, 100, 255); // Middle - blue
+    return Onnx::rgb8(100, 100, 255); // Middle - blue
   else if (idx <= 16)
-    return QColor(255, 255, 100); // Ring - yellow
+    return Onnx::rgb8(255, 255, 100); // Ring - yellow
   else
-    return QColor(255, 100, 255); // Pinky - magenta
+    return Onnx::rgb8(255, 100, 255); // Pinky - magenta
 }
 
 // Get color for BlazeFace keypoints
-static QColor getBlazeFaceColor(int idx)
+static Rgba getBlazeFaceColor(int idx)
 {
   switch(idx)
   {
-    case 0: return QColor(255, 0, 0);    // right_eye - red
-    case 1: return QColor(0, 0, 255);    // left_eye - blue
-    case 2: return QColor(0, 255, 0);    // nose - green
-    case 3: return QColor(255, 255, 0);  // mouth - yellow
-    case 4: return QColor(255, 0, 255);  // right_ear - magenta
-    case 5: return QColor(0, 255, 255);  // left_ear - cyan
+    case 0: return Onnx::rgb8(255, 0, 0);    // right_eye - red
+    case 1: return Onnx::rgb8(0, 0, 255);    // left_eye - blue
+    case 2: return Onnx::rgb8(0, 255, 0);    // nose - green
+    case 3: return Onnx::rgb8(255, 255, 0);  // mouth - yellow
+    case 4: return Onnx::rgb8(255, 0, 255);  // right_ear - magenta
+    case 5: return Onnx::rgb8(0, 255, 255);  // left_ear - cyan
     default: return Colors::face;
   }
 }
 
 // Get color for dlib 68 face landmarks
-static QColor getDlib68Color(int idx)
+static Rgba getDlib68Color(int idx)
 {
   if(idx <= 16)
-    return QColor(200, 200, 200);  // Jaw - gray
+    return Onnx::rgb8(200, 200, 200);  // Jaw - gray
   else if(idx <= 21)
-    return QColor(255, 200, 100);  // Left eyebrow - orange
+    return Onnx::rgb8(255, 200, 100);  // Left eyebrow - orange
   else if(idx <= 26)
-    return QColor(255, 200, 100);  // Right eyebrow - orange
+    return Onnx::rgb8(255, 200, 100);  // Right eyebrow - orange
   else if(idx <= 35)
-    return QColor(0, 255, 0);      // Nose - green
+    return Onnx::rgb8(0, 255, 0);      // Nose - green
   else if(idx <= 41)
-    return QColor(0, 255, 255);    // Left eye - cyan
+    return Onnx::rgb8(0, 255, 255);    // Left eye - cyan
   else if(idx <= 47)
-    return QColor(0, 255, 255);    // Right eye - cyan
+    return Onnx::rgb8(0, 255, 255);    // Right eye - cyan
   else if(idx <= 59)
-    return QColor(255, 100, 100);  // Outer lip - pink
+    return Onnx::rgb8(255, 100, 100);  // Outer lip - pink
   else
-    return QColor(255, 50, 50);    // Inner lip - red
+    return Onnx::rgb8(255, 50, 50);    // Inner lip - red
 }
 
 // AP10K animal: head + 4 limbs colored like the human limbs
-static QColor getAP10KColor(int idx)
+static Rgba getAP10KColor(int idx)
 {
   if(idx <= 3) return Colors::head;             // eyes/nose/neck
   if(idx == 4) return Colors::torso;            // tail root
@@ -291,14 +292,13 @@ static QColor getAP10KColor(int idx)
 // Stable, well-distributed color for a track id. Golden-ratio hue stepping so
 // consecutive ids are maximally distinct, and a given id is ALWAYS the same
 // color (id 1 -> the same hue every frame, every session).
-static QColor getTrackColor(int id)
+static Rgba getTrackColor(int id)
 {
   if(id < 0)
     return Colors::torso;
   constexpr double golden = 0.618033988749895;
   const double hue = std::fmod(0.11 + static_cast<double>(id) * golden, 1.0);
-  return QColor::fromHsvF(
-      static_cast<float>(hue), 0.85f, 1.0f);
+  return Onnx::hsv(static_cast<float>(hue), 0.85f, 1.0f);
 }
 
 // NaN/Inf-robust finiteness check. Uses ossia's bit-pattern variants because
@@ -353,11 +353,11 @@ void PoseDetector::drawOnePose(
   // one stable per-id color (id 1 always the same color, etc.). Otherwise fall
   // back to the per-keypoint-type palette below.
   const bool use_track_color = pose.track_id >= 0;
-  const QColor track_color
-      = use_track_color ? getTrackColor(pose.track_id) : QColor();
+  const Rgba track_color
+      = use_track_color ? getTrackColor(pose.track_id) : Rgba{};
 
   // Select skeleton connections and color function based on workflow
-  auto getColor = [&](int idx) -> QColor {
+  auto getColor = [&](int idx) -> Rgba {
     if(use_track_color)
       return track_color;
     switch(workflow)
@@ -405,8 +405,7 @@ void PoseDetector::drawOnePose(
         if(conf < min_conf)
           continue;
 
-        QColor color = getColor(from);
-        color.setAlphaF(safeAlpha(conf));
+        Rgba color = Onnx::withAlpha(getColor(from), safeAlpha(conf));
         ov.lineWidth(2.f);
         ov.color(color);
         ov.line(toPoint(from), toPoint(to));
@@ -443,8 +442,8 @@ void PoseDetector::drawOnePose(
         {
           // `closed` contours (oval/eyes/lips) wrap the last point back to the
           // first; open ones (eyebrows) stop at the last segment.
-          auto drawContour = [&](const auto& indices, QColor color, bool closed) {
-            color.setAlphaF(0.8f);
+          auto drawContour = [&](const auto& indices, Rgba color, bool closed) {
+            color = Onnx::withAlpha(color, 0.8f);
             ov.color(color);
             ov.lineWidth(1.f);
             const size_t n = indices.size();
@@ -461,13 +460,13 @@ void PoseDetector::drawOnePose(
               ov.line(toPoint(from), toPoint(to));
             }
           };
-          auto cc = [&](QColor base) { return use_track_color ? track_color : base; };
-          drawContour(Onnx::FaceMesh::FaceContours::face_oval, cc(QColor(200, 200, 255)), true);
-          drawContour(Onnx::FaceMesh::FaceContours::left_eye, cc(QColor(0, 255, 255)), true);
-          drawContour(Onnx::FaceMesh::FaceContours::right_eye, cc(QColor(0, 255, 255)), true);
-          drawContour(Onnx::FaceMesh::FaceContours::lips_outer, cc(QColor(255, 100, 100)), true);
-          drawContour(Onnx::FaceMesh::FaceContours::left_eyebrow, cc(QColor(255, 255, 0)), false);
-          drawContour(Onnx::FaceMesh::FaceContours::right_eyebrow, cc(QColor(255, 255, 0)), false);
+          auto cc = [&](Rgba base) { return use_track_color ? track_color : base; };
+          drawContour(Onnx::FaceMesh::FaceContours::face_oval, cc(Onnx::rgb8(200, 200, 255)), true);
+          drawContour(Onnx::FaceMesh::FaceContours::left_eye, cc(Onnx::rgb8(0, 255, 255)), true);
+          drawContour(Onnx::FaceMesh::FaceContours::right_eye, cc(Onnx::rgb8(0, 255, 255)), true);
+          drawContour(Onnx::FaceMesh::FaceContours::lips_outer, cc(Onnx::rgb8(255, 100, 100)), true);
+          drawContour(Onnx::FaceMesh::FaceContours::left_eyebrow, cc(Onnx::rgb8(255, 255, 0)), false);
+          drawContour(Onnx::FaceMesh::FaceContours::right_eyebrow, cc(Onnx::rgb8(255, 255, 0)), false);
         }
         break;
       case PoseWorkflow::MobileFaceNet:
@@ -495,8 +494,7 @@ void PoseDetector::drawOnePose(
     if(conf < min_conf)
       continue;
 
-    QColor color = getColor(i);
-    color.setAlphaF(safeAlpha(conf));
+    Rgba color = Onnx::withAlpha(getColor(i), safeAlpha(conf));
     ov.color(color);
 
     // Size based on keypoint importance
@@ -547,9 +545,10 @@ void PoseDetector::drawOnePose(
      && pose.box.w > 0.f && pose.box.h > 0.f
      && pose.mean_confidence >= min_conf)
   {
-    QColor bc = use_track_color ? track_color
-                                : getTrackColor(std::max(0, pose.class_id));
-    bc.setAlphaF(0.9f);
+    Rgba bc = Onnx::withAlpha(
+        use_track_color ? track_color
+                        : getTrackColor(std::max(0, pose.class_id)),
+        0.9f);
     ov.color(bc);
     ov.lineWidth(2.f);
     const QRectF r(
