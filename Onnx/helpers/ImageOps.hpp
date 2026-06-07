@@ -109,6 +109,10 @@ struct LetterboxInfo
 
 // Aspect-preserving resize of src into dst (fit), padded with `pad`. center=true
 // centers the image (else top-left). Returns scale + pad for un-letterboxing.
+// Uses bilinear sampling (cost ~ output pixels), not Lanczos (cost ~ source
+// pixels): on large webcam frames downscaled to a small model input this is the
+// difference between ~35ms and <1ms. Undersamples on big downscales (aliasing),
+// which is acceptable for noisy real-time input.
 inline LetterboxInfo letterbox(
     const ImageView& src, const MutableImageView& dst, uint8_t pad = 0,
     bool center = true)
@@ -128,11 +132,13 @@ inline LetterboxInfo letterbox(
     uint8_t* row = dst.data + static_cast<size_t>(y) * drow;
     std::fill(row, row + dst.w * C, pad);
   }
-  // resize into the centered sub-rect (strided dst view)
+  // bilinear-resize into the centered sub-rect (strided dst view). The affine
+  // maps inner-dst px -> src px: sx = x/scale, sy = y/scale.
   MutableImageView inner{
       dst.data + static_cast<size_t>(lb.pad_y) * drow + lb.pad_x * C, nw, nh, C,
       drow};
-  resize(src, inner);
+  const float inv = 1.0f / lb.scale;
+  warpAffine(src, inner, Affine{inv, 0.f, 0.f, 0.f, inv, 0.f});
   return lb;
 }
 } // namespace Onnx
