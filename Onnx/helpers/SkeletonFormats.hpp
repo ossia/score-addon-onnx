@@ -206,9 +206,11 @@ inline constexpr const char* coco18_names[] = {
     "Nose", "Neck", "RShoulder", "RElbow", "RWrist", "LShoulder", "LElbow",
     "LWrist", "RHip", "RKnee", "RAnkle", "LHip", "LKnee", "LAnkle", "REye",
     "LEye", "REar", "LEar"};
+// Edges in controlnet_aux/OpenPose `limbSeq` order, so limb i uses palette
+// color i (getOpenPoseColor18) and the overlay matches an OpenPose ControlNet.
 inline constexpr Bone coco18_bones[] = {
-    {1, 0}, {0, 14}, {0, 15}, {14, 16}, {15, 17}, {1, 2}, {2, 3}, {3, 4},
-    {1, 5}, {5, 6}, {6, 7}, {1, 8}, {8, 9}, {9, 10}, {1, 11}, {11, 12}, {12, 13}};
+    {1, 2}, {1, 5}, {2, 3}, {3, 4}, {5, 6}, {6, 7}, {1, 8}, {8, 9}, {9, 10},
+    {1, 11}, {11, 12}, {12, 13}, {1, 0}, {0, 14}, {14, 16}, {0, 15}, {15, 17}};
 
 inline constexpr const char* body25_names[] = {
     "Nose", "Neck", "RShoulder", "RElbow", "RWrist", "LShoulder", "LElbow",
