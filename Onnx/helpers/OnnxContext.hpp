@@ -1,9 +1,6 @@
 #pragma once
 #include <ossia/detail/algorithms.hpp>
 
-#include <QFile>
-#include <QImage>
-
 #include <Onnx/helpers/Debug.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxBase.hpp>
@@ -236,7 +233,7 @@ struct OnnxRunContext
           = input_type.GetTensorTypeAndShapeInfo();
 
       spec.inputs.push_back(
-          {.name = QString::fromStdString(name),
+          {.name = name,
            .port_type = {},
            .data_type = {},
            .shape = input_tensor_type.GetShape()});
@@ -259,7 +256,7 @@ struct OnnxRunContext
           = output_type.GetTensorTypeAndShapeInfo();
 
       spec.outputs.push_back(
-          {.name = QString::fromStdString(name),
+          {.name = name,
            .port_type = {},
            .data_type = {},
            .shape = output_tensor_type.GetShape()});
