@@ -859,6 +859,17 @@ PoseWorkflow workflowForRole(const Onnx::ModelRole& r)
   }
 }
 
+// ASCII case-insensitive substring test (model I/O names are ASCII).
+static bool icontains(std::string_view hay, std::string_view needle) noexcept
+{
+  auto eq = [](char a, char b) {
+    auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? char(c + 32) : c; };
+    return lower(a) == lower(b);
+  };
+  return std::search(hay.begin(), hay.end(), needle.begin(), needle.end(), eq)
+         != hay.end();
+}
+
 // Lightweight ModelSpec -> ModelIO view for the classifier.
 Onnx::ModelIO toModelIO(const Onnx::ModelSpec& s)
 {
@@ -866,9 +877,9 @@ Onnx::ModelIO toModelIO(const Onnx::ModelSpec& s)
   io.inputs.reserve(s.inputs.size());
   io.outputs.reserve(s.outputs.size());
   for(const auto& p : s.inputs)
-    io.inputs.push_back({p.name.toStdString(), p.shape});
+    io.inputs.push_back({p.name, p.shape});
   for(const auto& p : s.outputs)
-    io.outputs.push_back({p.name.toStdString(), p.shape});
+    io.outputs.push_back({p.name, p.shape});
   return io;
 }
 
@@ -1381,8 +1392,7 @@ PoseDetector::runDetector(
     dctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
 
     const bool sbb = !spec.outputs.empty()
-                     && spec.outputs[0].name.contains(
-                         "score_x", Qt::CaseInsensitive); // score before box
+                     && icontains(spec.outputs[0].name, "score_x"); // score before box
     const int keep = (keep_class == -2) ? 0 : keep_class;
     auto dets = Onnx::Detection::decodeMultiClass(
         std::span<Ort::Value>(outs, n_out), mw, mh, keep, 0.4f, sbb);

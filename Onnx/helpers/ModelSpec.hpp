@@ -4,8 +4,8 @@
 #include <ossia/network/common/parameter_properties.hpp>
 
 #include <QDebug>
-#include <QString>
 
+#include <string>
 #include <vector>
 
 namespace Onnx
@@ -14,7 +14,7 @@ struct ModelSpec
 {
   struct Port
   {
-    QString name;
+    std::string name;
     Process::PortType port_type{};
     ossia::val_type data_type{};
     std::vector<int64_t> shape;
@@ -34,12 +34,12 @@ inline QDebug operator<<(QDebug s, const ModelSpec& spec)
   for (auto& port : spec.input_names)
     s << " - i: " << port.c_str() << "\n";
   for (auto& port : spec.inputs)
-    s << "   => " << port.name << (int)port.port_type << (int)port.data_type
+    s << "   => " << port.name.c_str() << (int)port.port_type << (int)port.data_type
       << port.shape << "\n";
   for (auto& port : spec.output_names)
     s << " - o: " << port.c_str() << "\n";
   for (auto& port : spec.outputs)
-    s << "   => " << port.name << (int)port.port_type << (int)port.data_type
+    s << "   => " << port.name.c_str() << (int)port.port_type << (int)port.data_type
       << port.shape << "\n";
 
   return s;
