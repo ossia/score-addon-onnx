@@ -69,7 +69,6 @@ inline Affine affineFromRoi(
 inline void warpAffine(
     const ImageView& src, const MutableImageView& dst, const Affine& a)
 {
-  ONNX_PROF_SCOPE(Warp);
   const int C = dst.channels;
   const int srow = src.rowBytes(), drow = dst.rowBytes();
   const int sw1 = src.w - 1, sh1 = src.h - 1;
@@ -231,9 +230,10 @@ inline LetterboxInfo letterboxImpl(
 // warp-into-RGBA-scratch + separate normalize pass.
 inline void sampleAffineToTensor(
     TensorLayout L, const ImageView& src, const Affine& a, int mw, int mh,
-    const float mean[3], const float invstd[3], float* out)
+    const float mean[3], const float invstd[3], float* out,
+    prof::Bucket prof_bucket = prof::WarpCrop)
 {
-  ONNX_PROF_SCOPE(Warp);
+  ONNX_PROF_SCOPE_VAR(prof_bucket);
   switch(L)
   {
     case TensorLayout::NchwRgb:
@@ -254,7 +254,7 @@ inline LetterboxInfo letterboxToTensor(
     TensorLayout L, const ImageView& src, int mw, int mh, bool center,
     uint8_t pad, const float mean[3], const float invstd[3], float* out)
 {
-  ONNX_PROF_SCOPE(Warp);
+  ONNX_PROF_SCOPE(WarpDet);
   switch(L)
   {
     case TensorLayout::NchwRgb:
