@@ -277,6 +277,7 @@ target_sources(score_addon_onnx_models
     Onnx/helpers/OnnxBase.hpp
     Onnx/helpers/OnnxContext.hpp
     Onnx/helpers/Profile.hpp
+    Onnx/helpers/SkeletonFormats.hpp
     Onnx/helpers/BlazeFace.hpp
     Onnx/helpers/FaceMesh.hpp
     Onnx/helpers/MediaPipeHands.hpp
