@@ -18,3 +18,16 @@
 #if __APPLE__
 #include <coreml_provider_factory.h>
 #endif
+
+#include <boost/container/vector.hpp>
+
+namespace Onnx
+{
+// An ORT input tensor plus the float buffer backing it. The buffer is reused
+// across frames (steady-state zero-alloc), so it must outlive `value`.
+struct FloatTensor
+{
+  boost::container::vector<float> storage;
+  Ort::Value value;
+};
+}

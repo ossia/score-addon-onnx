@@ -3,6 +3,7 @@
 
 #include <Onnx/helpers/Detection.hpp>
 #include <Onnx/helpers/ModelRole.hpp>
+#include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/OneEuro.hpp>
 #include <Onnx/helpers/PoseTracker.hpp>
 #include <Onnx/helpers/ROI.hpp>
