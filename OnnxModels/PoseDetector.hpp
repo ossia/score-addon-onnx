@@ -19,7 +19,6 @@
 
 class QImage;
 class QTransform;
-class QPainter;
 
 namespace Onnx
 {
@@ -28,6 +27,8 @@ struct OnnxRunContext;
 
 namespace OnnxModels
 {
+struct Overlay; // ctx-backed software overlay renderer (CtxOverlay.hpp)
+
 // Unified keypoint structure for all pose models
 struct PoseKeypoint
 {
@@ -455,9 +456,9 @@ private:
   void drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow);
   // Draw all of m_instances onto one output image (multi-instance path).
   void drawAllSkeletons(PoseWorkflow workflow);
-  // Draw one pose's connections + points with an already-open painter.
+  // Draw one pose's connections + points into an open ctx overlay.
   void drawOnePose(
-      QPainter& p, const DetectedPose& pose, PoseWorkflow workflow, int w,
+      Overlay& ov, const DetectedPose& pose, PoseWorkflow workflow, int w,
       int h);
   void generateGeometryOutput(const DetectedPose& pose, PoseWorkflow workflow);
   // Append one pose's flattened geometry (current Data Format) to `out`.

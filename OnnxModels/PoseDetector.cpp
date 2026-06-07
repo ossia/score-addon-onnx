@@ -3,8 +3,9 @@
 #include <ossia/math/safe_math.hpp>
 
 #include <QImage>
-#include <QPainter>
 #include <QTransform>
+
+#include <Onnx/helpers/CtxOverlay.hpp>
 
 #include <Onnx/helpers/BlazeFace.hpp>
 #include <Onnx/helpers/BlazePose.hpp>
@@ -331,7 +332,7 @@ static void fillBoxFromKeypoints(DetectedPose& pose)
 // Draw one pose's connections + points with an already-open painter (the output
 // image / compositing is owned by the caller — drawSkeleton or drawAllSkeletons).
 void PoseDetector::drawOnePose(
-    QPainter& p, const DetectedPose& pose, PoseWorkflow workflow, int w, int h)
+    Overlay& ov, const DetectedPose& pose, PoseWorkflow workflow, int w, int h)
 {
   const float min_conf = inputs.min_confidence;
   const bool draw_lines = inputs.draw_skeleton.value;
@@ -406,8 +407,9 @@ void PoseDetector::drawOnePose(
 
         QColor color = getColor(from);
         color.setAlphaF(safeAlpha(conf));
-        p.setPen(QPen(color, 2));
-        p.drawLine(toPoint(from), toPoint(to));
+        ov.lineWidth(2.f);
+        ov.color(color);
+        ov.line(toPoint(from), toPoint(to));
       }
     };
 
@@ -443,7 +445,8 @@ void PoseDetector::drawOnePose(
           // first; open ones (eyebrows) stop at the last segment.
           auto drawContour = [&](const auto& indices, QColor color, bool closed) {
             color.setAlphaF(0.8f);
-            p.setPen(QPen(color, 1));
+            ov.color(color);
+            ov.lineWidth(1.f);
             const size_t n = indices.size();
             for(size_t i = 0; i < n; ++i)
             {
@@ -455,7 +458,7 @@ void PoseDetector::drawOnePose(
                 continue;
               if(from >= num_kps || to >= num_kps)
                 continue;
-              p.drawLine(toPoint(from), toPoint(to));
+              ov.line(toPoint(from), toPoint(to));
             }
           };
           auto cc = [&](QColor base) { return use_track_color ? track_color : base; };
@@ -486,7 +489,6 @@ void PoseDetector::drawOnePose(
   }
 
   // Draw keypoints (landmark dots), gated independently of the skeleton lines.
-  p.setPen(Qt::NoPen);
   for(int i = 0; inputs.draw_landmarks.value && i < num_kps; ++i)
   {
     float conf = kps[i].confidence;
@@ -495,7 +497,7 @@ void PoseDetector::drawOnePose(
 
     QColor color = getColor(i);
     color.setAlphaF(safeAlpha(conf));
-    p.setBrush(color);
+    ov.color(color);
 
     // Size based on keypoint importance
     int radius = 4;
@@ -537,7 +539,7 @@ void PoseDetector::drawOnePose(
       radius = 2; // Small for 68 face landmarks
     }
 
-    p.drawEllipse(toPoint(i), radius, radius);
+    ov.fillCircle(toPoint(i), static_cast<float>(radius));
   }
 
   // Bounding box: always in Box Detection, opt-in elsewhere via Draw Boxes.
@@ -548,11 +550,11 @@ void PoseDetector::drawOnePose(
     QColor bc = use_track_color ? track_color
                                 : getTrackColor(std::max(0, pose.class_id));
     bc.setAlphaF(0.9f);
-    p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(bc, 2));
+    ov.color(bc);
+    ov.lineWidth(2.f);
     const QRectF r(
         pose.box.x * w, pose.box.y * h, pose.box.w * w, pose.box.h * h);
-    p.drawRect(r);
+    ov.strokeRect(r);
 
     QString lbl;
     if(pose.track_id >= 0)
@@ -560,27 +562,29 @@ void PoseDetector::drawOnePose(
     if(pose.class_id >= 0)
       lbl += QStringLiteral("c%1 ").arg(pose.class_id);
     lbl += QString::number(pose.mean_confidence, 'f', 2);
-    p.setPen(QPen(bc, 1));
-    p.drawText(QPointF(r.x() + 2, std::max(10.0, r.y() - 3)), lbl);
+    ov.text(14.f, QPointF(r.x() + 2, std::max(10.0, r.y() - 3)), lbl);
   }
 }
 
-// Open an output image (black for skeleton-only, else wrapping the input bytes),
-// returning it ready for a QPainter. Shared by the single + multi drawers.
-static QImage makeOutputCanvas(
-    unsigned char* bytes, int w, int h, bool skeleton_only)
+// Prepare the output texture before drawing: copy the input frame in, or fill
+// opaque black for skeleton-only mode. The ctx overlay then draws onto it.
+static void fillCanvas(
+    unsigned char* dst, const unsigned char* src, int w, int h,
+    bool skeleton_only)
 {
-  QImage img;
+  const size_t n = static_cast<size_t>(w) * h * 4;
   if(skeleton_only)
   {
-    img = QImage(w, h, QImage::Format_RGBA8888);
-    img.fill(Qt::black);
+    for(size_t i = 0; i < n; i += 4)
+    {
+      dst[i] = dst[i + 1] = dst[i + 2] = 0;
+      dst[i + 3] = 255;
+    }
   }
   else
   {
-    img = QImage(bytes, w, h, QImage::Format_RGBA8888);
+    std::memcpy(dst, src, n);
   }
-  return img;
 }
 
 void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
@@ -590,15 +594,15 @@ void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
   const bool skeleton_only
       = (inputs.output_mode.value == OutputMode::SkeletonOnly);
 
-  QImage img = makeOutputCanvas(in_tex.bytes, w, h, skeleton_only);
-  {
-    QPainter p(&img);
-    p.setRenderHint(QPainter::Antialiasing);
-    drawOnePose(p, pose, workflow, w, h);
-  }
-
   outputs.image.create(w, h);
-  memcpy(outputs.image.texture.bytes, img.constBits(), w * h * 4);
+  auto* dst = reinterpret_cast<unsigned char*>(outputs.image.texture.bytes);
+  fillCanvas(
+      dst, reinterpret_cast<const unsigned char*>(in_tex.bytes), w, h,
+      skeleton_only);
+  {
+    Overlay ov(dst, w, h);
+    drawOnePose(ov, pose, workflow, w, h);
+  } // Overlay dtor rasterizes the queued drawing into dst
   outputs.image.texture.changed = true;
 }
 
@@ -609,16 +613,16 @@ void PoseDetector::drawAllSkeletons(PoseWorkflow workflow)
   const bool skeleton_only
       = (inputs.output_mode.value == OutputMode::SkeletonOnly);
 
-  QImage img = makeOutputCanvas(in_tex.bytes, w, h, skeleton_only);
-  {
-    QPainter p(&img);
-    p.setRenderHint(QPainter::Antialiasing);
-    for(const auto& pose : m_instances)
-      drawOnePose(p, pose, workflow, w, h);
-  }
-
   outputs.image.create(w, h);
-  memcpy(outputs.image.texture.bytes, img.constBits(), w * h * 4);
+  auto* dst = reinterpret_cast<unsigned char*>(outputs.image.texture.bytes);
+  fillCanvas(
+      dst, reinterpret_cast<const unsigned char*>(in_tex.bytes), w, h,
+      skeleton_only);
+  {
+    Overlay ov(dst, w, h);
+    for(const auto& pose : m_instances)
+      drawOnePose(ov, pose, workflow, w, h);
+  }
   outputs.image.texture.changed = true;
 }
 

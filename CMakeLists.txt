@@ -280,7 +280,26 @@ target_sources(score_addon_onnx_models
     Onnx/helpers/FaceMesh.hpp
     Onnx/helpers/MediaPipeHands.hpp
     Onnx/helpers/RTMPose.hpp
+    Onnx/helpers/ctx.h
+    Onnx/helpers/ctx_overlay.h
+    Onnx/helpers/CtxOverlay.hpp
 )
+
+# ctx.h is a single-header C library; it does not build as C++. Build the overlay
+# shim as its own small C static library so it never touches the main target's
+# C++ precompiled header. CTX_RASTERIZER=1 enables the in-memory framebuffer
+# rasterizer (otherwise gated behind a windowing backend); -w silences the
+# header's benign C-isms (const-casts, an implicit static-inline forward use).
+add_library(score_onnx_ctx_overlay STATIC Onnx/helpers/ctx_overlay.c)
+target_include_directories(score_onnx_ctx_overlay
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Onnx/helpers)
+target_compile_definitions(score_onnx_ctx_overlay PRIVATE CTX_RASTERIZER=1)
+set_target_properties(score_onnx_ctx_overlay PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC)
+  target_compile_options(score_onnx_ctx_overlay
+    PRIVATE -w -Wno-implicit-function-declaration)
+endif()
+target_link_libraries(score_addon_onnx_models PRIVATE score_onnx_ctx_overlay)
 
 # Link
 target_link_libraries(score_addon_onnx_models
