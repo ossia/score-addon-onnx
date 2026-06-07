@@ -3,6 +3,7 @@
 
 #include <Onnx/helpers/Debug.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
+#include <Onnx/helpers/Profile.hpp>
 #include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 #include <onnxruntime_session_options_config_keys.h>
@@ -222,6 +223,7 @@ struct OnnxRunContext
 
   ModelSpec readModelSpec()
   {
+    ONNX_PROF_SCOPE(ReadSpec);
     ModelSpec spec;
 
     for (std::size_t i = 0; i < session.GetInputCount(); i++)
@@ -285,6 +287,7 @@ struct OnnxRunContext
       std::span<Ort::Value> input_tensors,
       std::span<Ort::Value> output_values)
   {
+    ONNX_PROF_SCOPE(Infer);
     try
     {
       // Counts MUST come from the caller-provided spans, not the model's full

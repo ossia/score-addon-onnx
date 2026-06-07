@@ -11,6 +11,7 @@
 #include <Onnx/helpers/MediaPipeHands.hpp>
 #include <Onnx/helpers/ModelRole.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
+#include <Onnx/helpers/Profile.hpp>
 #include <Onnx/helpers/ROI.hpp>
 #include <Onnx/helpers/RTMPose.hpp>
 #include <Onnx/helpers/Yolo.hpp>
@@ -901,6 +902,7 @@ Onnx::FloatTensor nhwcDetectorTensor(
     Onnx::ModelSpec::Port& port, const uint8_t* ptr, int stride, int mw, int mh,
     boost::container::vector<float>& storage, float a, float b)
 {
+  ONNX_PROF_SCOPE(TensorBuild);
   storage.resize(3 * mw * mh, boost::container::default_init);
   float* dst = storage.data();
   int di = 0;
@@ -924,6 +926,7 @@ Onnx::FloatTensor nchwBgrDetectorTensor(
     boost::container::vector<float>& storage, std::array<float, 3> mean_bgr,
     std::array<float, 3> std_bgr)
 {
+  ONNX_PROF_SCOPE(TensorBuild);
   storage.resize(3 * mw * mh, boost::container::default_init);
   float* b_plane = storage.data();
   float* g_plane = b_plane + mw * mh;
@@ -949,6 +952,7 @@ Onnx::FloatTensor nchwRgbDetectorTensor(
     boost::container::vector<float>& storage, std::array<float, 3> mean_rgb,
     std::array<float, 3> std_rgb)
 {
+  ONNX_PROF_SCOPE(TensorBuild);
   storage.resize(3 * mw * mh, boost::container::default_init);
   float* r_plane = storage.data();
   float* g_plane = r_plane + mw * mh;
@@ -2718,6 +2722,8 @@ try
             || (wf == PoseWorkflow::Auto && !have_landmark));
   if(!box_only && !have_landmark)
     return;
+
+  ONNX_PROF_FRAME(); // counts only frames that actually process
 
   bool reinit = false;
   if(wf != m_last_workflow)

@@ -2,6 +2,7 @@
 // Qt-free image operations for the ONNX pose core: high-quality Lanczos resize
 // (via avir LANCIR) and a bilinear affine warp (for rotated ROI crops, which
 // LANCIR can't do). Operates on interleaved 8-bit buffers (RGBA by default).
+#include <Onnx/helpers/Profile.hpp>
 #include <Onnx/helpers/lancir.h>
 
 #include <algorithm>
@@ -30,6 +31,7 @@ struct MutableImageView
 // Lanczos resize of the whole src into dst (any up/down scale, antialiased).
 inline void resize(const ImageView& src, const MutableImageView& dst)
 {
+  ONNX_PROF_SCOPE(Resize);
   thread_local avir::CLancIR rs;
   avir::CLancIRParams p;
   p.SrcSSize = src.rowBytes(); // bytes == elements for 8-bit
@@ -67,6 +69,7 @@ inline Affine affineFromRoi(
 inline void warpAffine(
     const ImageView& src, const MutableImageView& dst, const Affine& a)
 {
+  ONNX_PROF_SCOPE(Warp);
   const int C = dst.channels;
   const int srow = src.rowBytes(), drow = dst.rowBytes();
   const int sw1 = src.w - 1, sh1 = src.h - 1;
