@@ -8,7 +8,6 @@
 #include <Onnx/helpers/BlazePose.hpp>
 #include <Onnx/helpers/Detection.hpp>
 #include <Onnx/helpers/FaceMesh.hpp>
-#include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/MediaPipeHands.hpp>
 #include <Onnx/helpers/ModelRole.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
@@ -2424,9 +2423,14 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
   if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
     model_size = static_cast<int>(spec.inputs[0].shape[2]);
 
-  auto t = Onnx::nchw_tensorFromRGBA(
-      spec.inputs[0], src.data, src.w, src.h, model_size,
-      model_size, storage, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f});
+  // Cover-resize the whole frame through M (model px -> image px), the same
+  // affine the keypoint mapback below uses, so input and output geometry agree.
+  m_det_rgba.resize(static_cast<size_t>(model_size) * model_size * 4);
+  Onnx::MutableImageView dst{m_det_rgba.data(), model_size, model_size, 4, 0};
+  Onnx::ROI::warpCrop(src, M, dst);
+  auto t = nchwRgbDetectorTensor(
+      spec.inputs[0], m_det_rgba.data(), model_size * 4, model_size, model_size,
+      storage, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f});
 
   Ort::Value ins[1] = {std::move(t.value)};
   Ort::Value outs[1]{Ort::Value{nullptr}};

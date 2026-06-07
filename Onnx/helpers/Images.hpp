@@ -17,12 +17,6 @@
 namespace Onnx
 {
 
-struct FloatTensor
-{
-  boost::container::vector<float> storage;
-  Ort::Value value;
-};
-
 inline FloatTensor nchw_tensorFromARGB(
     ModelSpec::Port& port,
     const unsigned char* source_bits,
