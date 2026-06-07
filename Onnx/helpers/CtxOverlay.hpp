@@ -6,12 +6,9 @@
 #include <Onnx/helpers/CoreTypes.hpp>
 #include <Onnx/helpers/ctx_overlay.h>
 
-#include <QPointF>
-#include <QRectF>
-#include <QString>
-
 namespace OnnxModels
 {
+// Qt-free: depends only on the C overlay shim + Onnx value types.
 struct Overlay
 {
   void* c{};
@@ -26,28 +23,21 @@ struct Overlay
 
   void color(Onnx::Rgba q) { onnx_overlay_color(c, q.r, q.g, q.b, q.a); }
   void lineWidth(float w) { onnx_overlay_line_width(c, w); }
-  void line(QPointF a, QPointF b)
+  void line(Onnx::Vec2 a, Onnx::Vec2 b)
   {
-    onnx_overlay_line(
-        c, static_cast<float>(a.x()), static_cast<float>(a.y()),
-        static_cast<float>(b.x()), static_cast<float>(b.y()));
+    onnx_overlay_line(c, a.x, a.y, b.x, b.y);
   }
-  void fillCircle(QPointF p, float r)
+  void fillCircle(Onnx::Vec2 p, float r)
   {
-    onnx_overlay_fill_circle(
-        c, static_cast<float>(p.x()), static_cast<float>(p.y()), r);
+    onnx_overlay_fill_circle(c, p.x, p.y, r);
   }
-  void strokeRect(QRectF r)
+  void strokeRect(Onnx::Rect r)
   {
-    onnx_overlay_stroke_rect(
-        c, static_cast<float>(r.x()), static_cast<float>(r.y()),
-        static_cast<float>(r.width()), static_cast<float>(r.height()));
+    onnx_overlay_stroke_rect(c, r.x, r.y, r.w, r.h);
   }
-  void text(float size, QPointF p, const QString& s)
+  void text(float size, Onnx::Vec2 p, const char* s)
   {
-    onnx_overlay_text(
-        c, size, static_cast<float>(p.x()), static_cast<float>(p.y()),
-        s.toUtf8().constData());
+    onnx_overlay_text(c, size, p.x, p.y, s);
   }
 };
 } // namespace OnnxModels

@@ -19,6 +19,7 @@
 #include <Onnx/helpers/RTMPose.hpp>
 #include <Onnx/helpers/Yolo.hpp>
 #include <cmath>
+#include <cstdio>
 
 #include <algorithm>
 #include <array>
@@ -341,8 +342,8 @@ void PoseDetector::drawOnePose(
   const int num_kps = static_cast<int>(kps.size());
 
   // Helper to convert keypoint to pixel coordinates
-  auto toPoint = [&](int idx) -> QPointF {
-    return QPointF(kps[idx].x * w, kps[idx].y * h);
+  auto toPoint = [&](int idx) -> Onnx::Vec2 {
+    return {kps[idx].x * w, kps[idx].y * h};
   };
 
   // Helper to safely set alpha (clamp to valid range)
@@ -551,17 +552,18 @@ void PoseDetector::drawOnePose(
         0.9f);
     ov.color(bc);
     ov.lineWidth(2.f);
-    const QRectF r(
-        pose.box.x * w, pose.box.y * h, pose.box.w * w, pose.box.h * h);
+    const Onnx::Rect r{
+        pose.box.x * w, pose.box.y * h, pose.box.w * w, pose.box.h * h};
     ov.strokeRect(r);
 
-    QString lbl;
+    char lbl[48];
+    int n = 0;
     if(pose.track_id >= 0)
-      lbl += QStringLiteral("#%1 ").arg(pose.track_id);
+      n += std::snprintf(lbl + n, sizeof(lbl) - n, "#%d ", pose.track_id);
     if(pose.class_id >= 0)
-      lbl += QStringLiteral("c%1 ").arg(pose.class_id);
-    lbl += QString::number(pose.mean_confidence, 'f', 2);
-    ov.text(14.f, QPointF(r.x() + 2, std::max(10.0, r.y() - 3)), lbl);
+      n += std::snprintf(lbl + n, sizeof(lbl) - n, "c%d ", pose.class_id);
+    std::snprintf(lbl + n, sizeof(lbl) - n, "%.2f", pose.mean_confidence);
+    ov.text(14.f, Onnx::Vec2{r.x + 2.f, std::max(10.f, r.y - 3.f)}, lbl);
   }
 }
 
