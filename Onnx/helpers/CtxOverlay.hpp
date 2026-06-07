@@ -3,9 +3,9 @@
  * heavy ctx.h confined to ctx_overlay.c; here we only depend on the tiny C API
  * plus Qt's color/geometry value types (kept for now — full Qt-type removal is
  * a later step). Renders straight into an RGBA8888 buffer; no QPainter/GPU. */
+#include <Onnx/helpers/CoreTypes.hpp>
 #include <Onnx/helpers/ctx_overlay.h>
 
-#include <QColor>
 #include <QPointF>
 #include <QRectF>
 #include <QString>
@@ -24,12 +24,7 @@ struct Overlay
   Overlay(const Overlay&) = delete;
   Overlay& operator=(const Overlay&) = delete;
 
-  void color(QColor q)
-  {
-    onnx_overlay_color(
-        c, static_cast<float>(q.redF()), static_cast<float>(q.greenF()),
-        static_cast<float>(q.blueF()), static_cast<float>(q.alphaF()));
-  }
+  void color(Onnx::Rgba q) { onnx_overlay_color(c, q.r, q.g, q.b, q.a); }
   void lineWidth(float w) { onnx_overlay_line_width(c, w); }
   void line(QPointF a, QPointF b)
   {
