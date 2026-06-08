@@ -154,9 +154,15 @@ inline std::vector<Detection> decode(
   return dets;
 }
 
-// Greedy IoU non-maximum suppression.
+// Greedy IoU non-maximum suppression. A box is also suppressed when it is
+// nested inside a higher-scoring keeper: plain IoU misses a small box fully
+// inside a large one (IoU = area_small/area_large drops below the threshold as
+// the size ratio grows), leaving two near-coincident boxes for one subject. We
+// additionally drop any box whose own area is >= contain_thresh covered by a
+// keeper (intersection-over-minimum). contain_thresh <= 0 disables that pass.
 inline std::vector<Detection>
-nms(std::vector<Detection> dets, float iou_threshold = 0.3f)
+nms(std::vector<Detection> dets, float iou_threshold = 0.3f,
+    float contain_thresh = 0.9f)
 {
   if(dets.empty())
     return {};
@@ -164,16 +170,22 @@ nms(std::vector<Detection> dets, float iou_threshold = 0.3f)
     return a.score > b.score;
   });
 
-  auto iou = [](const Detection& a, const Detection& b) -> float {
+  // True if keeper a suppresses the lower-scoring box b.
+  auto suppresses = [iou_threshold, contain_thresh](
+                        const Detection& a, const Detection& b) -> bool {
     const float x1 = std::max(a.xc - a.w * 0.5f, b.xc - b.w * 0.5f);
     const float y1 = std::max(a.yc - a.h * 0.5f, b.yc - b.h * 0.5f);
     const float x2 = std::min(a.xc + a.w * 0.5f, b.xc + b.w * 0.5f);
     const float y2 = std::min(a.yc + a.h * 0.5f, b.yc + b.h * 0.5f);
-    const float iw = std::max(0.0f, x2 - x1);
-    const float ih = std::max(0.0f, y2 - y1);
-    const float inter = iw * ih;
-    const float uni = a.w * a.h + b.w * b.h - inter;
-    return uni > 0.0f ? inter / uni : 0.0f;
+    const float inter = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
+    if(inter <= 0.0f)
+      return false;
+    const float aa = a.w * a.h, ab = b.w * b.h;
+    const float uni = aa + ab - inter;
+    if(uni > 0.0f && inter / uni > iou_threshold)
+      return true;
+    const float mn = std::min(aa, ab);
+    return contain_thresh > 0.0f && mn > 0.0f && inter / mn >= contain_thresh;
   };
 
   std::vector<Detection> out;
@@ -184,7 +196,7 @@ nms(std::vector<Detection> dets, float iou_threshold = 0.3f)
       continue;
     out.push_back(dets[i]);
     for(size_t j = i + 1; j < dets.size(); ++j)
-      if(!dead[j] && iou(dets[i], dets[j]) > iou_threshold)
+      if(!dead[j] && suppresses(dets[i], dets[j]))
         dead[j] = true;
   }
   return out;
