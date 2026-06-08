@@ -295,7 +295,37 @@ target_sources(score_addon_onnx_models
 add_library(score_onnx_ctx_overlay STATIC Onnx/helpers/ctx_overlay.c)
 target_include_directories(score_onnx_ctx_overlay
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Onnx/helpers)
-target_compile_definitions(score_onnx_ctx_overlay PRIVATE CTX_RASTERIZER=1)
+# ctx.h is a single-header monolith (vector raster + terminal emulator + audio +
+# event loop + backends + PNG/zip). We only rasterize a skeleton overlay into a
+# framebuffer, so preemptively compile out everything that isn't the rasterizer
+# or the (text-drawing) font engine. This is how ctx is meant to be slimmed --
+# via CTX_* macros, not by hand-editing the vendored header -- and it strips all
+# the POSIX baggage (events/threads/pty/sockets pull <unistd.h>, <sys/select.h>,
+# <sys/ioctl.h>, <termios.h>, <pthread.h>, <ucontext.h> ...). Verified to leave
+# every rasterizer fast path untouched (O2/O3, compositing, gradient/glyph
+# caches, LUTs, AA, fast-rect) -- no perf regression. What ctx still references
+# from POSIX in always-compiled glue is tiny: gettimeofday() (clock init) and
+# write()/usleep() (never-executed terminal paths). mingw supplies them (its
+# Windows builds pass); MSVC and the bare-clang Windows SDK do not, so feed those
+# a small self-contained compat shim. (CTX_EVENTS=0 also relies on the
+# keymap_get_shifted guard added in ctx.h.)
+target_compile_definitions(score_onnx_ctx_overlay PRIVATE
+  CTX_RASTERIZER=1
+  CTX_EVENTS=0 CTX_THREADS=0 CTX_PTY=0
+  CTX_PARSER=0 CTX_FORMATTER=0
+  CTX_AUDIO=0 CTX_VT=0
+  CTX_SDL=0 CTX_FB=0 CTX_KMS=0 CTX_HEADLESS=0
+  CTX_BABL=0 CTX_HARFBUZZ=0 CTX_CURL=0
+  CTX_SOCKETS=0 CTX_NET=0
+  CTX_TERMINAL_EVENTS=0 CTX_RAW_KB_EVENTS=0
+  CTX_PDF=0 CTX_SCREENSHOT=0
+  CTX_GET_CONTENTS=0 CTX_LOAD_FILE=0 CTX_FONTS_FROM_FILE=0)
+if(WIN32 AND NOT MINGW)
+  target_include_directories(score_onnx_ctx_overlay BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Onnx/helpers/msvc-compat)
+  # MSVC's <math.h> only defines M_PI etc. when this is set before it is included.
+  target_compile_definitions(score_onnx_ctx_overlay PRIVATE _USE_MATH_DEFINES)
+endif()
 set_target_properties(score_onnx_ctx_overlay PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
   target_compile_options(score_onnx_ctx_overlay

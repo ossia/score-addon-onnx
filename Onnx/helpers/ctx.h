@@ -44986,8 +44986,14 @@ const char *ctx_event_source_name (Ctx *ctx, int no)
   if (no < cb->evsource_count && no >= 0)
     return cb->evsource[no]->name;
   return NULL;
+#if CTX_EVENTS
+  // score-addon-onnx local patch: keymap_get_shifted/unshifted only exist when
+  // CTX_EVENTS is on; this dead warning-suppression hack must be gated too so a
+  // CTX_EVENTS=0 build (our framebuffer-only overlay, which avoids ctx's POSIX
+  // event/tty headers for MSVC) still compiles. Re-apply on ctx updates.
   return keymap_get_shifted (" ");  // hack to shut up overzealous builds
   return keymap_get_unshifted (" ");
+#endif
 }
 
 
