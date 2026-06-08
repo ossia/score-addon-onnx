@@ -277,7 +277,7 @@ public:
           description,
           "Suppress spurious new ids whose box sits mostly inside an existing "
           "tracked person (e.g. a raised arm read as a second person).");
-      bool value = false;
+      bool value = true;
     } birth_gate;
 
     struct : halp::toggle<"Strict Confirmation">
