@@ -301,6 +301,30 @@ if(NOT MSVC)
   target_compile_options(score_onnx_ctx_overlay
     PRIVATE -w -Wno-implicit-function-declaration)
 endif()
+
+# ctx.h bundles its own copy of miniz (the mz_* zlib helpers + miniz_def_*
+# allocators) and emits it unconditionally under CTX_IMPLEMENTATION, with no
+# macro to suppress it (the core helpers aren't even behind MINIZ_NO_ZLIB_APIS).
+# score_lib_base already links a miniz, so the two definitions clash at link
+# (duplicate mz_adler32, mz_crc32, ...). The overlay rasterizer (CTX_VT=0,
+# CTX_AUDIO=0, no image write) never calls miniz; it is only pulled in because
+# onnx_overlay_* shares the translation unit. Rename the eight exported miniz
+# symbols at preprocess time so ctx's copy is private to this TU: both its
+# definitions and any internal references move together, and score's copy no
+# longer collides. Pure -D, so it works identically on every toolchain in the
+# CI matrix (clang/gcc/emscripten/FreeBSD -D, MSVC /D) -- unlike an objcopy or
+# strip post-step. If a ctx update emits a new miniz symbol, the link error
+# names it; add it here.
+target_compile_definitions(score_onnx_ctx_overlay PRIVATE
+  mz_adler32=ctxshim_mz_adler32
+  mz_crc32=ctxshim_mz_crc32
+  mz_free=ctxshim_mz_free
+  mz_version=ctxshim_mz_version
+  mz_error=ctxshim_mz_error
+  miniz_def_alloc_func=ctxshim_miniz_def_alloc_func
+  miniz_def_free_func=ctxshim_miniz_def_free_func
+  miniz_def_realloc_func=ctxshim_miniz_def_realloc_func)
+
 target_link_libraries(score_addon_onnx_models PRIVATE score_onnx_ctx_overlay)
 
 # Image-processing hot path (per-pixel bilinear sample / normalize / warp /
