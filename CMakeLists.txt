@@ -1,18 +1,23 @@
-cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 
 if(EMSCRIPTEN)
   return()
 endif()
 
-if(NOT TARGET score_lib_base)
-  include("${SCORE_SOURCE_DIR}/cmake/ScoreExternalAddon.cmake")
-endif()
-
-if(NOT TARGET score_plugin_avnd)
-  return()
-endif()
-
 project(score_addon_onnx LANGUAGES CXX)
+
+# Use the Avendish the host (ossia score) provides; otherwise fetch it.
+find_package(Avendish QUIET)
+if(NOT Avendish_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(
+    Avendish
+    GIT_REPOSITORY "https://github.com/celtera/avendish"
+    GIT_TAG main)
+  FetchContent_Populate(Avendish)
+  list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
+  find_package(Avendish REQUIRED)
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
 if(NOT TARGET onnxruntime::onnxruntime)
@@ -46,109 +51,76 @@ endif()
 # General initialization
 score_common_setup()
 
-avnd_score_plugin_init(BASE_TARGET score_addon_onnx_models)
+avnd_addon_init(NAME score_addon_onnx_models)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME yolo-blob
+  CLASS YOLO7BlobDetector
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/YOLO-blob.hpp
-    OnnxModels/YOLO-blob.cpp
-  TARGET
-    yolo-blob
-  MAIN_CLASS
-    YOLO7BlobDetector
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/YOLO-blob.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME yolo-segmentation
+  CLASS YOLO8Segmentation
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/YOLO-segmentation.hpp
-    OnnxModels/YOLO-segmentation.cpp
-  TARGET
-    yolo-segmentation
-  MAIN_CLASS
-    YOLO8Segmentation
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/YOLO-segmentation.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME resnet
+  CLASS ResnetDetector
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/Resnet.hpp
-    OnnxModels/Resnet.cpp
-  TARGET
-    resnet
-  MAIN_CLASS
-    ResnetDetector
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/Resnet.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME enet
+  CLASS EmotionNetDetector
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/ENet.hpp
-    OnnxModels/ENet.cpp
-  TARGET
-    enet
-  MAIN_CLASS
-    EmotionNetDetector
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/ENet.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME yolo-pose
+  CLASS PoseDetector
+  NAMESPACE OnnxModels::Yolo
   SOURCES
     OnnxModels/YOLO-pose.hpp
-    OnnxModels/YOLO-pose.cpp
-  TARGET
-    yolo-pose
-  MAIN_CLASS
-    PoseDetector
-  NAMESPACE
-    OnnxModels::Yolo
-)
+    OnnxModels/YOLO-pose.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME blazepose
+  CLASS BlazePoseDetector
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/BlazePose.hpp
-    OnnxModels/BlazePose.cpp
-  TARGET
-    blazepose
-  MAIN_CLASS
-    BlazePoseDetector
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/BlazePose.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME trtpose
+  CLASS TRTPoseDetector
+  NAMESPACE OnnxModels::TRTPose
   SOURCES
     OnnxModels/TRTPose.hpp
-    OnnxModels/TRTPose.cpp
-  TARGET
-    trtpose
-  MAIN_CLASS
-    TRTPoseDetector
-  NAMESPACE
-    OnnxModels::TRTPose
-)
+    OnnxModels/TRTPose.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME pose-detector
+  CLASS PoseDetector
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/PoseDetector.hpp
     OnnxModels/PoseDetector_internal.hpp
@@ -156,122 +128,79 @@ avnd_score_plugin_add(
     OnnxModels/PoseDetector_draw.cpp
     OnnxModels/PoseDetector_detect.cpp
     OnnxModels/PoseDetector_landmark.cpp
-    OnnxModels/PoseDetector_tracking.cpp
-  TARGET
-    pose-detector
-  MAIN_CLASS
-    PoseDetector
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/PoseDetector_tracking.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME depthanything2
+  CLASS DepthAnythingV2
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/DepthAnything2.hpp
-    OnnxModels/DepthAnything2.cpp
-  TARGET
-    depthanything2
-  MAIN_CLASS
-    DepthAnythingV2
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/DepthAnything2.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME regressor
+  CLASS Regressor
+  NAMESPACE RapidlibModels
   SOURCES
     RapidlibModels/Regressor.hpp
-    RapidlibModels/Regressor.cpp
-  TARGET
-    regressor
-  MAIN_CLASS
-    Regressor
-  NAMESPACE
-    RapidlibModels
-)
+    RapidlibModels/Regressor.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME classifier
+  CLASS Classifier
+  NAMESPACE RapidlibModels
   SOURCES
     RapidlibModels/Classifier.hpp
-    RapidlibModels/Classifier.cpp
-  TARGET
-    classifier
-  MAIN_CLASS
-    Classifier
-  NAMESPACE
-    RapidlibModels
-)
+    RapidlibModels/Classifier.cpp)
 
 
 if(NOT WIN32)
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME fastvlm
+  CLASS FastVLMNode
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/FastVLM.hpp
     OnnxModels/FastVLM.cpp
     Onnx/helpers/FastVLM.hpp
-    Onnx/helpers/FastVLM.cpp
-  TARGET
-    fastvlm
-  MAIN_CLASS
-    FastVLMNode
-  NAMESPACE
-    OnnxModels
-)
+    Onnx/helpers/FastVLM.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME qwenllm
+  CLASS QwenLLMNode
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/QwenLLM.hpp
     OnnxModels/QwenLLM.cpp
     Onnx/helpers/QwenLLM.hpp
-    Onnx/helpers/QwenLLM.cpp
-  TARGET
-    qwenllm
-  MAIN_CLASS
-    QwenLLMNode
-  NAMESPACE
-    OnnxModels
-)
+    Onnx/helpers/QwenLLM.cpp)
 endif()
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME generative-image-gan
+  CLASS GenerativeImageGAN
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/GenerativeImageGAN.hpp
-    OnnxModels/GenerativeImageGAN.cpp
-  TARGET
-    generative-image-gan
-  MAIN_CLASS
-    GenerativeImageGAN
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/GenerativeImageGAN.cpp)
 
-avnd_score_plugin_add(
-  BASE_TARGET
-    score_addon_onnx_models
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME image-to-image-gan
+  CLASS ImageToImageGAN
+  NAMESPACE OnnxModels
   SOURCES
     OnnxModels/ImageToImageGAN.hpp
-    OnnxModels/ImageToImageGAN.cpp
-  TARGET
-    image-to-image-gan
-  MAIN_CLASS
-    ImageToImageGAN
-  NAMESPACE
-    OnnxModels
-)
+    OnnxModels/ImageToImageGAN.cpp)
 
-avnd_score_plugin_finalize(BASE_TARGET score_addon_onnx_models PLUGIN_VERSION 1
-                           PLUGIN_UUID "24a98f5b-700f-401c-ab89-8c1173bda73f")
+avnd_addon_finalize(NAME score_addon_onnx_models UUID 24a98f5b-700f-401c-ab89-8c1173bda73f VERSION 1)
 
 target_sources(score_addon_onnx_models
   PRIVATE
