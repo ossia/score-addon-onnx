@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <vector>
 
@@ -88,7 +89,38 @@ struct Config
   bool use_reid = false;    // blend appearance cosine into the cost
   float w_emb = 0.25f;      // appearance weight
   float emb_gate = 0.25f;   // min cosine to allow an appearance-only re-acquire
-  float emb_ema = 0.9f;     // per-track embedding EMA factor
+  float emb_ema = 0.9f;     // per-track embedding EMA factor (max incorporation)
+  // Confidence-adaptive EMA (Deep OC-SORT "Dynamic Appearance"): below this
+  // detection-quality threshold the new embedding is IGNORED (occlusion/blur
+  // proxy), so a low-confidence frame can't contaminate the identity template
+  // (and therefore the gallery, which stores the EMA'd template). Between thresh
+  // and 1 the update rate ramps from 0 to (1 - emb_ema).
+  float emb_quality_thresh = 0.5f;
+  // Long-term appearance gallery: when a confirmed track dies (left the frame),
+  // remember its id+embedding for gallery_ttl frames; a newly-born track whose
+  // appearance matches (cosine >= gallery_gate) RE-ACQUIRES that id instead of
+  // getting a fresh one. This is what lets a subject walk off and come back with
+  // the same id. Off unless ReID is on.
+  bool use_gallery = false;
+  int gallery_ttl = 1800;   // ~30-60s at typical fps; entries expire after this
+  float gallery_gate = 0.5f; // min cosine to re-acquire a gallery id
+  // Multi-shot gallery: instead of one averaged (EMA) template per departed
+  // identity, keep a small reservoir of DISTINCT clean appearance snapshots
+  // (slot 0 = peak-confidence view, the rest sampled every snapshot_interval
+  // frames). A query is matched by the BEST-matching snapshot in the set (plus a
+  // vote count), so a returning person matches whichever stored pose/viewpoint
+  // is closest to their current one — far more robust than a single mean.
+  int snapshot_interval = 45; // frames between captured snapshots (~1.5s @ 30fps)
+  int max_snapshots = 8;      // reservoir cap per identity
+
+  // Emit per-decision tracing to stderr (which id was picked and why). Off by
+  // default; the node turns it on from the SCORE_ONNX_TRACK_DEBUG env var.
+  bool debug = false;
+  // Ambiguity guard: the best gallery match must beat the SECOND-best by at
+  // least this cosine margin before its id is adopted. Prevents ID "hijacking"
+  // between near-identical people (teammates in the same kit, dancers) where the
+  // top two gallery entries are similarly close. 0 disables the margin check.
+  float reacquire_margin = 0.1f;
 
   // --- Plausibility gates (composable; every default reproduces the baseline so
   //     each can be A/B-tested independently). See cost() and canBirth(). ---
@@ -260,12 +292,24 @@ struct Tracklet
   std::vector<Keypoint> kpts_smooth; // One-Euro output (owned by this id)
   PoseSmoother smoother;             // 2 filters per keypoint (x,y)
   std::vector<float> embedding;      // EMA of L2-normalized ReID features
+  // Multi-shot appearance reservoir frozen into the gallery on death: slot 0 is
+  // the peak-confidence view, the rest are interval samples (round-robin).
+  std::vector<std::vector<float>> snapshots;
+  float snap_peak_q = -1.f; // quality of the peak snapshot (slot 0)
+  int snap_last_age = 0;    // track age at the last interval sample
+  int snap_rr = 1;          // round-robin write cursor over slots [1, max)
 
   float score = 0.f;
   int hits = 0;
   int age = 0;
   int time_since_update = 0;
   bool confirmed = false;
+  // True while this track holds a FRESHLY-MINTED id (the birth-time gallery
+  // re-acquire failed or didn't run). Such a track keeps re-checking the gallery
+  // each frame with its EMA-stabilized embedding, so a person who was given a
+  // wrong new id at re-entry gets corrected back to their original id once the
+  // appearance stabilizes. Cleared once an id is gallery-confirmed.
+  bool id_provisional = true;
 
   // OC-SORT direction history
   float prev_cx = 0, prev_cy = 0;
@@ -283,6 +327,7 @@ public:
   void reset()
   {
     _tracks.clear();
+    _gallery.clear();
     _next_id = 1;
   }
 
@@ -290,9 +335,13 @@ public:
   // the assigned track id (-1 if the detection started a still-tentative track
   // or was dropped). After this call, tracks() holds the live tracklets with
   // smoothed keypoints.
-  std::vector<int> update(const std::vector<Detection>& dets)
+  const std::vector<int>& update(const std::vector<Detection>& dets)
   {
-    std::vector<int> out(dets.size(), -1);
+    // All per-frame scratch is held in reused members (cleared, never reallocated
+    // once warm) — the hot path must not allocate. `out` is returned by const&;
+    // callers consume it before the next update() overwrites it.
+    auto& out = _assign;
+    out.assign(dets.size(), -1);
 
     // 1) predict all tracks forward; motion-compensate their keypoints so OKS
     //    compares pose *shape*, not stale position (the key tuning lesson).
@@ -311,22 +360,29 @@ public:
     }
 
     // 2) split detections by score
-    std::vector<int> high, low;
+    auto& high = _high;
+    auto& low = _low;
+    high.clear();
+    low.clear();
     for(int i = 0; i < (int)dets.size(); ++i)
       (dets[i].score >= _cfg.track_high ? high : low).push_back(i);
 
-    std::vector<int> t_match(_tracks.size(), -1);
-    std::vector<char> d_used(dets.size(), 0);
+    auto& t_match = _t_match;
+    auto& d_used = _d_used;
+    t_match.assign(_tracks.size(), -1);
+    d_used.assign(dets.size(), 0);
 
     // 3) stage 1: all tracks vs high-score detections (IoU + OKS + dir)
-    std::vector<int> all_t(_tracks.size());
+    auto& all_t = _all_t;
+    all_t.resize(_tracks.size());
     for(int i = 0; i < (int)_tracks.size(); ++i)
       all_t[i] = i;
     associate(all_t, high, dets, t_match, d_used, /*full_cost=*/true);
 
     // 4) stage 2: unmatched tracks vs low-score detections (IoU only — recovers
     //    confidence dips / partial occlusion, the ByteTrack trick)
-    std::vector<int> rem_t;
+    auto& rem_t = _rem_t;
+    rem_t.clear();
     for(int i = 0; i < (int)_tracks.size(); ++i)
       if(t_match[i] < 0)
         rem_t.push_back(i);
@@ -339,6 +395,12 @@ public:
         continue;
       const int di = t_match[i];
       updateTrack(_tracks[i], dets[di]);
+      // Mid-track re-acquire: a provisional-id track (one given a fresh id
+      // because the birth-time gallery match failed on a poor re-entry frame)
+      // re-checks the gallery every frame with its now EMA-stabilized embedding.
+      // Once it matches its original entry it adopts that id — correcting a
+      // wrong id instead of being stuck with it for the rest of the session.
+      maybeReacquireFromGallery(_tracks[i]);
       if(_tracks[i].confirmed)
         out[di] = _tracks[i].id;
     }
@@ -355,18 +417,57 @@ public:
 
     // 7) death: drop tracks lost longer than max_age. With strict confirmation,
     //    also drop a tentative track the first frame it fails to match (so a
-    //    one-frame spurious detection never persists or is emitted).
+    //    one-frame spurious detection never persists or is emitted). A confirmed
+    //    track that dies with an appearance embedding is remembered in the
+    //    gallery so the subject re-acquires its id on return.
     _tracks.erase(
         std::remove_if(
             _tracks.begin(), _tracks.end(),
             [&](const Tracklet& t) {
-              if(t.time_since_update > _cfg.max_age)
-                return true;
-              if(_cfg.strict_confirm && !t.confirmed && t.time_since_update > 0)
-                return true;
-              return false;
+              const bool dead = t.time_since_update > _cfg.max_age
+                                || (_cfg.strict_confirm && !t.confirmed
+                                    && t.time_since_update > 0);
+              if(dead)
+              {
+                const bool galleried = _cfg.use_gallery && t.confirmed
+                                       && !t.snapshots.empty();
+                if(galleried)
+                  _gallery.push_back({t.id, t.snapshots, 0});
+                if(_cfg.debug)
+                  std::fprintf(
+                      stderr,
+                      "[track] DEATH id=%d (lost %d frames) -> %s (snaps=%d, "
+                      "gallery=%d)\n",
+                      t.id, t.time_since_update,
+                      galleried ? "gallery" : "discarded",
+                      (int)t.snapshots.size(), (int)_gallery.size());
+              }
+              return dead;
             }),
         _tracks.end());
+
+    // Age the gallery; expire stale entries.
+    if(_cfg.use_gallery)
+    {
+      for(auto& g : _gallery)
+        ++g.age;
+      _gallery.erase(
+          std::remove_if(
+              _gallery.begin(), _gallery.end(),
+              [&](const GalleryEntry& g) { return g.age > _cfg.gallery_ttl; }),
+          _gallery.end());
+    }
+
+    if(_cfg.debug)
+    {
+      std::fprintf(
+          stderr, "[track] frame: %d dets -> ids [", (int)dets.size());
+      for(size_t i = 0; i < out.size(); ++i)
+        std::fprintf(stderr, "%s%d", i ? "," : "", out[i]);
+      std::fprintf(
+          stderr, "] | %d live, %d gallery\n", (int)_tracks.size(),
+          (int)_gallery.size());
+    }
 
     return out;
   }
@@ -433,7 +534,8 @@ private:
     {
       if(_cfg.motion_gate == MotionGate::MaxSpeed)
       {
-        const float disp = std::hypot(d.box.cx - tb.cx, d.box.cy - tb.cy);
+        const float ddx = d.box.cx - tb.cx, ddy = d.box.cy - tb.cy;
+        const float disp = std::sqrt(ddx * ddx + ddy * ddy);
         const float budget = _cfg.max_speed * std::max(tb.w, tb.h)
                              * float(1 + t.time_since_update);
         if(disp > budget)
@@ -466,7 +568,8 @@ private:
     {
       const float vx = t.mean(0) - t.prev_cx, vy = t.mean(1) - t.prev_cy;
       const float tx = d.box.cx - t.prev_cx, ty = d.box.cy - t.prev_cy;
-      const float nv = std::hypot(vx, vy), nt = std::hypot(tx, ty);
+      const float nv = std::sqrt(vx * vx + vy * vy);
+      const float nt = std::sqrt(tx * tx + ty * ty);
       if(nv > 1e-4f && nt > 1e-4f)
       {
         float cosang = (vx * tx + vy * ty) / (nv * nt);
@@ -484,12 +587,9 @@ private:
       const std::vector<Detection>& dets, std::vector<int>& t_match,
       std::vector<char>& d_used, bool full_cost)
   {
-    struct Pair
-    {
-      float c;
-      int ti, di;
-    };
-    std::vector<Pair> pairs;
+    auto& pairs = _pairs; // reused member (cost matrix); never reallocated warm
+    pairs.clear();
+    pairs.reserve(tk.size() * dk.size());
     for(int ti : tk)
     {
       if(t_match[ti] >= 0)
@@ -563,17 +663,60 @@ private:
         t.embedding = d.embedding; // first sight / changed model -> adopt
       else
       {
-        const float a = _cfg.emb_ema;
-        float norm = 0.f;
-        for(size_t i = 0; i < t.embedding.size(); ++i)
+        // Confidence-adaptive EMA factor: a is the fraction of the OLD template
+        // kept. Low detection quality -> a -> 1 (ignore the new, possibly
+        // occluded/blurred embedding); high quality -> a -> emb_ema. Mirrors
+        // Deep OC-SORT's Dynamic Appearance, with the pose mean-confidence as the
+        // quality proxy. When a ~= 1 the template (and thus the gallery) is left
+        // untouched this frame, keeping the identity clean.
+        const float sigma = _cfg.emb_quality_thresh;
+        const float trust = (sigma < 1.f)
+                                ? std::clamp(
+                                      (d.score - sigma) / (1.f - sigma), 0.f, 1.f)
+                                : 0.f;
+        const float a = _cfg.emb_ema + (1.f - _cfg.emb_ema) * (1.f - trust);
+        if(a < 0.999f)
         {
-          t.embedding[i] = a * t.embedding[i] + (1.f - a) * d.embedding[i];
-          norm += t.embedding[i] * t.embedding[i];
+          float norm = 0.f;
+          for(size_t i = 0; i < t.embedding.size(); ++i)
+          {
+            t.embedding[i] = a * t.embedding[i] + (1.f - a) * d.embedding[i];
+            norm += t.embedding[i] * t.embedding[i];
+          }
+          norm = std::sqrt(norm);
+          if(norm > 1e-9f)
+            for(auto& v : t.embedding)
+              v /= norm;
         }
-        norm = std::sqrt(norm);
-        if(norm > 1e-9f)
-          for(auto& v : t.embedding)
-            v /= norm;
+      }
+
+      // Multi-shot reservoir: capture only CLEAN (high-quality) RAW embeddings
+      // (not the EMA), so each snapshot is a crisp distinct view rather than a
+      // blurred average. Slot 0 holds the peak-confidence view; the rest are
+      // interval samples written round-robin to stay temporally diverse.
+      if(_cfg.use_gallery && d.score >= _cfg.emb_quality_thresh)
+      {
+        if(d.score > t.snap_peak_q)
+        {
+          t.snap_peak_q = d.score;
+          if(t.snapshots.empty())
+            t.snapshots.push_back(d.embedding);
+          else
+            t.snapshots[0] = d.embedding;
+        }
+        if(_cfg.max_snapshots > 1
+           && t.age - t.snap_last_age >= _cfg.snapshot_interval)
+        {
+          t.snap_last_age = t.age;
+          if((int)t.snapshots.size() < _cfg.max_snapshots)
+            t.snapshots.push_back(d.embedding);
+          else
+          {
+            if(t.snap_rr < 1 || t.snap_rr >= (int)t.snapshots.size())
+              t.snap_rr = 1;
+            t.snapshots[t.snap_rr++] = d.embedding;
+          }
+        }
       }
     }
 
@@ -586,7 +729,29 @@ private:
   void birth(const Detection& d)
   {
     Tracklet t;
-    t.id = _next_id++;
+    // Long-term re-acquire: if this new detection's appearance matches a
+    // remembered (departed) track, reuse that id instead of minting a new one.
+    int reacquired = -1;
+    if(_cfg.use_gallery)
+    {
+      const int g = findGalleryMatch(d.embedding, "birth");
+      if(g >= 0)
+      {
+        reacquired = _gallery[g].id;
+        // Inherit the identity's whole appearance reservoir so its memory (and
+        // multi-view robustness) persists across the exit/return, and pin slot 0
+        // so the original peak view is not overwritten by this re-entry frame.
+        t.snapshots = std::move(_gallery[g].snapshots);
+        t.snap_peak_q = 1.f;
+        _gallery.erase(_gallery.begin() + g);
+      }
+    }
+    t.id = (reacquired >= 0) ? reacquired : _next_id++;
+    if(_cfg.debug)
+      std::fprintf(
+          stderr, "[track] BIRTH id=%d (%s) score=%.2f reid=%s\n", t.id,
+          reacquired >= 0 ? "RE-ACQUIRED" : "new", d.score,
+          d.embedding.empty() ? "no" : "yes");
     _kf.initiate(boxToXyah(d.box), t.mean, t.cov);
     t.kpts = d.keypoints;
     t.kpts_smooth = d.keypoints;
@@ -595,8 +760,126 @@ private:
     t.hits = 1;
     t.age = 1;
     t.time_since_update = 0;
-    t.confirmed = (_cfg.min_hits <= 1);
+    // A re-acquired (gallery-matched) track is a known subject — confirm it
+    // immediately so its id reappears at once instead of after min_hits frames.
+    t.confirmed = (reacquired >= 0) || (_cfg.min_hits <= 1);
+    // A gallery-matched id is final; a fresh id stays provisional so it keeps
+    // re-checking the gallery as its embedding stabilizes.
+    t.id_provisional = (reacquired < 0);
     _tracks.push_back(std::move(t));
+  }
+
+  // Best gallery entry for `emb` that (a) passes the cosine gate, (b) beats the
+  // SECOND-best by reacquire_margin (ambiguity guard vs near-identical people),
+  // and (c) whose id is not already held by a live track (one id per frame).
+  // Returns the gallery index, or -1. Shared by birth and mid-track adoption.
+  int findGalleryMatch(const std::vector<float>& emb, const char* ctx = "") const
+  {
+    if(emb.empty() || _gallery.empty())
+      return -1;
+    // Per entry: sim = BEST-matching snapshot (DeepSORT min-distance, robust to
+    // pose change), votes = how many snapshots match (consensus). Rank entries
+    // by votes then sim; track the runner-up sim for the ambiguity margin.
+    int best_g = -1, best_votes = -1;
+    float best_sim = -2.f, second_sim = -2.f;
+    for(int g = 0; g < (int)_gallery.size(); ++g)
+    {
+      float sim = -2.f;
+      int votes = 0;
+      for(const auto& s : _gallery[g].snapshots)
+      {
+        const float c = cosine(s, emb);
+        if(c > sim)
+          sim = c;
+        if(c >= _cfg.gallery_gate)
+          ++votes;
+      }
+      const bool better
+          = (votes > best_votes) || (votes == best_votes && sim > best_sim);
+      if(better)
+      {
+        if(best_g >= 0 && best_sim > second_sim)
+          second_sim = best_sim;
+        best_g = g;
+        best_votes = votes;
+        best_sim = sim;
+      }
+      else if(sim > second_sim)
+      {
+        second_sim = sim;
+      }
+    }
+    const int cand_id = best_g >= 0 ? _gallery[best_g].id : -1;
+    const int cand_snaps
+        = best_g >= 0 ? (int)_gallery[best_g].snapshots.size() : 0;
+    if(best_g < 0 || best_sim < _cfg.gallery_gate)
+    {
+      if(_cfg.debug)
+        std::fprintf(
+            stderr,
+            "[track] gallery %s: REJECT (below gate) best_id=%d sim=%.3f "
+            "votes=%d gate=%.2f (gallery=%d)\n",
+            ctx, cand_id, best_sim, best_votes, _cfg.gallery_gate,
+            (int)_gallery.size());
+      return -1;
+    }
+    // Ambiguity guard: the best identity must beat the runner-up by a margin,
+    // else we'd risk hijacking a similar-looking person's id.
+    if(_cfg.reacquire_margin > 0.f && second_sim > -1.f
+       && (best_sim - second_sim) < _cfg.reacquire_margin)
+    {
+      if(_cfg.debug)
+        std::fprintf(
+            stderr,
+            "[track] gallery %s: REJECT (ambiguous) best_id=%d sim=%.3f vs "
+            "2nd=%.3f margin=%.2f\n",
+            ctx, cand_id, best_sim, second_sim, _cfg.reacquire_margin);
+      return -1;
+    }
+    // One id per frame: never adopt an id a live track already holds.
+    const int id = _gallery[best_g].id;
+    for(const auto& t : _tracks)
+      if(t.id == id)
+      {
+        if(_cfg.debug)
+          std::fprintf(
+              stderr,
+              "[track] gallery %s: REJECT (id %d already live) sim=%.3f\n", ctx,
+              id, best_sim);
+        return -1;
+      }
+    if(_cfg.debug)
+      std::fprintf(
+          stderr,
+          "[track] gallery %s: MATCH id=%d sim=%.3f votes=%d/%d 2nd=%.3f\n", ctx,
+          cand_id, best_sim, best_votes, cand_snaps, second_sim);
+    return best_g;
+  }
+
+  // If a provisional-id track's EMA appearance now matches a gallery entry,
+  // adopt that (original) id and lock it. Requires a couple of observations so
+  // the embedding is past its noisy birth value.
+  void maybeReacquireFromGallery(Tracklet& t)
+  {
+    if(!_cfg.use_gallery || !t.id_provisional || t.hits < 2)
+      return;
+    const int g = findGalleryMatch(t.embedding, "midtrack");
+    if(g >= 0)
+    {
+      const int old = t.id;
+      t.id = _gallery[g].id;
+      // Inherit the original identity's appearance reservoir (as birth() does),
+      // pinning slot 0 so the stored peak view survives. Without this the
+      // correction would discard the long-term memory and re-gallery only this
+      // track's younger, poorer snapshots — degrading re-ID on every correction.
+      t.snapshots = std::move(_gallery[g].snapshots);
+      t.snap_peak_q = 1.f;
+      _gallery.erase(_gallery.begin() + g);
+      t.id_provisional = false;
+      if(_cfg.debug)
+        std::fprintf(
+            stderr, "[track] RE-ACQUIRE mid-track: id %d -> %d\n", old, t.id);
+    }
   }
 
   static constexpr float kReject = std::numeric_limits<float>::max();
@@ -605,6 +888,28 @@ private:
   KalmanFilter _kf;
   std::vector<Tracklet> _tracks;
   int _next_id = 1;
+
+  // Per-frame association scratch, hoisted out of update()/associate() so the
+  // hot path never heap-allocates once these have grown to their working size.
+  struct Pair
+  {
+    float c;
+    int ti, di;
+  };
+  std::vector<int> _assign;  // returned by update() (one entry per detection)
+  std::vector<int> _high, _low, _t_match, _all_t, _rem_t;
+  std::vector<char> _d_used;
+  std::vector<Pair> _pairs;  // cost matrix candidates
+
+  // Long-term ReID gallery: embeddings of confirmed tracks that left the frame,
+  // kept so a returning subject re-acquires its old id (see Config::use_gallery).
+  struct GalleryEntry
+  {
+    int id;
+    std::vector<std::vector<float>> snapshots; // multi-shot appearance set
+    int age = 0;
+  };
+  std::vector<GalleryEntry> _gallery;
 };
 
 } // namespace Track

@@ -48,12 +48,17 @@ struct BoundingBox
 struct DetectedPose
 {
   std::vector<PoseKeypoint> keypoints; // empty for box-only detections
+  // World-space 3D keypoints (meters, hip-origin) for models that emit them
+  // (BlazePose full-body landmark's [1,117] world output). Same joint order and
+  // confidences as `keypoints`; empty when the model has no world output.
+  // NOT affine-mapped or smoothed — raw metric coordinates.
+  std::vector<PoseKeypoint> world;
   float mean_confidence;
   int track_id = -1; // persistent ID across frames (-1 = untracked)
   BoundingBox box;   // always filled: detector box, or the keypoint bbox
   int class_id = -1; // detector class (-1 = n/a, e.g. landmark-only output)
 
-  halp_field_names(keypoints, mean_confidence, track_id, box, class_id);
+  halp_field_names(keypoints, world, mean_confidence, track_id, box, class_id);
 };
 
 // Available pose estimation workflows
@@ -94,8 +99,9 @@ enum class ReidPreprocess : uint8_t
   ArcFaceRGB,   // (x-127.5)/128, RGB       (ArcFace)
 };
 
-// Output visualization mode
-enum class OutputMode
+// Output visualization mode. Uniquely named (not "OutputMode") so it can't
+// clash with the image/video nodes' OutputMode in the OnnxModels namespace.
+enum class PoseRenderMode
 {
   SkeletonOnImage, // Draw skeleton on top of input image
   SkeletonOnly,    // Draw skeleton on black background
@@ -108,6 +114,9 @@ enum class KeypointOutputFormat
   XYArray,   // Flat xyxy array
   XYZArray,  // Flat xyzxyz array
   LineArray, // Flat xyz pairs for e.g. GL_LINES (x1,y1,z1,x2,y2,z2,...)
+  WorldXYZArray, // Flat world-space xyz (meters, hip-origin) from models with a
+                 // world-3D output (BlazePose family); falls back to the screen
+                 // xyz when the model has none.
 };
 
 struct PoseDetector : OnnxObject
@@ -135,15 +144,23 @@ public:
 
     } workflow;
 
-    struct : halp::enum_t<OutputMode, "Output Mode">
+    struct : halp::enum_t<PoseRenderMode, "Output Mode">
     {
       halp_meta(description, "Visualization output mode");
     } output_mode;
 
-    halp::hslider_f32<"Min Confidence", halp::range{0., 1., 0.3}> min_confidence;
+    struct : halp::hslider_f32<"Min Confidence", halp::range{0., 1., 0.3}>
+    {
+      halp_meta(
+          description,
+          "Detection / keypoint acceptance threshold: instances and joints below "
+          "this score are dropped. Also gates which instances get tracked.");
+    } min_confidence;
 
     struct : halp::toggle<"Draw Skeleton">
     {
+      halp_meta(
+          description, "Draw the skeleton bone lines connecting the keypoints.");
       bool value = true;
     } draw_skeleton;
 
@@ -298,6 +315,43 @@ public:
           "-> human) falls back to Native.");
     } skeleton_type;
 
+    // Appended last to keep existing presets' port indices stable.
+    struct : halp::file_port<"Class Names File">
+    {
+      halp_meta(
+          description,
+          "Box Detection: a text file with one class name per line, used to "
+          "label boxes instead of the numeric id. Empty = built-in COCO-80.");
+    } class_file;
+
+    struct : halp::spinbox_i32<"Track Memory", halp::range{1, 300, 30}>
+    {
+      halp_meta(
+          description,
+          "Track IDs: how many frames a lost track is kept alive (Kalman-coasted) "
+          "before it is dropped (~ frames-per-second = ~1s at 30). Higher = an id "
+          "survives longer occlusions but may stick to a stale position.");
+    } track_memory;
+
+    struct : halp::spinbox_i32<"Re-ID Memory", halp::range{0, 18000, 1800}>
+    {
+      halp_meta(
+          description,
+          "Re-ID: how many frames a DEPARTED person's appearance is remembered "
+          "so they re-acquire their id when they return to frame (~30-60s at 30 "
+          "fps). 0 = no long-term gallery. Needs Re-ID on.");
+    } reid_memory;
+
+    struct : halp::hslider_f32<"Re-ID Margin", halp::range{0., 0.5, 0.1}>
+    {
+      halp_meta(
+          description,
+          "Re-ID ambiguity guard: the best remembered identity must beat the "
+          "second-best by at least this appearance margin before a returning "
+          "person re-acquires its id. Higher = stricter, avoids swapping "
+          "near-identical people (same uniform); 0 = off.");
+    } reid_margin;
+
   } inputs;
 
   struct
@@ -353,33 +407,49 @@ public:
       halp::item<&ins::det_model> det_model;
       halp::item<&ins::workflow> workflow;
       halp::item<&ins::detection_class> detection_class;
+      halp::item<&ins::class_file> class_file;
     } models_tab;
 
-    struct
-    {
-      halp_meta(name, "Output")
-      halp_meta(layout, halp::layouts::vbox)
-      halp::item<&ins::min_confidence> min_confidence;
-      halp::item<&ins::output_mode> output_mode;
-      halp::item<&ins::draw_skeleton> draw_skeleton;
-      halp::item<&ins::draw_landmarks> draw_landmarks;
-      halp::item<&ins::draw_boxes> draw_boxes;
-      halp::item<&ins::data_format> data_format;
-      halp::item<&ins::skeleton_type> skeleton_type;
-    } output_tab;
-
+    // Tracking tab, split into three columns: core tracking, ROI feedback, and
+    // the plausibility gates.
     struct
     {
       halp_meta(name, "Tracking")
-      halp_meta(layout, halp::layouts::vbox)
-      halp::item<&ins::track_ids> track_ids;
-      halp::item<&ins::max_instances> max_instances;
-      halp::item<&ins::track_roi> track_roi;
-      halp::item<&ins::detector_cadence> detector_cadence;
-      halp::item<&ins::motion_gate> motion_gate;
-      halp::item<&ins::max_speed> max_speed;
-      halp::item<&ins::birth_gate> birth_gate;
-      halp::item<&ins::strict_confirm> strict_confirm;
+      halp_meta(layout, halp::layouts::hbox)
+
+      struct
+      {
+        halp_meta(name, "Tracking")
+        halp_meta(layout, halp::layouts::vbox)
+        // Min Confidence belongs with tracking: it is the detection-acceptance
+        // threshold that gates which instances are tracked.
+        halp::item<&ins::min_confidence> min_confidence;
+        halp::item<&ins::track_ids> track_ids;
+        halp::item<&ins::max_instances> max_instances;
+        halp::item<&ins::track_memory> track_memory;
+      } core;
+
+      halp::spacing sp1{.width = 12, .height = 1};
+
+      struct
+      {
+        halp_meta(name, "ROI")
+        halp_meta(layout, halp::layouts::vbox)
+        halp::item<&ins::track_roi> track_roi;
+        halp::item<&ins::detector_cadence> detector_cadence;
+      } roi;
+
+      halp::spacing sp2{.width = 12, .height = 1};
+
+      struct
+      {
+        halp_meta(name, "Gates")
+        halp_meta(layout, halp::layouts::vbox)
+        halp::item<&ins::motion_gate> motion_gate;
+        halp::item<&ins::max_speed> max_speed;
+        halp::item<&ins::birth_gate> birth_gate;
+        halp::item<&ins::strict_confirm> strict_confirm;
+      } gates;
     } tracking_tab;
 
     struct
@@ -390,6 +460,8 @@ public:
       halp::item<&ins::reid> reid;
       halp::item<&ins::reid_weight> reid_weight;
       halp::item<&ins::reid_preprocess> reid_preprocess;
+      halp::item<&ins::reid_memory> reid_memory;
+      halp::item<&ins::reid_margin> reid_margin;
     } reid_tab;
 
     struct
@@ -399,6 +471,19 @@ public:
       halp::item<&ins::smoothing> smoothing;
       halp::item<&ins::smoothing_amount> smoothing_amount;
     } smoothing_tab;
+
+    // Output is the LAST tab (visualization/format, set once and forgotten).
+    struct
+    {
+      halp_meta(name, "Output")
+      halp_meta(layout, halp::layouts::vbox)
+      halp::item<&ins::output_mode> output_mode;
+      halp::item<&ins::draw_skeleton> draw_skeleton;
+      halp::item<&ins::draw_landmarks> draw_landmarks;
+      halp::item<&ins::draw_boxes> draw_boxes;
+      halp::item<&ins::data_format> data_format;
+      halp::item<&ins::skeleton_type> skeleton_type;
+    } output_tab;
   };
 
   PoseDetector() noexcept;
@@ -412,9 +497,13 @@ private:
   // image-normalized [0,1] coordinates (letterbox removed).
   // keep_class: -2 = use the target-domain default class filter (person/animal),
   // -1 = keep all classes, >=0 = keep only that class id.
+  // ctx_override runs the detector on a specific context instead of det_ctx
+  // (used when a detector model sits in the LANDMARK port, e.g. RetinaFace alone
+  // drawn as a 5-keypoint pose — its session is `ctx`, not `det_ctx`).
   std::vector<Onnx::Detection::Detection> runDetector(
       const Onnx::ModelRole& role, const Onnx::ImageView& src,
-      Onnx::ModelDomain target = Onnx::ModelDomain::Body, int keep_class = -2);
+      Onnx::ModelDomain target = Onnx::ModelDomain::Body, int keep_class = -2,
+      Onnx::OnnxRunContext* ctx_override = nullptr);
 
   // Stage 2: run the landmark/pose model on the crop defined by M
   // (crop-pixels -> image-pixels), then map keypoints back through M.
@@ -425,9 +514,11 @@ private:
   // Stage 2 core: run the landmark model on one crop and decode keypoints into
   // `out` (image-normalized [0,1]); no smoothing/drawing/output. Returns the
   // mean confidence, or -1 on decode failure. Shared by single + multi paths.
+  // `out_world` (when non-null) receives the model's world-space 3D keypoints
+  // (meters, hip-origin; BlazePose family) — empty if the model has none.
   float landmarkKeypoints(
       const Onnx::ModelRole& role, const Onnx::ImageView& src, const Onnx::Affine& M,
-      std::vector<PoseKeypoint>& out);
+      std::vector<PoseKeypoint>& out, std::vector<PoseKeypoint>* out_world = nullptr);
 
   // --- Multi-instance back-end (Track IDs path) ---
   // Run the detector (top-K) or per-track ROIs, landmark each, track, per-id
@@ -482,6 +573,13 @@ private:
   void appendGeometry(
       std::vector<float>& out, const DetectedPose& pose, PoseWorkflow workflow);
   void passthrough(const Onnx::ImageView& src);
+  // Class id -> display name (custom file, else built-in COCO-80, else null).
+  const char* className(int id) const;
+  // Death-gate helpers (Track IDs path): age the tracker on a no-detection
+  // frame, re-emit still-live coasted poses, or fall back to passthrough.
+  void ageTracker();
+  bool reEmitCoasted(PoseWorkflow draw);
+  void coastOrPassthrough(PoseWorkflow draw, const Onnx::ImageView& src);
 
   // Temporal One-Euro smoothing of the detected keypoints (in place).
   void applySmoothing(DetectedPose& pose);
@@ -516,6 +614,13 @@ private:
   bool m_tracking{false};               // valid ROI carried from prev frame?
   Onnx::RectSmoother m_roi_smoother;    // temporal ROI stabilization
   std::vector<PoseKeypoint> m_last_keypoints; // image-normalized, prev frame
+  // Pre-remap (native-skeleton) snapshot of the last single-pose keypoints. The
+  // tracking-ROI loop indexes NATIVE joint ids (e.g. BlazePose hips 23/24), so
+  // it must not see keypoints that finalizeSingle() remapped to another layout.
+  std::vector<PoseKeypoint> m_native_keypoints;
+  // Previous frame's smoothed keypoints (single-instance), for the
+  // confidence-weighted hold that tames low-confidence joint teleports.
+  std::vector<PoseKeypoint> m_prev_smoothed_kps;
   int m_lost_frames{0};                 // consecutive frames without a pose
   Onnx::ROI::Rect m_prev_roi{};         // last smoothed ROI (plausibility check)
   bool m_have_prev_roi{false};
@@ -527,16 +632,32 @@ private:
   std::string m_last_model;
   std::string m_last_det_model;
   std::string m_last_reid_model;
+  std::string m_last_cfg_log; // de-dup for the debug config trace
+
+  // Custom box class names, loaded once when the Class Names File path changes.
+  std::vector<std::string> m_class_names;
+  std::string m_last_class_file;
 
   // --- Cached scratch reused every frame (zero steady-state allocation) ---
   std::vector<DetectedPose> m_instances;          // this frame's instances
   std::vector<PoseKeypoint> m_kp_scratch;         // landmark decode -> keypoints
+  std::vector<PoseKeypoint> m_world_scratch;      // landmark decode -> world 3D
   std::vector<Onnx::Track::Detection> m_track_in; // tracker input
   std::vector<Onnx::Detection::Detection> m_dets; // detector output (top-K)
+  std::vector<std::pair<float, int>> m_box_sel;   // (score,idx) top-K box select
   std::vector<Onnx::ROI::Rect> m_rois;            // ROIs to landmark this frame
   boost::container::vector<float> m_batch_storage; // packed [N,C,H,W] input
   std::vector<int64_t> m_bbox;                     // batched SimCC [N,2] bbox
   int m_frames_since_detect{0};                   // detector-cadence counter
+
+  // Detector anchor/prior caches: the geometry only depends on the model, so
+  // regenerating it per frame would heap-allocate tens of KB at frame rate.
+  std::vector<Onnx::Vec2> m_ssd_anchors;
+  Onnx::ModelKind m_ssd_kind{};
+  int m_ssd_input{0}, m_ssd_num_boxes{-1};
+  std::vector<Onnx::Detection::PriorBox> m_prior_cache;
+  Onnx::ModelKind m_prior_kind{};
+  int m_prior_w{0}, m_prior_h{0};
 
   // Skeleton remap state (recomputed per emit from the Skeleton control).
   bool m_remap_active{false};

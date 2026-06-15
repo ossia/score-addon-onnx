@@ -60,8 +60,13 @@ struct COCOConnections
 struct Keypoint
 {
   float x, y;
+  float z = 0.f; // RTMW3D: root-relative depth in METERS (simcc_z); else 0
   float confidence;
 };
+
+// RTMW3D z decode: z_m = (z_px / (input_h/2) - 1) * Z_RANGE, with Z_RANGE the
+// codec constant from mmpose projects/rtmpose3d (also used by rtmlib).
+constexpr float RTMW3D_Z_RANGE = 2.1744869f;
 
 struct PoseResult
 {
@@ -108,8 +113,8 @@ inline std::vector<Keypoint> decode(
 
   for(int k = 0; k < num_keypoints; ++k)
   {
-    const float* x_logits = simcc_x + k * bins_x;
-    const float* y_logits = simcc_y + k * bins_y;
+    const float* x_logits = simcc_x + static_cast<size_t>(k) * bins_x;
+    const float* y_logits = simcc_y + static_cast<size_t>(k) * bins_y;
 
     // Find argmax and max value for X
     int max_idx_x = 0;
@@ -231,11 +236,14 @@ inline bool processOutput(
   {
     // Post-processed format: [1, K, 3] with (x, y, score)
     // Coordinates are in pixel space relative to model input
+    auto info = outputs[0].GetTensorTypeAndShapeInfo();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      return false; // fp16/u8 buffers read as float would over-read
     const float* data = outputs[0].GetTensorData<float>();
 
     // Trust the actual element count, not the declared K: a dynamic-dim model
     // can resolve to fewer floats than the shape implied -> clamp before reading.
-    const int64_t n = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
+    const int64_t n = info.GetElementCount();
     const int K = static_cast<int>(
         std::min<int64_t>(config.num_keypoints, n / 3));
     keypoints.resize(K);
@@ -257,14 +265,20 @@ inline bool processOutput(
     if(outputs.size() < 2)
       return false;
 
+    auto info_x = outputs[0].GetTensorTypeAndShapeInfo();
+    auto info_y = outputs[1].GetTensorTypeAndShapeInfo();
+    if(info_x.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+       || info_y.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      return false; // fp16/u8 buffers read as float would over-read
+
     const float* simcc_x = outputs[0].GetTensorData<float>();
     const float* simcc_y = outputs[1].GetTensorData<float>();
 
     // Clamp the keypoint count to what each buffer actually holds: the x/y
     // tensors can have a different (dynamic) K than detectConfig inferred, so
     // reading num_keypoints*bins from the smaller buffer would run off the end.
-    const int64_t nx = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
-    const int64_t ny = outputs[1].GetTensorTypeAndShapeInfo().GetElementCount();
+    const int64_t nx = info_x.GetElementCount();
+    const int64_t ny = info_y.GetElementCount();
     int nk = config.num_keypoints;
     if(config.simcc_bins_x > 0)
       nk = static_cast<int>(std::min<int64_t>(nk, nx / config.simcc_bins_x));
@@ -280,6 +294,43 @@ inline bool processOutput(
         config.input_width,
         config.input_height,
         config.split_ratio);
+
+    // RTMW3D: a third simcc_z [1, K, bins_z] head carrying root-relative
+    // depth. Decode validated against the real rtmw3d-l export + the rtmlib
+    // reference: z_m = (argmax_z/split / (input_h/2) - 1) * Z_RANGE.
+    if(outputs.size() >= 3 && !keypoints.empty())
+    {
+      auto info_z = outputs[2].GetTensorTypeAndShapeInfo();
+      auto shape_z = info_z.GetShape();
+      // Only accept the third output as a depth head when its keypoint axis
+      // matches the x/y heads — an unrelated rank-3 aux output (scores etc.)
+      // must not be decoded as depth.
+      if(shape_z.size() == 3 && shape_z[2] > 1 && config.input_height > 0
+         && shape_z[1] == static_cast<int64_t>(keypoints.size())
+         && info_z.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      {
+        const int bins_z = static_cast<int>(shape_z[2]);
+        const float* simcc_z = outputs[2].GetTensorData<float>();
+        const int64_t nz = info_z.GetElementCount();
+        const int kz = static_cast<int>(std::min<int64_t>(
+            static_cast<int64_t>(keypoints.size()), nz / bins_z));
+        const float half_h = 0.5f * config.input_height;
+        for(int k = 0; k < kz; ++k)
+        {
+          const float* z_logits = simcc_z + static_cast<size_t>(k) * bins_z;
+          int max_idx = 0;
+          float max_val = z_logits[0];
+          for(int i = 1; i < bins_z; ++i)
+            if(z_logits[i] > max_val)
+            {
+              max_val = z_logits[i];
+              max_idx = i;
+            }
+          const float z_px = max_idx / config.split_ratio;
+          keypoints[k].z = (z_px / half_h - 1.f) * RTMW3D_Z_RANGE;
+        }
+      }
+    }
   }
 
   // Calculate mean confidence (compute before the move below).

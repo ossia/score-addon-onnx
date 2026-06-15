@@ -18,7 +18,7 @@ namespace Onnx
 {
 
 inline FloatTensor nchw_tensorFromARGB(
-    ModelSpec::Port& port,
+    const ModelSpec::Port& port,
     const unsigned char* source_bits,
     int source_w,
     int source_h,
@@ -79,7 +79,7 @@ inline FloatTensor nchw_tensorFromARGB(
 
 // When coming from a GL_RGBA texture
 inline FloatTensor nchw_tensorFromRGBA(
-    ModelSpec::Port& port,
+    const ModelSpec::Port& port,
     const unsigned char* source_bits,
     int source_w,
     int source_h,
@@ -140,7 +140,7 @@ inline FloatTensor nchw_tensorFromRGBA(
 
 // When coming from a GL_RGBA texture
 inline FloatTensor nhwc_rgb_tensorFromRGBA(
-    ModelSpec::Port& port,
+    const ModelSpec::Port& port,
     const unsigned char* source_bits,
     int source_w,
     int source_h,

@@ -35,7 +35,12 @@ try
   session_options.SetGraphOptimizationLevel(
       GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-  session_options.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
+  // Sequential is ORT's default and most-tested teardown path. We run with
+  // InterOpNumThreads(1), so ORT_PARALLEL bought no inter-op parallelism anyway
+  // but did take the parallel-executor teardown path — a known crash class when
+  // a node owning several sessions (a two-stage PoseDetector: landmark+detector)
+  // is destroyed on stop. Use sequential to avoid it.
+  session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
   session_options.DisableProfiling();
   static constexpr const char* device_ids[10]
       = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
@@ -203,6 +208,27 @@ catch (...)
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
 }
 
+inline TensorElemType fromOrtElementType(ONNXTensorElementDataType t) noexcept
+{
+  switch(t)
+  {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   return TensorElemType::Float;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return TensorElemType::Float16;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:return TensorElemType::BFloat16;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:  return TensorElemType::Double;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:   return TensorElemType::Uint8;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:    return TensorElemType::Int8;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:  return TensorElemType::Uint16;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:   return TensorElemType::Int16;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:  return TensorElemType::Uint32;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:   return TensorElemType::Int32;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:  return TensorElemType::Uint64;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:   return TensorElemType::Int64;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:    return TensorElemType::Bool;
+    default:                                    return TensorElemType::Unknown;
+  }
+}
+
 struct OnnxRunContext
 {
   Options opts;
@@ -219,9 +245,20 @@ struct OnnxRunContext
       , session_options(create_session_options(opts))
       , session(env, bytes.data(), bytes.size(), session_options)
   {
+    // The session (and therefore its I/O spec) is immutable for the context's
+    // lifetime, so build the spec ONCE here. readModelSpec() then hands back a
+    // reference instead of re-querying ORT and re-allocating names/vectors on
+    // every frame — this is the per-frame hot path of every node.
+    m_spec = buildModelSpec();
   }
 
-  ModelSpec readModelSpec()
+  // Cached, immutable model I/O spec. Hot per-frame callers should bind with
+  // `const auto&` to stay allocation-free; the worker threads hold the context
+  // alive via shared_ptr, so the reference (and its name char*) stay valid.
+  const ModelSpec& readModelSpec() const noexcept { return m_spec; }
+
+private:
+  ModelSpec buildModelSpec()
   {
     ONNX_PROF_SCOPE(ReadSpec);
     ModelSpec spec;
@@ -238,7 +275,8 @@ struct OnnxRunContext
           {.name = name,
            .port_type = {},
            .data_type = {},
-           .shape = input_tensor_type.GetShape()});
+           .shape = input_tensor_type.GetShape(),
+           .elem_type = fromOrtElementType(input_tensor_type.GetElementType())});
 
       // some models might have negative shape values to indicate dynamic shape, e.g., for variable batch size.
       if (auto& tensor = spec.inputs.back();
@@ -261,7 +299,8 @@ struct OnnxRunContext
           {.name = name,
            .port_type = {},
            .data_type = {},
-           .shape = output_tensor_type.GetShape()});
+           .shape = output_tensor_type.GetShape(),
+           .elem_type = fromOrtElementType(output_tensor_type.GetElementType())});
 
       spec.output_names.push_back(std::move(name));
     }
@@ -279,9 +318,13 @@ struct OnnxRunContext
         std::begin(spec.output_names_char),
         [&](const std::string& str) { return str.c_str(); });
 
+    spec.rebuildCharPointers();
     return spec;
   }
 
+  ModelSpec m_spec; // built once in the ctor; returned by readModelSpec()
+
+public:
   void infer(
       const ModelSpec& spec,
       std::span<Ort::Value> input_tensors,

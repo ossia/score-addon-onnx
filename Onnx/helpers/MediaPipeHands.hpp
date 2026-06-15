@@ -3,6 +3,7 @@
 #include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <optional>
@@ -114,11 +115,14 @@ inline bool processOutput(
   if(outputs.size() < 1)
     return false;
 
-  // Get model input size from spec (NHWC: [N, H, W, C])
+  // Get model input size — robust to NHWC [N,H,W,C] and NCHW [N,C,H,W]
+  // (shape[1] is 3 for an NCHW export): take the largest concrete dim.
   float model_size = 256.0f;  // default
   if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
   {
-    model_size = static_cast<float>(spec.inputs[0].shape[1]);
+    const auto& s = spec.inputs[0].shape;
+    if(const auto m = std::max({s[1], s[2], s[3]}); m > 0)
+      model_size = static_cast<float>(m);
   }
 
   // Identify outputs by shape
@@ -128,7 +132,10 @@ inline bool processOutput(
 
   for(size_t i = 0; i < outputs.size(); ++i)
   {
-    int64_t total = outputs[i].GetTensorTypeAndShapeInfo().GetElementCount();
+    auto info = outputs[i].GetTensorTypeAndShapeInfo();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      continue; // fp16/u8 buffers read as float would over-read
+    int64_t total = info.GetElementCount();
     const float* data = outputs[i].GetTensorData<float>();
 
     if(total == NUM_LANDMARKS * 3)
@@ -155,8 +162,11 @@ inline bool processOutput(
   if(hand_flag_data)
   {
     hand_flag = *hand_flag_data;
-    // Apply sigmoid if raw logit
-    hand_flag = sigmoid(hand_flag);
+    // Values in [0,1] are taken as probabilities; only logits get sigmoided.
+    // (Unconditionally sigmoiding a probability maps [0,1] onto [0.5,0.73],
+    // which makes a 0.5 threshold never reject and 0.75 always reject.)
+    if(hand_flag < 0.0f || hand_flag > 1.0f)
+      hand_flag = sigmoid(hand_flag);
   }
 
   if(hand_flag < presence_thresh)
@@ -171,8 +181,10 @@ inline bool processOutput(
   if(handedness_data)
   {
     handedness = *handedness_data;
-    // Apply sigmoid if raw logit
-    handedness = sigmoid(handedness);
+    // Same probability-vs-logit sniff as hand_flag: sigmoiding an already
+    // [0,1] handedness pins it above 0.5, i.e. always "right hand".
+    if(handedness < 0.0f || handedness > 1.0f)
+      handedness = sigmoid(handedness);
     is_right = handedness > 0.5f;
   }
 

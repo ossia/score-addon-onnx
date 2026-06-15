@@ -64,9 +64,10 @@ struct LetterboxInfo
 // Output tensor layout + channel order for the fused samplers below.
 enum class TensorLayout
 {
-  NchwRgb, // planar, R then G then B  (most landmark / SSD models)
-  NchwBgr, // planar, B then G then R  (YOLOX / RTMDet / RTMO)
-  NhwcRgb  // interleaved RGB          (some PINTO / NHWC exports)
+  NchwRgb,  // planar, R then G then B  (most landmark / SSD models)
+  NchwBgr,  // planar, B then G then R  (YOLOX / RTMDet / RTMO)
+  NhwcRgb,  // interleaved RGB          (some PINTO / NHWC exports)
+  NchwGray, // planar single channel    (luma; 1-channel input models)
 };
 
 // ---- defined in ImageOps.cpp (always compiled -O3) ----

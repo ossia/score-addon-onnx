@@ -98,6 +98,12 @@ inline void writeNorm(
     out[plane + idx] = (G - m[1]) * is[1];
     out[2 * plane + idx] = (R - m[2]) * is[2];
   }
+  else if constexpr(L == TensorLayout::NchwGray)
+  {
+    // ITU-R 601 luma; a single normalized plane (mean/invstd index 0).
+    const float Y = 0.299f * R + 0.587f * G + 0.114f * B;
+    out[idx] = (Y - m[0]) * is[0];
+  }
   else // NhwcRgb
   {
     float* d = out + 3 * idx;
@@ -182,6 +188,9 @@ void sampleAffineToTensor(
     case TensorLayout::NhwcRgb:
       detail::sampleAffineImpl<TensorLayout::NhwcRgb>(src, a, mw, mh, mean, invstd, out);
       break;
+    case TensorLayout::NchwGray:
+      detail::sampleAffineImpl<TensorLayout::NchwGray>(src, a, mw, mh, mean, invstd, out);
+      break;
   }
 }
 
@@ -198,6 +207,8 @@ LetterboxInfo letterboxToTensor(
       return detail::letterboxImpl<TensorLayout::NchwBgr>(src, mw, mh, center, pad, mean, invstd, out);
     case TensorLayout::NhwcRgb:
       return detail::letterboxImpl<TensorLayout::NhwcRgb>(src, mw, mh, center, pad, mean, invstd, out);
+    case TensorLayout::NchwGray:
+      return detail::letterboxImpl<TensorLayout::NchwGray>(src, mw, mh, center, pad, mean, invstd, out);
   }
   return {};
 }

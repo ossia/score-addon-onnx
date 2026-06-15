@@ -95,7 +95,10 @@ inline bool processOutput(
   if(!spec.inputs.empty() && spec.inputs[0].shape.size() == 4)
   {
     const auto& s = spec.inputs[0].shape;
-    model_size = static_cast<float>(std::max({s[1], s[2], s[3]}));
+    // Fully dynamic dims are -1; dividing coordinates by a negative size
+    // would flip them, so only adopt a concrete size.
+    if(const auto m = std::max({s[1], s[2], s[3]}); m > 0)
+      model_size = static_cast<float>(m);
   }
 
   // Find landmark and face_flag outputs by shape
@@ -105,7 +108,10 @@ inline bool processOutput(
 
   for(size_t i = 0; i < outputs.size(); ++i)
   {
-    int64_t total = outputs[i].GetTensorTypeAndShapeInfo().GetElementCount();
+    auto info = outputs[i].GetTensorTypeAndShapeInfo();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      continue; // fp16/u8 buffers read as float would over-read
+    int64_t total = info.GetElementCount();
     const float* data = outputs[i].GetTensorData<float>();
 
     if(total == NUM_LANDMARKS * 3 || total == NUM_LANDMARKS_V2 * 3)
@@ -135,8 +141,10 @@ inline bool processOutput(
   if(face_flag_data)
   {
     face_flag = *face_flag_data;
-    // Apply sigmoid if raw logit
-    if(face_flag < -10.0f || face_flag > 10.0f)
+    // Values in [0,1] are taken as probabilities; anything outside is a raw
+    // logit and gets sigmoided. (A wider sniff window would let logits in
+    // (1,10] through un-squashed and compare them against a [0,1] threshold.)
+    if(face_flag < 0.0f || face_flag > 1.0f)
       face_flag = 1.0f / (1.0f + std::exp(-face_flag));
   }
 

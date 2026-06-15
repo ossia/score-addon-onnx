@@ -150,7 +150,12 @@ avnd_score_plugin_add(
     score_addon_onnx_models
   SOURCES
     OnnxModels/PoseDetector.hpp
+    OnnxModels/PoseDetector_internal.hpp
     OnnxModels/PoseDetector.cpp
+    OnnxModels/PoseDetector_draw.cpp
+    OnnxModels/PoseDetector_detect.cpp
+    OnnxModels/PoseDetector_landmark.cpp
+    OnnxModels/PoseDetector_tracking.cpp
   TARGET
     pose-detector
   MAIN_CLASS
@@ -362,7 +367,9 @@ target_link_libraries(score_addon_onnx_models PRIVATE score_onnx_ctx_overlay)
 # Debug builds, because these tight float loops run 5-15x slower at -Og/-O0 and
 # would otherwise dominate the frame in a developer build. Header-only inlining
 # would pull them back into the -Og host TU, so they live in ImageOps.cpp.
-add_library(score_onnx_imageops STATIC Onnx/helpers/ImageOps.cpp)
+add_library(score_onnx_imageops STATIC
+    Onnx/helpers/ImageOps.cpp
+    Onnx/helpers/TensorToTexture.cpp)
 target_include_directories(score_onnx_imageops PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(score_onnx_imageops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)

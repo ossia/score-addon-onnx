@@ -70,12 +70,37 @@ inline std::vector<Onnx::Vec2> generateAnchors(const SsdParams& p)
   return anchors;
 }
 
+// Number of anchors generateAnchors() would emit, in closed form — lets
+// callers pick candidate params per frame without materializing the anchors.
+inline int anchorCount(const SsdParams& p)
+{
+  int total = 0;
+  const int n = static_cast<int>(p.strides.size());
+  int i = 0;
+  while(i < n)
+  {
+    const int stride = p.strides[i];
+    int repeats = 0, j = i;
+    while(j < n && p.strides[j] == stride)
+    {
+      ++repeats;
+      ++j;
+    }
+    const int fm = (p.input_size + stride - 1) / stride; // ceil
+    total += fm * fm * p.anchors_per_cell * repeats;
+    i = j;
+  }
+  return total;
+}
+
 // Decode raw model outputs (any number of score/box tensors, concatenated in
 // output order) into detections. Boxes are encoded as
 // [dx, dy, dw, dh, kp0x, kp0y, ...] relative to anchor centers, scaled by
-// input_size (the MediaPipe convention with fixed unit anchors).
+// input_size (the MediaPipe convention with fixed unit anchors). Anchors are
+// passed in so callers can generate them once per model instead of per frame.
 inline std::vector<Detection> decode(
-    std::span<Ort::Value> outputs, const SsdParams& params, float score_thr)
+    std::span<Ort::Value> outputs, std::span<const Onnx::Vec2> anchors,
+    int input_size, float score_thr)
 {
   struct Buf
   {
@@ -88,7 +113,10 @@ inline std::vector<Detection> decode(
   {
     if(!o.IsTensor())
       continue;
-    auto shape = o.GetTensorTypeAndShapeInfo().GetShape();
+    auto info = o.GetTensorTypeAndShapeInfo();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      continue; // GetTensorData<float> on fp16/u8 outputs would over-read
+    auto shape = info.GetShape();
     if(shape.size() != 3)
       continue;
     const int n = static_cast<int>(shape[1]);
@@ -96,17 +124,19 @@ inline std::vector<Detection> decode(
     const float* data = o.GetTensorData<float>();
     if(c == 1)
       scoreBufs.push_back({data, n, c});
-    else
+    // Rows are later read with boxBufs[0].c as the width, so every box
+    // tensor must share that channel count (MediaPipe splits boxes across
+    // tensors of identical width); anything narrower would be over-read.
+    else if(c >= 4 && (boxBufs.empty() || c == boxBufs[0].c))
       boxBufs.push_back({data, n, c});
   }
   if(scoreBufs.empty() || boxBufs.empty())
     return {};
 
-  const auto anchors = generateAnchors(params);
   const int total = static_cast<int>(anchors.size());
   const int coords = boxBufs[0].c;
   const int num_kp = std::max(0, (coords - 4) / 2);
-  const float inv = 1.0f / params.input_size;
+  const float inv = 1.0f / input_size;
 
   auto scoreAt = [&](int idx) -> float {
     for(auto& b : scoreBufs)
@@ -154,6 +184,13 @@ inline std::vector<Detection> decode(
   return dets;
 }
 
+inline std::vector<Detection> decode(
+    std::span<Ort::Value> outputs, const SsdParams& params, float score_thr)
+{
+  const auto anchors = generateAnchors(params);
+  return decode(outputs, anchors, params.input_size, score_thr);
+}
+
 // Greedy IoU non-maximum suppression. A box is also suppressed when it is
 // nested inside a higher-scoring keeper: plain IoU misses a small box fully
 // inside a large one (IoU = area_small/area_large drops below the threshold as
@@ -194,10 +231,10 @@ nms(std::vector<Detection> dets, float iou_threshold = 0.3f,
   {
     if(dead[i])
       continue;
-    out.push_back(dets[i]);
     for(size_t j = i + 1; j < dets.size(); ++j)
       if(!dead[j] && suppresses(dets[i], dets[j]))
         dead[j] = true;
+    out.push_back(std::move(dets[i]));
   }
   return out;
 }
@@ -240,27 +277,51 @@ inline std::vector<Detection> decodeEnd2End(
   const float* labels_f = nullptr;
   const int64_t* labels_i = nullptr;
   int n = 0;
+  int64_t labels_count = 0;
   for(auto& o : outputs)
   {
     if(!o.IsTensor())
       continue;
     auto info = o.GetTensorTypeAndShapeInfo();
     auto sh = info.GetShape();
+    const auto elem = info.GetElementType();
     if(sh.size() == 3 && sh[2] == 5)
     {
+      if(elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+        continue;
       dets = o.GetTensorData<float>();
       n = static_cast<int>(sh[1]);
     }
     else if(sh.size() == 2)
     {
-      if(info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)
+      // Several rank-2 outputs can coexist (labels [1,N], num_dets [1,1]);
+      // keep the largest and bounds-check it against n below.
+      const auto cnt = static_cast<int64_t>(info.GetElementCount());
+      if(cnt <= labels_count)
+        continue;
+      if(elem == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)
+      {
         labels_i = o.GetTensorData<int64_t>();
-      else
+        labels_f = nullptr;
+        labels_count = cnt;
+      }
+      else if(elem == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      {
         labels_f = o.GetTensorData<float>();
+        labels_i = nullptr;
+        labels_count = cnt;
+      }
     }
   }
   if(!dets)
     return {};
+  // The labels tensor must cover every detection row; anything shorter
+  // (e.g. a [1,1] num_dets output) is not the labels.
+  if(labels_count < n)
+  {
+    labels_i = nullptr;
+    labels_f = nullptr;
+  }
 
   const float inv = 1.0f / input_size;
   std::vector<Detection> out;
@@ -304,7 +365,10 @@ inline std::vector<Detection> decodeMultiClass(
   {
     if(!o.IsTensor())
       continue;
-    auto sh = o.GetTensorTypeAndShapeInfo().GetShape();
+    auto info = o.GetTensorTypeAndShapeInfo();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      continue;
+    auto sh = info.GetShape();
     if(sh.size() == 2 && sh[1] == 7)
     {
       d = o.GetTensorData<float>();
@@ -359,6 +423,8 @@ inline std::vector<Detection> decodeYoloxGrid(
     if(!o.IsTensor())
       continue;
     auto info = o.GetTensorTypeAndShapeInfo();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      continue;
     auto sh = info.GetShape();
     if(sh.size() == 3)
     {
@@ -414,6 +480,251 @@ inline std::vector<Detection> decodeYoloxGrid(
       }
   }
   return nms(std::move(dets), nms_thr);
+}
+
+// ---------------------------------------------------------------------------
+// PriorBox face detectors (RetinaFace / FaceBoxes): SSD priors with variance
+// encoding — a different convention from the fixed-unit MediaPipe anchors
+// above. Decode validated against real exports: retinaface_mobile0.25
+// (320x320 -> 4200 priors, score 1.0 sane box+landmarks) and 3ddfa
+// FaceBoxesProd (320x320 -> 2134 densified priors), cross-checked against the
+// PINTO faceboxes_post ground-truth boxes (/mnt/models/validate_decoders.py).
+// Input convention for both families: BGR - (104,117,123), NCHW.
+// ---------------------------------------------------------------------------
+struct PriorBox
+{
+  float cx, cy, w, h; // normalized [0,1]
+};
+
+struct PriorBoxLayer
+{
+  std::vector<int> min_sizes;
+  int step = 8;
+  std::vector<int> densities; // FaceBoxes densification (1 = single anchor)
+};
+
+struct PriorBoxParams
+{
+  std::vector<PriorBoxLayer> layers;
+  float var_center = 0.1f;
+  float var_size = 0.2f;
+};
+
+inline PriorBoxParams retinaFacePriorParams()
+{
+  return {
+      .layers
+      = {{{16, 32}, 8, {1, 1}},
+         {{64, 128}, 16, {1, 1}},
+         {{256, 512}, 32, {1, 1}}}};
+}
+
+inline PriorBoxParams faceBoxesPriorParams()
+{
+  return {
+      .layers
+      = {{{32, 64, 128}, 32, {4, 2, 1}}, {{256}, 64, {1}}, {{512}, 128, {1}}}};
+}
+
+// Official PriorBox generation: per cell, per min_size, density d emits a d x d
+// grid of anchors at (j + k/d, i + l/d) (l outer, k inner); d == 1 centers the
+// single anchor at (j + 0.5, i + 0.5).
+inline std::vector<PriorBox> generatePriorBoxes(
+    const PriorBoxParams& p, int in_w, int in_h)
+{
+  std::vector<PriorBox> out;
+  // in_w/in_h come from model metadata, which is untrusted: refuse degenerate
+  // or absurd declared sizes before they turn into a giant allocation (the
+  // count-mismatch guard in decodePriorBox would only run afterwards).
+  if(in_w <= 0 || in_h <= 0 || in_w > 16384 || in_h > 16384)
+    return out;
+  for(const auto& layer : p.layers)
+  {
+    const int fh = (in_h + layer.step - 1) / layer.step;
+    const int fw = (in_w + layer.step - 1) / layer.step;
+    for(int i = 0; i < fh; ++i)
+      for(int j = 0; j < fw; ++j)
+        for(size_t m = 0; m < layer.min_sizes.size(); ++m)
+        {
+          const float ms = static_cast<float>(layer.min_sizes[m]);
+          const int d
+              = m < layer.densities.size() ? std::max(1, layer.densities[m]) : 1;
+          for(int l = 0; l < d; ++l)
+            for(int k = 0; k < d; ++k)
+            {
+              const float cx = (d == 1) ? (j + 0.5f) : (j + float(k) / d);
+              const float cy = (d == 1) ? (i + 0.5f) : (i + float(l) / d);
+              out.push_back(
+                  {cx * layer.step / in_w, cy * layer.step / in_h, ms / in_w,
+                   ms / in_h});
+            }
+        }
+  }
+  return out;
+}
+
+// Decode loc[1,N,4] + conf[1,N,2] (softmaxed or logits, auto-detected) +
+// optional landms[1,N,10] (5 keypoints) against generated priors. Results are
+// normalized [0,1] in the model input frame — the same convention as decode().
+// Priors are passed in so callers can generate them once per model instead of
+// per frame.
+inline std::vector<Detection> decodePriorBox(
+    std::span<Ort::Value> outputs, std::span<const PriorBox> priors,
+    float var_center, float var_size, float score_thr)
+{
+  const float* loc = nullptr;
+  const float* conf = nullptr;
+  const float* landms = nullptr;
+  int n_loc = 0, n_conf = 0, n_landm = 0;
+  for(auto& o : outputs)
+  {
+    if(!o.IsTensor())
+      continue;
+    auto info = o.GetTensorTypeAndShapeInfo();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      continue; // GetTensorData<float> on fp16/u8 outputs would over-read
+    auto shape = info.GetShape();
+    if(shape.size() != 3)
+      continue;
+    const int n = static_cast<int>(shape[1]);
+    switch(shape[2])
+    {
+      case 4: loc = o.GetTensorData<float>(); n_loc = n; break;
+      case 2: conf = o.GetTensorData<float>(); n_conf = n; break;
+      case 10: landms = o.GetTensorData<float>(); n_landm = n; break;
+      default: break;
+    }
+  }
+  if(!loc || !conf)
+    return {};
+
+  // The prior layout must line up 1:1 with the model's anchor axis; a count
+  // mismatch means a different input size or config — refuse, don't decode
+  // garbage.
+  if(n_loc != static_cast<int>(priors.size()) || n_conf != n_loc)
+    return {};
+  // Landmarks are optional, but a count mismatch means that tensor is not the
+  // per-prior landmarks — drop it rather than over-read it below.
+  if(landms && n_landm != n_loc)
+    landms = nullptr;
+
+  // Some exports bake the softmax in (3ddfa FaceBoxesProd ends in Softmax);
+  // others emit logits. Sniff the first rows: probabilities lie in [0,1] AND
+  // sum to 1 per pair — logits that happen to fall in [0,1] fail the sum test.
+  bool softmaxed = true;
+  for(int i = 0; i < std::min(n_loc, 64); ++i)
+  {
+    const float a = conf[i * 2], b = conf[i * 2 + 1];
+    if(a < -0.001f || a > 1.001f || b < -0.001f || b > 1.001f
+       || std::abs(a + b - 1.0f) > 0.01f)
+    {
+      softmaxed = false;
+      break;
+    }
+  }
+
+  std::vector<Detection> dets;
+  for(int i = 0; i < n_loc; ++i)
+  {
+    float score;
+    if(softmaxed)
+      score = conf[i * 2 + 1];
+    else
+    {
+      const float a = conf[i * 2], b = conf[i * 2 + 1];
+      const float m = std::max(a, b);
+      const float ea = std::exp(a - m), eb = std::exp(b - m);
+      score = eb / (ea + eb);
+    }
+    if(score < score_thr)
+      continue;
+
+    const auto& pr = priors[i];
+    const float* l = loc + static_cast<size_t>(i) * 4;
+    Detection det;
+    det.score = score;
+    det.xc = pr.cx + l[0] * var_center * pr.w;
+    det.yc = pr.cy + l[1] * var_center * pr.h;
+    det.w = pr.w * std::exp(l[2] * var_size);
+    det.h = pr.h * std::exp(l[3] * var_size);
+    if(landms)
+    {
+      const float* lm = landms + static_cast<size_t>(i) * 10;
+      det.keypoints.reserve(5);
+      for(int k = 0; k < 5; ++k)
+        det.keypoints.push_back(
+            {pr.cx + lm[k * 2] * var_center * pr.w,
+             pr.cy + lm[k * 2 + 1] * var_center * pr.h});
+    }
+    dets.push_back(std::move(det));
+  }
+  return dets;
+}
+
+inline std::vector<Detection> decodePriorBox(
+    std::span<Ort::Value> outputs, const PriorBoxParams& p, int in_w, int in_h,
+    float score_thr)
+{
+  const auto priors = generatePriorBoxes(p, in_w, in_h);
+  return decodePriorBox(outputs, priors, p.var_center, p.var_size, score_thr);
+}
+
+// PINTO pre-decoded FaceBoxes export: boxes already in normalized x1y1x2y2
+// ([1,N,4]) plus conf scores ([1,1,N] / [1,N]). The caller picks the right
+// boxes output by NAME ("x1y1x2y2") and passes its index; conf is the
+// non-box output.
+inline std::vector<Detection> decodePreDecodedBoxes(
+    std::span<Ort::Value> outputs, int boxes_index, float score_thr)
+{
+  const float* boxes = nullptr;
+  const float* conf = nullptr;
+  int n = 0;
+  int64_t conf_count = 0;
+  for(int idx = 0; idx < static_cast<int>(outputs.size()); ++idx)
+  {
+    auto& o = outputs[idx];
+    if(!o.IsTensor())
+      continue;
+    auto info = o.GetTensorTypeAndShapeInfo();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      continue; // GetTensorData<float> on fp16/u8 outputs would over-read
+    auto shape = info.GetShape();
+    if(idx == boxes_index && shape.size() == 3 && shape.back() == 4)
+    {
+      boxes = o.GetTensorData<float>();
+      n = static_cast<int>(shape[1]);
+    }
+    else if(shape.empty() || shape.back() != 4)
+    {
+      // Keep the largest non-box output as the scores; it must cover every
+      // box row (checked below) — a scalar sibling output is not the scores.
+      const auto cnt = static_cast<int64_t>(info.GetElementCount());
+      if(cnt > conf_count)
+      {
+        conf = o.GetTensorData<float>();
+        conf_count = cnt;
+      }
+    }
+  }
+  if(!boxes || !conf || n <= 0 || conf_count < n)
+    return {};
+
+  std::vector<Detection> dets;
+  for(int i = 0; i < n; ++i)
+  {
+    const float score = conf[i];
+    if(score < score_thr)
+      continue;
+    const float* b = boxes + static_cast<size_t>(i) * 4; // x1,y1,x2,y2
+    Detection det;
+    det.score = score;
+    det.xc = (b[0] + b[2]) * 0.5f;
+    det.yc = (b[1] + b[3]) * 0.5f;
+    det.w = b[2] - b[0];
+    det.h = b[3] - b[1];
+    dets.push_back(std::move(det));
+  }
+  return dets;
 }
 
 } // namespace Onnx::Detection
