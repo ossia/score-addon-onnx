@@ -25,7 +25,7 @@ void GenerativeImageGAN::initializeLatentVector()
 {
   // Initialize with small random values
   std::mt19937 gen(inputs.seed.value);
-  std::normal_distribution<float> dist(-1.0f, 1.0f);
+  std::normal_distribution<float> dist(0.0f, 1.0f); // N(0,1): (mean, stddev)
 
   for (auto& val : latent_vector)
   {
@@ -49,7 +49,7 @@ void GenerativeImageGAN::randomizeLatent()
 {
   std::random_device rd;
   std::mt19937 gen(inputs.seed.value);
-  std::normal_distribution<float> dist(-1.0f, 1.0f);
+  std::normal_distribution<float> dist(0.0f, 1.0f); // N(0,1): (mean, stddev)
 
   for (auto& val : latent_vector)
   {

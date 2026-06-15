@@ -37,7 +37,7 @@ try
   }
 
   auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
+  const auto& spec = ctx.readModelSpec();
   auto t = nhwc_rgb_tensorFromRGBA(
       spec.inputs[0],
       in_tex.bytes,

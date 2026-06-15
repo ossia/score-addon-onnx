@@ -36,7 +36,7 @@ try
         = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
   }
   auto& ctx = *this->ctx;
-  auto spec = ctx.readModelSpec();
+  const auto& spec = ctx.readModelSpec();
   auto t = nchw_tensorFromRGBA(
       spec.inputs[0],
       in_tex.bytes,
