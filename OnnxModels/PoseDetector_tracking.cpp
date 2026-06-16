@@ -20,22 +20,32 @@ void PoseDetector::ageTracker()
 // no track is fresh enough to show (caller then falls back to passthrough).
 bool PoseDetector::reEmitCoasted(PoseWorkflow draw)
 {
-  // Only show a coasted ghost for a few frames; a subject that genuinely left
-  // shouldn't linger (the track itself still survives to max_age for ID reuse).
+  // Only show a coasted ghost for the user's Detection-Hold window; a subject
+  // that genuinely left shouldn't linger (the track itself still survives to
+  // max_age for ID reuse). 0 = no visible coast.
   const int coast_limit
-      = std::clamp(static_cast<int>(inputs.detector_cadence.value), 1, 5);
+      = std::clamp(static_cast<int>(inputs.hold_frames.value), 0, 60);
+  if(coast_limit <= 0)
+    return false;
   m_instances.clear();
   for(const auto& tk : m_tracker.tracks())
   {
     if(!tk.confirmed || tk.time_since_update <= 0
-       || tk.time_since_update > coast_limit || tk.kpts_smooth.empty())
+       || tk.time_since_update > coast_limit)
+      continue;
+    const auto bb = tk.box();
+    const bool has_box = bb.w > 0.f && bb.h > 0.f;
+    // A box-only track (box detection: no keypoints) must still coast on its
+    // Kalman box — the previous `kpts_smooth.empty()` skip is exactly why boxes
+    // blinked on every dropout regardless of the gates. Skip only a track with
+    // nothing to draw at all.
+    if(tk.kpts_smooth.empty() && !has_box)
       continue;
     DetectedPose p;
     p.keypoints.reserve(tk.kpts_smooth.size());
     for(const auto& k : tk.kpts_smooth)
       p.keypoints.push_back({k.x, k.y, k.z, k.score});
-    const auto bb = tk.box();
-    if(bb.w > 0.f && bb.h > 0.f)
+    if(has_box)
       p.box = {bb.cx - bb.w * 0.5f, bb.cy - bb.h * 0.5f, bb.w, bb.h};
     p.mean_confidence = tk.score;
     p.track_id = tk.id;
@@ -58,6 +68,26 @@ void PoseDetector::coastOrPassthrough(
     ageTracker();
     if(reEmitCoasted(draw))
       return;
+  }
+  passthrough(src);
+}
+
+// Single-instance no-detection handler: re-emit the last good pose (its smoothed
+// keypoints + smoothed box, drawn again) for up to Detection-Hold frames so a
+// 1-2 frame detector dropout / low-confidence frame doesn't blink, then blank.
+void PoseDetector::holdOrPassthrough(const Onnx::ImageView& src)
+{
+  const int hold = std::clamp(static_cast<int>(inputs.hold_frames.value), 0, 60);
+  if(hold > 0 && m_last_single_pose && m_hold_frames < hold)
+  {
+    ++m_hold_frames;
+    ++m_lost_frames; // still counts toward passthrough's sustained-loss reset
+    outputs.detection.value = m_last_single_pose;
+    drawSkeleton(*m_last_single_pose, m_last_single_draw);
+    generateGeometryOutput(*m_last_single_pose, m_last_single_draw);
+    // Keep m_had_detection true: a held subject should re-acquire at the lenient
+    // (exit) detector threshold, not snap back to the strict enter threshold.
+    return;
   }
   passthrough(src);
 }
@@ -401,6 +431,11 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
     cfg.max_speed = std::max(0.01f, static_cast<float>(inputs.max_speed.value));
     cfg.birth_gate = inputs.birth_gate.value;
     cfg.strict_confirm = inputs.strict_confirm.value;
+    // Min Confidence gates which detections may BIRTH a track (user-facing
+    // "minimum confidence to start showing something"). The low-score pool still
+    // feeds ByteTrack's second association, so continuity isn't lost.
+    cfg.new_track
+        = std::clamp(static_cast<float>(inputs.min_confidence.value), 0.05f, 0.95f);
     m_tracker.configure(cfg);
 
     // One-line config trace (on change) so it's obvious WHY re-id is/ isn't

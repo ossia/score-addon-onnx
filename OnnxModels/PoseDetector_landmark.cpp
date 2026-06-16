@@ -64,7 +64,8 @@ NormSpec landmarkNorm(const Onnx::ModelRole& role)
 void decodeLandmark(
     const Onnx::ModelRole& role, const Onnx::ModelSpec& spec,
     std::span<Ort::Value> outspan, int mw, int mh, float min_conf,
-    std::vector<LandmarkKp>& kps, std::vector<LandmarkKp>* world = nullptr)
+    std::vector<LandmarkKp>& kps, std::vector<LandmarkKp>* world = nullptr,
+    bool crop_padded = false)
 {
   kps.clear();
   if(world)
@@ -341,13 +342,34 @@ void decodeLandmark(
     default:
       break;
   }
+
+  // Decode artifacts: top-down SimCC/heatmap pose models peg an ABSENT or
+  // occluded joint to bin 0 / the last bin, i.e. a keypoint glued to the crop
+  // edge (the "points stuck on the box border", e.g. rtmw3d / rtmpose / vitpose
+  // on a partially-visible person). In a detector-cropped ROI (padded ~1.25x)
+  // real joints sit well inside the edge, so drop (confidence = 0) any keypoint
+  // within a few px of the model-crop border. Gated on crop_padded so the
+  // whole-frame path — where a subject filling the frame has real head/feet
+  // keypoints at the edge — is left untouched; and scoped to the top-down
+  // decoders, since fill-the-crop models (FaceMesh/BlazePose/hand) legitimately
+  // place points on the edge.
+  if(crop_padded
+     && (role.kind == Onnx::ModelKind::SimccPose
+         || role.kind == Onnx::ModelKind::HeatmapPose))
+  {
+    const float mx = std::max(2.f, 0.015f * mw);
+    const float my = std::max(2.f, 0.015f * mh);
+    for(auto& k : kps)
+      if(k.x <= mx || k.x >= mw - mx || k.y <= my || k.y >= mh - my)
+        k.conf = 0.f;
+  }
 }
 } // namespace
 
 float PoseDetector::landmarkKeypoints(
     const Onnx::ModelRole& role, const Onnx::ImageView& src,
     const Onnx::Affine& M, std::vector<PoseKeypoint>& out,
-    std::vector<PoseKeypoint>* out_world)
+    std::vector<PoseKeypoint>* out_world, bool crop_padded)
 {
   out.clear();
   if(out_world)
@@ -406,7 +428,7 @@ float PoseDetector::landmarkKeypoints(
   std::vector<LandmarkKp> wkps;
   decodeLandmark(
       role, spec, outspan, mw, mh, static_cast<float>(inputs.min_confidence),
-      kps, out_world ? &wkps : nullptr);
+      kps, out_world ? &wkps : nullptr, crop_padded);
 
   std::swap(storage, t.storage);
 
@@ -499,8 +521,8 @@ void PoseDetector::runLandmarkBatch(
     for(const auto& r : rois)
     {
       const Onnx::Affine M = Onnx::ROI::rectToAffine(r, mw, mh);
-      const float mc
-          = landmarkKeypoints(role, src, M, m_kp_scratch, &m_world_scratch);
+      const float mc = landmarkKeypoints(
+          role, src, M, m_kp_scratch, &m_world_scratch, /*crop_padded=*/true);
       if(mc < 0.f || m_kp_scratch.empty())
         continue;
       DetectedPose pose;
@@ -633,20 +655,21 @@ void PoseDetector::runLandmarkBatch(
     wkps.clear();
     decodeLandmark(
         role, spec, std::span<Ort::Value>(sl, n_out), mw, mh,
-        static_cast<float>(inputs.min_confidence), kps, &wkps);
+        static_cast<float>(inputs.min_confidence), kps, &wkps,
+        /*crop_padded=*/true);
     pushFromKps(kps, wkps, Onnx::ROI::rectToAffine(rois[b], mw, mh));
   }
 }
 
 void PoseDetector::runLandmark(
     const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
-    const Onnx::Affine& M, int track_id)
+    const Onnx::Affine& M, int track_id, bool crop_padded)
 {
-  const float mean_conf
-      = landmarkKeypoints(role, src, M, m_kp_scratch, &m_world_scratch);
+  const float mean_conf = landmarkKeypoints(
+      role, src, M, m_kp_scratch, &m_world_scratch, crop_padded);
   if(!finitef(mean_conf) || mean_conf < 0.f || m_kp_scratch.empty())
   {
-    passthrough(src);
+    holdOrPassthrough(src);
     return;
   }
 
@@ -696,7 +719,7 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
 
   if(poses.empty())
   {
-    passthrough(src);
+    holdOrPassthrough(src);
     std::swap(storage, t.storage);
     return;
   }
@@ -827,7 +850,7 @@ void PoseDetector::runRTMO(const Onnx::ImageView& src)
   const int N = std::min(n_det, n_kpt);
   if(!dets || !kpt || K == 0 || N <= 0)
   {
-    passthrough(src);
+    holdOrPassthrough(src);
     return;
   }
 
@@ -886,7 +909,7 @@ void PoseDetector::runRTMO(const Onnx::ImageView& src)
     }
   if(best < 0)
   {
-    passthrough(src);
+    holdOrPassthrough(src);
     return;
   }
 

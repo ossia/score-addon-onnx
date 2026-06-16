@@ -16,6 +16,8 @@
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <optional>
 #include <vector>
 
@@ -352,6 +354,18 @@ public:
           "near-identical people (same uniform); 0 = off.");
     } reid_margin;
 
+    // Appended last to keep existing presets' port indices stable (id 30).
+    struct : halp::spinbox_i32<"Detection Hold", halp::range{0, 60, 6}>
+    {
+      halp_meta(
+          description,
+          "Keep showing the last detection for up to this many frames after it "
+          "is momentarily lost (a detector miss or a low-confidence frame) "
+          "instead of blanking immediately. Bridges 1-2 frame dropouts so "
+          "poses/boxes stop blinking. Applies to single detections and (as the "
+          "coast window) to tracked instances. 0 = blank immediately.");
+    } hold_frames;
+
   } inputs;
 
   struct
@@ -427,6 +441,7 @@ public:
         halp::item<&ins::track_ids> track_ids;
         halp::item<&ins::max_instances> max_instances;
         halp::item<&ins::track_memory> track_memory;
+        halp::item<&ins::hold_frames> hold_frames;
       } core;
 
       halp::spacing sp1{.width = 12, .height = 1};
@@ -500,16 +515,22 @@ private:
   // ctx_override runs the detector on a specific context instead of det_ctx
   // (used when a detector model sits in the LANDMARK port, e.g. RetinaFace alone
   // drawn as a 5-keypoint pose — its session is `ctx`, not `det_ctx`).
+  // score_thr < 0 keeps each detector family's built-in quality floor; >= 0
+  // raises the accept threshold to max(floor, score_thr) — how Min Confidence
+  // (with hysteresis, see detThreshold) reaches the stage-1 detector.
   std::vector<Onnx::Detection::Detection> runDetector(
       const Onnx::ModelRole& role, const Onnx::ImageView& src,
       Onnx::ModelDomain target = Onnx::ModelDomain::Body, int keep_class = -2,
-      Onnx::OnnxRunContext* ctx_override = nullptr);
+      Onnx::OnnxRunContext* ctx_override = nullptr, float score_thr = -1.f);
 
   // Stage 2: run the landmark/pose model on the crop defined by M
   // (crop-pixels -> image-pixels), then map keypoints back through M.
+  // crop_padded: the ROI is a padded detector crop (two-stage / multi-instance),
+  // so a keypoint pegged to the crop edge is a SimCC/heatmap decode artifact to
+  // drop. False for whole-frame, where edge keypoints can be real.
   void runLandmark(
       const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
-      const Onnx::Affine& M, int track_id = -1);
+      const Onnx::Affine& M, int track_id = -1, bool crop_padded = false);
 
   // Stage 2 core: run the landmark model on one crop and decode keypoints into
   // `out` (image-normalized [0,1]); no smoothing/drawing/output. Returns the
@@ -518,7 +539,8 @@ private:
   // (meters, hip-origin; BlazePose family) — empty if the model has none.
   float landmarkKeypoints(
       const Onnx::ModelRole& role, const Onnx::ImageView& src, const Onnx::Affine& M,
-      std::vector<PoseKeypoint>& out, std::vector<PoseKeypoint>* out_world = nullptr);
+      std::vector<PoseKeypoint>& out, std::vector<PoseKeypoint>* out_world = nullptr,
+      bool crop_padded = false);
 
   // --- Multi-instance back-end (Track IDs path) ---
   // Run the detector (top-K) or per-track ROIs, landmark each, track, per-id
@@ -580,6 +602,19 @@ private:
   void ageTracker();
   bool reEmitCoasted(PoseWorkflow draw);
   void coastOrPassthrough(PoseWorkflow draw, const Onnx::ImageView& src);
+  // Single-instance equivalent of coastOrPassthrough: re-emit the last good pose
+  // for up to Detection-Hold frames on a transient miss, else passthrough.
+  void holdOrPassthrough(const Onnx::ImageView& src);
+
+  // Detector accept score with enter/exit hysteresis: the user's Min Confidence
+  // is the enter threshold; once a detection is live we hold marginal ones down
+  // to a lower exit threshold so a subject hovering near the cut stops blinking.
+  float detThreshold() const noexcept
+  {
+    const float enter
+        = std::clamp(static_cast<float>(inputs.min_confidence.value), 0.05f, 0.95f);
+    return m_had_detection ? 0.66f * enter : enter;
+  }
 
   // Temporal One-Euro smoothing of the detected keypoints (in place).
   void applySmoothing(DetectedPose& pose);
@@ -624,6 +659,14 @@ private:
   int m_lost_frames{0};                 // consecutive frames without a pose
   Onnx::ROI::Rect m_prev_roi{};         // last smoothed ROI (plausibility check)
   bool m_have_prev_roi{false};
+
+  // Single-instance visible hold + box stabilization (the multi-instance path
+  // coasts via the tracker; these are the single-instance equivalents).
+  std::optional<DetectedPose> m_last_single_pose; // last good pose, for re-emit
+  PoseWorkflow m_last_single_draw{PoseWorkflow::Auto};
+  int m_hold_frames{0};                 // consecutive re-emitted (held) frames
+  bool m_had_detection{false};          // a detection is live (hysteresis)
+  Onnx::RectSmoother m_box_smoother;    // temporal One-Euro on the output box
 
   Onnx::ReidSpec m_reid_spec;
   boost::container::vector<float> m_reid_batch; // packed [N,3,H,W] reid input

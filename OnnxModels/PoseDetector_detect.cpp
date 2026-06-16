@@ -49,12 +49,18 @@ Onnx::ROI::Rect PoseDetector::detectionRect(
 std::vector<Onnx::Detection::Detection>
 PoseDetector::runDetector(
     const Onnx::ModelRole& role, const Onnx::ImageView& src, Onnx::ModelDomain target,
-    int keep_class, Onnx::OnnxRunContext* ctx_override)
+    int keep_class, Onnx::OnnxRunContext* ctx_override, float score_thr)
 {
   Onnx::OnnxRunContext* dctx_ptr
       = ctx_override ? ctx_override : this->det_ctx.get();
   if(!dctx_ptr)
     return {};
+
+  // Accept threshold: keep the family's quality floor, or raise it to the
+  // user/hysteresis value when one was passed (score_thr >= 0).
+  auto useThr = [score_thr](float floor) {
+    return (score_thr >= 0.f) ? std::max(floor, score_thr) : floor;
+  };
 
   auto& dctx = *dctx_ptr;
   const auto& spec = dctx.readModelSpec();
@@ -125,7 +131,7 @@ PoseDetector::runDetector(
     // -2 (domain default) -> person(0); else the requested class (-1 = all).
     const int keep = (keep_class == -2) ? 0 : keep_class;
     auto dets = Onnx::Detection::decodeEnd2End(
-        std::span<Ort::Value>(outs, n_out), model, keep, 0.3f);
+        std::span<Ort::Value>(outs, n_out), model, keep, useThr(0.3f));
     removeLetterbox(dets, lb);
     return dets;
   }
@@ -155,7 +161,7 @@ PoseDetector::runDetector(
                      && icontains(spec.outputs[0].name, "score_x"); // score before box
     const int keep = (keep_class == -2) ? 0 : keep_class;
     auto dets = Onnx::Detection::decodeMultiClass(
-        std::span<Ort::Value>(outs, n_out), mw, mh, keep, 0.4f, sbb);
+        std::span<Ort::Value>(outs, n_out), mw, mh, keep, useThr(0.4f), sbb);
     // remove top-left letterbox (non-square aware)
     for(auto& dd : dets)
     {
@@ -196,7 +202,8 @@ PoseDetector::runDetector(
     const size_t n_out = std::min<size_t>(2, spec.output_names_char.size());
     dctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
     auto dets = Onnx::Detection::decodeYoloxGrid(
-        std::span<Ort::Value>(outs, n_out), mw, mh, cls_lo, cls_hi, 0.3f, 0.45f);
+        std::span<Ort::Value>(outs, n_out), mw, mh, cls_lo, cls_hi, useThr(0.3f),
+        0.45f);
     for(auto& dd : dets)
     {
       auto fix = [&](float nx, float ny, float& ox, float& oy) {
@@ -246,7 +253,7 @@ PoseDetector::runDetector(
       }
     if(predecoded_idx >= 0)
       dets = Onnx::Detection::decodePreDecodedBoxes(
-          std::span<Ort::Value>(outs, n_out), predecoded_idx, 0.3f);
+          std::span<Ort::Value>(outs, n_out), predecoded_idx, useThr(0.3f));
     else
     {
       // Prior geometry only depends on (family, input size): rebuild on model
@@ -264,7 +271,8 @@ PoseDetector::runDetector(
       }
       // Both families use the canonical SSD variances 0.1/0.2.
       dets = Onnx::Detection::decodePriorBox(
-          std::span<Ort::Value>(outs, n_out), m_prior_cache, 0.1f, 0.2f, 0.4f);
+          std::span<Ort::Value>(outs, n_out), m_prior_cache, 0.1f, 0.2f,
+          useThr(0.4f));
     }
     dets = Onnx::Detection::nms(std::move(dets), 0.4f);
     // remove top-left letterbox (non-square aware)
@@ -357,7 +365,7 @@ PoseDetector::runDetector(
   dctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
 
   auto dets = Onnx::Detection::decode(
-      std::span<Ort::Value>(outs, n_out), m_ssd_anchors, model, 0.5f);
+      std::span<Ort::Value>(outs, n_out), m_ssd_anchors, model, useThr(0.5f));
   dets = Onnx::Detection::nms(std::move(dets), 0.3f);
   removeLetterbox(dets, lb);
   return dets;
@@ -368,10 +376,11 @@ void PoseDetector::runDetectorAsPose(
 {
   // The detector sits in the LANDMARK port here (standalone, e.g. RetinaFace
   // drawn as a 5-keypoint face pose), so run it on `ctx`, not `det_ctx`.
-  auto dets = runDetector(role, src, Onnx::ModelDomain::Body, -2, this->ctx.get());
+  auto dets = runDetector(
+      role, src, Onnx::ModelDomain::Body, -2, this->ctx.get(), detThreshold());
   if(dets.empty())
   {
-    passthrough(src);
+    holdOrPassthrough(src);
     return;
   }
 
@@ -402,7 +411,9 @@ void PoseDetector::runBoxDetection(
 {
   // detection_class: -1 = all classes, >=0 = that class id.
   const int class_sel = static_cast<int>(inputs.detection_class.value);
-  m_dets = runDetector(detRole, src, Onnx::ModelDomain::Unknown, class_sel);
+  m_dets = runDetector(
+      detRole, src, Onnx::ModelDomain::Unknown, class_sel, nullptr,
+      detThreshold());
   // App-side NMS (idempotent for branches already NMS'd in runDetector): closes
   // the duplicate-box gap for end2end/PINTO detectors that feed the tracker.
   m_dets = Onnx::Detection::nms(std::move(m_dets), 0.45f, 0.8f);

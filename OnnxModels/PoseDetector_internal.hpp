@@ -51,27 +51,57 @@ inline void fillBoxFromKeypoints(DetectedPose& pose)
 {
   if(pose.box.w > 0.f && pose.box.h > 0.f)
     return;
-  // Box from the keypoints, but built from only CONFIDENT joints. wholebody-133
-  // emits many low-confidence face/hand points whose SimCC peak hops every
-  // frame; including them makes the box jump ~25% frame-to-frame. Prefer
-  // conf>=0.5; fall back to a looser threshold only if that's too sparse.
-  auto build = [&](float thr) -> int {
+  // Confidence-weighted ("soft") bbox. The previous version used a hard
+  // confidence cut with a count-based 0.5<->0.2 fallback, which is BISTABLE: a
+  // far joint (foot/ear/hand) flicking across the cut, or the confident-joint
+  // count crossing 3, swapped the point set and made the box halve/double
+  // frame-to-frame. Here each joint's pull on the box edge ramps smoothly with
+  // its confidence (smoothstep over [lo,hi]); a fading joint retracts toward the
+  // confidence-weighted centroid, so the extent moves continuously instead of
+  // popping. wholebody-133's many low-confidence face/hand points barely move
+  // the box.
+  constexpr float lo = 0.2f, hi = 0.5f;
+  auto weight = [](float c) {
+    const float t = std::clamp((c - lo) / (hi - lo), 0.f, 1.f);
+    return t * t * (3.f - 2.f * t); // smoothstep
+  };
+  float sw = 0.f, cx = 0.f, cy = 0.f;
+  for(const auto& k : pose.keypoints)
+  {
+    const float w = weight(k.confidence);
+    sw += w;
+    cx += w * k.x;
+    cy += w * k.y;
+  }
+  if(sw <= 1e-6f)
+  {
+    // No confident joint: fall back to the unweighted bbox of every joint so a
+    // weak pose still gets a (rough) box rather than none.
     float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
     int n = 0;
     for(const auto& k : pose.keypoints)
     {
-      if(k.confidence < thr)
-        continue;
       ++n;
       minx = std::min(minx, k.x); maxx = std::max(maxx, k.x);
       miny = std::min(miny, k.y); maxy = std::max(maxy, k.y);
     }
-    if(n >= 1 && maxx > minx)
+    if(n >= 1 && maxx > minx && maxy > miny)
       pose.box = {minx, miny, maxx - minx, maxy - miny};
-    return n;
-  };
-  if(build(0.5f) < 3)
-    build(0.2f);
+    return;
+  }
+  cx /= sw;
+  cy /= sw;
+  float minx = cx, maxx = cx, miny = cy, maxy = cy;
+  for(const auto& k : pose.keypoints)
+  {
+    const float w = weight(k.confidence);
+    const float ex = cx + w * (k.x - cx); // retracts to centroid as conf fades
+    const float ey = cy + w * (k.y - cy);
+    minx = std::min(minx, ex); maxx = std::max(maxx, ex);
+    miny = std::min(miny, ey); maxy = std::max(maxy, ey);
+  }
+  if(maxx > minx && maxy > miny)
+    pose.box = {minx, miny, maxx - minx, maxy - miny};
 }
 
 // Prepare the output texture before drawing: copy the input frame in, or fill

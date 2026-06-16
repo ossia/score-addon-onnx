@@ -120,6 +120,9 @@ void PoseDetector::passthrough(const Onnx::ImageView& src)
       src.w, src.h, skeleton_only);
   outputs.image.texture.changed = true;
 
+  // A genuine blank frame: the detector-accept hysteresis goes back to strict.
+  m_had_detection = false;
+
   // Coast: keep temporal state for a few frames so a brief detection dropout
   // doesn't restart smoothing/tracking and lurch on re-acquisition. Only after
   // a sustained loss do we drop everything.
@@ -128,8 +131,11 @@ void PoseDetector::passthrough(const Onnx::ImageView& src)
   {
     m_smoother.reset();
     m_roi_smoother.reset();
+    m_box_smoother.reset();
     m_tracking = false;
     m_last_keypoints.clear();
+    m_last_single_pose.reset();
+    m_hold_frames = 0;
   }
 }
 
@@ -223,9 +229,13 @@ try
     m_last_keypoints.clear();
     m_roi_smoother.reset();
     m_smoother.reset();
+    m_box_smoother.reset();
     m_tracker.reset();
     m_lost_frames = 0;
     m_frames_since_detect = 0;
+    m_last_single_pose.reset();
+    m_hold_frames = 0;
+    m_had_detection = false;
   }
 
   // Model construction is the only failure that should permanently invalidate
@@ -325,10 +335,11 @@ try
     }
     if(!from_tracking)
     {
-      auto dets = runDetector(m_detector_role, src, role.domain);
+      auto dets = runDetector(
+          m_detector_role, src, role.domain, -2, nullptr, detThreshold());
       if(dets.empty())
       {
-        passthrough(src);
+        holdOrPassthrough(src);
         return;
       }
       rect = detectionRect(role, dets.front(), in_tex.width, in_tex.height);
@@ -355,7 +366,7 @@ try
     m_prev_roi = rect;
     m_have_prev_roi = true;
     const Onnx::Affine M = Onnx::ROI::rectToAffine(rect, mw, mh);
-    runLandmark(role, draw, src, M);
+    runLandmark(role, draw, src, M, /*track_id=*/-1, /*crop_padded=*/true);
 
     // --- Tracking gate: keep tracking only if the landmark model is confident
     if(inputs.track_roi.value && outputs.detection.value

@@ -675,8 +675,38 @@ void PoseDetector::finalizeSingle(PoseWorkflow wf)
       wf, static_cast<int>(outputs.detection.value->keypoints.size()));
   if(m_remap_active)
     remapPose(*outputs.detection.value);
+
+  // Temporal box smoothing: the single-instance equivalent of the tracker's
+  // Kalman box. Even with the soft confidence-weighted bbox, the extent can
+  // step when a joint's confidence ramps; One-Euro the box (cx,cy,w,h) so it
+  // tracks motion but doesn't jitter. (The smoother is reset on sustained loss
+  // and on model change; a short hold gap leaves it warm, which is fine.)
+  if(inputs.smoothing.value)
+  {
+    auto& b = outputs.detection.value->box;
+    if(b.w > 0.f && b.h > 0.f && finitef(b.x) && finitef(b.y) && finitef(b.w)
+       && finitef(b.h))
+    {
+      const float amt = std::clamp(
+          static_cast<float>(inputs.smoothing_amount.value), 0.f, 1.f);
+      m_box_smoother.configure(
+          5.0f * std::pow(0.02f / 5.0f, amt), 1.0f + 4.0f * amt);
+      float v[5] = {b.x + b.w * 0.5f, b.y + b.h * 0.5f, b.w, b.h, 0.f};
+      m_box_smoother.smooth(v);
+      if(v[2] > 0.f && v[3] > 0.f)
+        b = {v[0] - v[2] * 0.5f, v[1] - v[3] * 0.5f, v[2], v[3]};
+    }
+  }
+
   drawSkeleton(*outputs.detection.value, wf);
   generateGeometryOutput(*outputs.detection.value, wf);
+
+  // Record the finished pose so a transient miss next frame can re-emit it
+  // (holdOrPassthrough) instead of blanking.
+  m_last_single_pose = outputs.detection.value;
+  m_last_single_draw = wf;
+  m_hold_frames = 0;
+  m_had_detection = true;
 }
 
 void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
