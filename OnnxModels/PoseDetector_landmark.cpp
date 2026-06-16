@@ -41,6 +41,15 @@ NormSpec landmarkNorm(const Onnx::ModelRole& role)
   if(role.kind == Onnx::ModelKind::XyScoreLandmark && role.num_inputs < 2)
     return normMeanStd(
         Onnx::TensorLayout::NchwRgb, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f});
+  // 2D-FAN / face-alignment heatmap nets (68/98/106 kpts) take RGB in [0,1]
+  // (img/255), NOT the ImageNet mean/std the body heatmap nets (ViTPose/HRNet)
+  // below use. Verified upstream: 1adrianb/face-alignment api.py feeds
+  // crop(...).astype(float32) / 255.0 with no mean/std. Feeding ImageNet
+  // normalization instead flattens the heatmaps and scatters the keypoints.
+  if(role.kind == Onnx::ModelKind::HeatmapPose
+     && role.domain == Onnx::ModelDomain::Face)
+    return normMeanStd(
+        Onnx::TensorLayout::NchwRgb, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f});
   return normMeanStd(
       Onnx::TensorLayout::NchwRgb, {123.675f, 116.28f, 103.53f},
       {58.395f, 57.12f, 57.375f});
@@ -170,12 +179,26 @@ void decodeLandmark(
     }
     case Onnx::ModelKind::HeatmapPose:
     {
-      if(!outspan.empty())
+      // Stacked-hourglass face-alignment nets (2D-FAN) emit one heatmap per
+      // stage; the refined prediction is the LAST stage (1adrianb/face-alignment
+      // decodes out[-1]). Single-stage nets (ViTPose/HRNet) emit one heatmap, so
+      // this picks that same one. Select the last [1,K,h,w] float output.
+      const Ort::Value* hv = nullptr;
+      for(size_t i = 0; i < outspan.size(); ++i)
       {
-        auto info = outspan[0].GetTensorTypeAndShapeInfo();
+        if(!outspan[i].IsTensor())
+          continue;
+        auto hi = outspan[i].GetTensorTypeAndShapeInfo();
+        if(hi.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+          continue;
+        const auto hs = hi.GetShape();
+        if(hs.size() == 4 && hs[2] > 1 && hs[3] > 1)
+          hv = &outspan[i];
+      }
+      if(hv)
+      {
+        auto info = hv->GetTensorTypeAndShapeInfo();
         auto shape = info.GetShape();
-        if(shape.size() == 4
-           && info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
         {
           const int hh = static_cast<int>(shape[2]);
           const int hw = static_cast<int>(shape[3]);
@@ -186,7 +209,7 @@ void decodeLandmark(
           const int64_t total = static_cast<int64_t>(info.GetElementCount());
           const int K = static_cast<int>(std::min<int64_t>(
               shape[1] > 0 ? shape[1] : 0, total / (static_cast<int64_t>(hh) * hw)));
-          const float* hmaps = outspan[0].GetTensorData<float>();
+          const float* hmaps = hv->GetTensorData<float>();
           kps.reserve(K);
           for(int k = 0; k < K; ++k)
           {
