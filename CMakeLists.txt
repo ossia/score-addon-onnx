@@ -21,7 +21,7 @@ if(NOT Avendish_FOUND)
   FetchContent_Declare(
     Avendish
     GIT_REPOSITORY "https://github.com/celtera/avendish"
-    GIT_TAG 7eafe173)
+    GIT_TAG ebbbdf81a3c69831c50231877814b63852f9881c)
   FetchContent_Populate(Avendish)
   list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
   find_package(Avendish REQUIRED)
@@ -56,8 +56,10 @@ if(NOT WIN32)
   endblock()
 endif()
 
-# General initialization
-score_common_setup()
+# General initialization (only available in a score build; standalone has no such command)
+if(COMMAND score_common_setup)
+  score_common_setup()
+endif()
 
 avnd_addon_init(NAME score_addon_onnx_models)
 
@@ -235,7 +237,16 @@ target_sources(score_addon_onnx_models
 # C++ precompiled header. CTX_RASTERIZER=1 enables the in-memory framebuffer
 # rasterizer (otherwise gated behind a windowing backend); -w silences the
 # header's benign C-isms (const-casts, an implicit static-inline forward use).
-add_library(score_onnx_ctx_overlay STATIC Onnx/helpers/ctx_overlay.c)
+#
+# The source is referenced through a variable on purpose: score's JIT add-on
+# loader gathers compilable sources by *textually* scanning add_library() blocks
+# and #include-ing every file it finds into one C++ unity TU. A bare
+# "ctx_overlay.c" there would be pulled into that C++ TU and fail to compile (it
+# is C-only), and likewise the -O3 ImageOps/TensorToTexture units below would be
+# duplicated. Hiding the filenames behind ${...} keeps the real CMake build
+# identical while making these helper libraries invisible to the JIT scanner.
+set(SCORE_ONNX_CTX_OVERLAY_SRC Onnx/helpers/ctx_overlay.c)
+add_library(score_onnx_ctx_overlay STATIC ${SCORE_ONNX_CTX_OVERLAY_SRC})
 target_include_directories(score_onnx_ctx_overlay
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Onnx/helpers)
 # ctx.h is a single-header monolith (vector raster + terminal emulator + audio +
@@ -305,9 +316,13 @@ target_link_libraries(score_addon_onnx_models PRIVATE score_onnx_ctx_overlay)
 # Debug builds, because these tight float loops run 5-15x slower at -Og/-O0 and
 # would otherwise dominate the frame in a developer build. Header-only inlining
 # would pull them back into the -Og host TU, so they live in ImageOps.cpp.
-add_library(score_onnx_imageops STATIC
+# Referenced via a variable so score's JIT add-on scanner (which textually
+# harvests add_library() sources into a single C++ unity TU) does not also
+# #include these -O3 units -- they are already compiled here as their own lib.
+set(SCORE_ONNX_IMAGEOPS_SRC
     Onnx/helpers/ImageOps.cpp
     Onnx/helpers/TensorToTexture.cpp)
+add_library(score_onnx_imageops STATIC ${SCORE_ONNX_IMAGEOPS_SRC})
 target_include_directories(score_onnx_imageops PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(score_onnx_imageops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
