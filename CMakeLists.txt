@@ -34,7 +34,27 @@ endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rapidlib.cmake")
 
-if(NOT WIN32)
+# onnxruntime-extensions (tokenizers) are only needed by the LLM/VLM objects
+# (QwenLLM, FastVLM). Building it requires the onnxruntime-extensions submodule and
+# its own onnxruntime headers, and its CMake fails to configure outside a full score
+# tree (it errors "required internal CMake variable not set" right after "Tokenizer
+# needed." on the standalone/portability lanes). The bulk of the addon (YOLO*, Pose*,
+# Depth*, Resnet, ENet, GAN, rapidlib regressor/classifier) only needs plain
+# onnxruntime, so gate the extensions subbuild -- and the two objects that depend on
+# it -- behind SCORE_ONNX_ENABLE_EXTENSIONS. It defaults ON in a score build (which
+# keeps CUDA + extensions) and OFF standalone, where only plain-onnxruntime objects
+# are introspected/built. AVND_ADDON_SCORE is set by Avendish's AvendishAddon.cmake.
+option(SCORE_ONNX_ENABLE_EXTENSIONS
+  "Build onnxruntime-extensions (tokenizers) and the LLM/VLM objects that need them"
+  ${AVND_ADDON_SCORE})
+
+# onnxruntime-extensions does not build on Windows here (issue #985); never enable it
+# there even in a score build.
+if(WIN32)
+  set(SCORE_ONNX_ENABLE_EXTENSIONS 0)
+endif()
+
+if(SCORE_ONNX_ENABLE_EXTENSIONS)
   # disabled due to https://github.com/microsoft/onnxruntime-extensions/issues/985
   set(ENABLE_TESTS 0)
   set(ENABLE_PYTHON 0)
@@ -168,7 +188,11 @@ avnd_addon_object(
     RapidlibModels/Classifier.cpp)
 
 
-if(NOT WIN32)
+# FastVLM and QwenLLM are the only objects that #include the onnxruntime-extensions
+# tokenizer headers (Onnx/helpers/TokenIO.hpp etc.), so they can only be built when the
+# extensions subbuild above ran. Standalone/portability builds skip both the subbuild
+# and these objects; the remaining objects compile against plain onnxruntime.
+if(SCORE_ONNX_ENABLE_EXTENSIONS)
 avnd_addon_object(
   BASE score_addon_onnx_models
   C_NAME fastvlm
@@ -338,7 +362,7 @@ target_link_libraries(score_addon_onnx_models
       $<COMPILE_ONLY:onnxruntime::onnxruntime>
       rapidlib
  )
-if(NOT WIN32)
+if(SCORE_ONNX_ENABLE_EXTENSIONS)
   target_link_libraries(score_addon_onnx_models
     PUBLIC
       ocos_operators
