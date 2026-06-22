@@ -333,7 +333,17 @@ target_compile_definitions(score_onnx_ctx_overlay PRIVATE
   miniz_def_free_func=ctxshim_miniz_def_free_func
   miniz_def_realloc_func=ctxshim_miniz_def_realloc_func)
 
-target_link_libraries(score_addon_onnx_models PRIVATE score_onnx_ctx_overlay)
+# In a score build the base target is the final plugin and links these helpers
+# directly (PRIVATE). Standalone, each object is its own static lib that links the
+# base PUBLIC, and the per-object back-end executables link the object PUBLIC -- so the
+# helper libs must propagate through the base (PUBLIC) for those executables to resolve
+# the ImageOps / ctx-overlay symbols the objects reference.
+if(AVND_ADDON_SCORE)
+  set(SCORE_ONNX_HELPER_LINK PRIVATE)
+else()
+  set(SCORE_ONNX_HELPER_LINK PUBLIC)
+endif()
+target_link_libraries(score_addon_onnx_models ${SCORE_ONNX_HELPER_LINK} score_onnx_ctx_overlay)
 
 # Image-processing hot path (per-pixel bilinear sample / normalize / warp /
 # letterbox / Lanczos resize). Built as its own static lib forced to -O3 even in
@@ -354,14 +364,26 @@ if(NOT MSVC)
 else()
   target_compile_options(score_onnx_imageops PRIVATE /O2)
 endif()
-target_link_libraries(score_addon_onnx_models PRIVATE score_onnx_imageops)
+target_link_libraries(score_addon_onnx_models ${SCORE_ONNX_HELPER_LINK} score_onnx_imageops)
 
-# Link
-target_link_libraries(score_addon_onnx_models
-    PUBLIC
-      $<COMPILE_ONLY:onnxruntime::onnxruntime>
-      rapidlib
- )
+# Link. In a score build the host links the onnxruntime shared lib itself (and
+# installs it, see cmake/onnxruntime.cmake), so the plugin only needs its headers
+# (COMPILE_ONLY) -- avoids a second copy on the link line. Standalone, each back-end
+# executable must actually link libonnxruntime, so attach it as a normal PUBLIC dep
+# that propagates through the base to the per-object back-ends.
+if(AVND_ADDON_SCORE)
+  target_link_libraries(score_addon_onnx_models
+      PUBLIC
+        $<COMPILE_ONLY:onnxruntime::onnxruntime>
+        rapidlib
+   )
+else()
+  target_link_libraries(score_addon_onnx_models
+      PUBLIC
+        onnxruntime::onnxruntime
+        rapidlib
+   )
+endif()
 if(SCORE_ONNX_ENABLE_EXTENSIONS)
   target_link_libraries(score_addon_onnx_models
     PUBLIC
