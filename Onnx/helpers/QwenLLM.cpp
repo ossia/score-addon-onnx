@@ -1,9 +1,8 @@
 #include "QwenLLM.hpp"
 
-#include <QDebug>
-
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <cmath>
+#include <cstdio>
 #include <ext_status.h>
 
 #include <algorithm>
@@ -349,7 +348,7 @@ std::vector<float> QwenLLMInference::runModel(
                 kvShape.data(),
                 kvShape.size()));
       } else {
-        qDebug() << "QwenLLM: WARNING - KV cache" << i << "is empty";
+        std::fprintf(stderr, "QwenLLM: WARNING - KV cache %d is empty\n", (int)i);
       }
     }
   }
@@ -394,7 +393,7 @@ std::vector<float> QwenLLMInference::runModel(
     
     int64_t lastDim = logitsShape.back();
     if (lastDim != vocabSize) {
-      qDebug() << "WARNING: Last dimension" << lastDim << "doesn't match vocab size" << vocabSize;
+      std::fprintf(stderr, "WARNING: Last dimension %lld doesn't match vocab size %lld\n", (long long)lastDim, (long long)vocabSize);
     }
     
     // For safety, only take the logits for the last token (most recent position)
@@ -457,14 +456,14 @@ std::vector<float> QwenLLMInference::runModel(
       }
       else
       {
-        qDebug() << "QwenLLM: WARNING - KV output" << i << "is not float16, skipping";
+        std::fprintf(stderr, "QwenLLM: WARNING - KV output %d is not float16, skipping\n", (int)i);
       }
     }
 
     return logits;
   }
   catch (const Ort::Exception& e) {
-    qDebug() << "ORT Exception in runModel:" << e.what();
+    std::fprintf(stderr, "ORT Exception in runModel: %s\n", e.what());
     throw;
   }
 }

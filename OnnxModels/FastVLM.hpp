@@ -1,5 +1,5 @@
 #pragma once
-#include <QImage>
+#include <Onnx/helpers/ImageBuffer.hpp>
 
 #include <Onnx/helpers/FastVLM.hpp>
 #include <OnnxModels/Utils.hpp>
@@ -85,7 +85,7 @@ public:
   struct worker
   {
     std::function<void(
-        QImage,
+        Onnx::ImageData,
         std::string,
         float,
         std::shared_ptr<Onnx::FastVLMInference>)>
@@ -94,7 +94,7 @@ public:
     // Called back in a worker thread
     // The returned function will be later applied in this object's processing thread
     static std::function<void(FastVLMNode&)> work(
-        QImage image,
+        Onnx::ImageData image,
         std::string prompt,
         float temperature,
         std::shared_ptr<Onnx::FastVLMInference> vlm);

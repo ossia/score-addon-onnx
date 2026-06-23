@@ -2,9 +2,6 @@
 
 #include <ossia/detail/fmt.hpp>
 
-#include <QImage>
-#include <QRect>
-
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
@@ -14,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -46,12 +44,12 @@ struct FastVLMTokenizerConstants
 };
 
 static Onnx::FloatTensor preprocessImageForFastVLM(
-    const QImage& image,
+    const Onnx::ImageData& image,
     boost::container::vector<float>& tensorValues)
 {
   // Create a minimal ModelSpec::Port for the existing function
   ModelSpec::Port port;
-  port.shape = {1, 3, image.height(), image.width()};
+  port.shape = {1, 3, image.height, image.width};
   static constexpr std::array<float, 3> mean = {0.0f, 0.0f, 0.0f};
   static constexpr std::array<float, 3> std = {255.f, 255.f, 255.f};
 
@@ -59,11 +57,11 @@ static Onnx::FloatTensor preprocessImageForFastVLM(
 
   return nchw_tensorFromRGBA(
       port,
-      image.constBits(),
-      image.width(),
-      image.height(),
-      image.width(),
-      image.height(),
+      image.pixels.data(),
+      image.width,
+      image.height,
+      image.width,
+      image.height,
       tensorValues,
       mean,
       std);
@@ -83,12 +81,25 @@ FastVLMInference::FastVLMInference(
   try
   {
 #if defined(_WIN32)
-    auto model0 = QString::fromUtf8(visionEncoderPath);
-    auto model1 = QString::fromUtf8(embedTokensPath);
-    auto model2 = QString::fromUtf8(decoderPath);
-    auto model0_str = model0.toStdWString();
-    auto model1_str = model1.toStdWString();
-    auto model2_str = model2.toStdWString();
+    // ORT wants wide paths on Windows: decode the UTF-8 byte paths to wstring.
+    auto model0_str
+        = std::filesystem::path(std::u8string(
+                                    reinterpret_cast<const char8_t*>(
+                                        visionEncoderPath.data()),
+                                    visionEncoderPath.size()))
+              .wstring();
+    auto model1_str
+        = std::filesystem::path(std::u8string(
+                                    reinterpret_cast<const char8_t*>(
+                                        embedTokensPath.data()),
+                                    embedTokensPath.size()))
+              .wstring();
+    auto model2_str
+        = std::filesystem::path(std::u8string(
+                                    reinterpret_cast<const char8_t*>(
+                                        decoderPath.data()),
+                                    decoderPath.size()))
+              .wstring();
 #else
     auto model0_str = visionEncoderPath;
     auto model1_str = embedTokensPath;
@@ -152,7 +163,7 @@ FastVLMInference::~FastVLMInference()
 }
 
 std::string FastVLMInference::generateResponse(
-    const QImage& image,
+    const Onnx::ImageData& image,
     const std::string& prompt,
     float temperature)
 {
@@ -162,7 +173,7 @@ std::string FastVLMInference::generateResponse(
     auto processedImageTensor = preprocessImageForFastVLM(image, tensorValues);
 
     auto imageFeatures = runVisionEncoder(
-        processedImageTensor.storage, image.width(), image.height());
+        processedImageTensor.storage, image.width, image.height);
     std::swap(processedImageTensor.storage, tensorValues);
     if (imageFeatures.empty())
       throw std::runtime_error("No image feature");
