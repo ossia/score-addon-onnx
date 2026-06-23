@@ -2,17 +2,15 @@
 #include <boost/container/vector.hpp>
 #include <boost/dynamic_bitset.hpp>
 
-#include <QDebug>
-#include <QImage>
-#include <QPainter>
-#include <QPen>
-
+#include <Onnx/helpers/CoreTypes.hpp>
+#include <Onnx/helpers/CtxOverlay.hpp>
 #include <Onnx/helpers/ImageBuffer.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <vector>
 
 namespace Onnx
@@ -153,15 +151,21 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
   return f;
 }
 
-inline QImage drawRects(const unsigned char* input, int w, int h, auto& rects)
+// Composite detection rectangles (and optional names / keypoints) onto a copy
+// of the RGBA8888 input frame using the Qt-free ctx overlay. Returns the
+// rasterized RGBA buffer; the caller memcpy's it into its output texture.
+inline ImageData drawRects(const unsigned char* input, int w, int h, auto& rects)
 {
-  QImage img(input, w, h, QImage::Format_RGBA8888);
+  ImageData img;
+  img.width = w;
+  img.height = h;
+  img.pixels.assign(
+      input, input + static_cast<std::size_t>(w) * h * 4);
 
   {
-    QPainter p(&img);
-    p.setClipRect(img.rect());
-    p.setPen(QPen(Qt::white, 4));
-    p.setBrush(Qt::NoBrush);
+    OnnxModels::Overlay ov(img.pixels.data(), w, h);
+    ov.color(Onnx::Rgba{1.f, 1.f, 1.f, 1.f});
+    ov.lineWidth(4.f);
     for (const auto& rect : rects)
     {
       // Clamp coordinates to valid range
@@ -169,10 +173,17 @@ inline QImage drawRects(const unsigned char* input, int w, int h, auto& rects)
       int ry = std::clamp(static_cast<int>(rect.geometry.y), 0, h);
       int rw = std::clamp(static_cast<int>(rect.geometry.w), 0, w - rx);
       int rh = std::clamp(static_cast<int>(rect.geometry.h), 0, h - ry);
-      p.drawRect(rx, ry, rw, rh);
+      ov.strokeRect(Onnx::Rect{
+          static_cast<float>(rx), static_cast<float>(ry),
+          static_cast<float>(rw), static_cast<float>(rh)});
       if constexpr (requires { rect.name; })
       {
-        p.drawText(std::max(0, rx), std::max(10, ry), QString::fromStdString(rect.name));
+        ov.text(
+            14.f,
+            Onnx::Vec2{
+                static_cast<float>(std::max(0, rx)),
+                static_cast<float>(std::max(10, ry))},
+            rect.name.c_str());
       }
 
       if constexpr (requires { rect.keypoints; })
@@ -180,40 +191,36 @@ inline QImage drawRects(const unsigned char* input, int w, int h, auto& rects)
         for (auto [i, x, y] : rect.keypoints)
         {
           if (x >= 0 && x < w && y >= 0 && y < h)
-            p.drawEllipse(QPoint(x, y), 5, 5);
+            ov.fillCircle(
+                Onnx::Vec2{static_cast<float>(x), static_cast<float>(y)}, 5.f);
         }
       }
     }
-  }
+  } // Overlay dtor rasterizes into img.pixels
   return img;
 }
 
-// Function to draw segmentation results on a QImage
-inline QImage drawBlobAndSegmentation(
+// Function to draw segmentation results onto a copy of the RGBA8888 input.
+inline ImageData drawBlobAndSegmentation(
     const unsigned char* input,
     int w,
     int h,
     const auto& segmentations)
 {
-  QImage img(input, w, h, QImage::Format_RGBA8888);
-  QImage maskOverlay(w, h, QImage::Format_ARGB32_Premultiplied);
-  maskOverlay.fill(Qt::transparent);
+  ImageData img;
+  img.width = w;
+  img.height = h;
+  img.pixels.assign(
+      input, input + static_cast<std::size_t>(w) * h * 4);
 
-  QPainter painter(&maskOverlay);
-  painter.setRenderHint(QPainter::Antialiasing);
-  painter.setClipRect(maskOverlay.rect());
-
+  // 1) Tint the masked pixels directly in the RGBA buffer (was a premultiplied
+  //    ARGB overlay composited with QPainter).
   int k = 120;
   for (const auto& seg : segmentations)
   {
-    QColor color = QColor::fromHsv(k % 360, 200, 220);
-    color.setAlpha(100);
-    auto r = color.red();
-    auto g = color.green();
-    auto b = color.blue();
-    painter.setBrush(color);
-    painter.setPen(color);
-    auto data = img.bits();
+    const Onnx::Rgba c = Onnx::hsv((k % 360) / 360.f, 200.f / 255.f, 220.f / 255.f);
+    const double r = c.r * 255.0, g = c.g * 255.0, b = c.b * 255.0;
+    auto data = img.pixels.data();
     const boost::dynamic_bitset<>& mask = seg.mask;
     const size_t mask_size = mask.size();
 #pragma omp simd
@@ -236,57 +243,66 @@ inline QImage drawBlobAndSegmentation(
     k = k % 359;
   }
 
-  QPainter finalPainter(&img);
-  finalPainter.setClipRect(img.rect());
-  finalPainter.drawImage(0, 0, maskOverlay);
-
-  for (const auto& seg : segmentations)
+  // 2) Stroke boxes + labels with the ctx overlay.
   {
-    finalPainter.setBrush(Qt::NoBrush);
-    finalPainter.setPen(QPen(Qt::white, 2));
+    OnnxModels::Overlay ov(img.pixels.data(), w, h);
+    for (const auto& seg : segmentations)
+    {
+      ov.color(Onnx::Rgba{1.f, 1.f, 1.f, 1.f});
+      ov.lineWidth(2.f);
 
-    // Clamp coordinates to valid range
-    int rx = std::clamp(static_cast<int>(seg.geometry.x), 0, w);
-    int ry = std::clamp(static_cast<int>(seg.geometry.y), 0, h);
-    int rw = std::clamp(static_cast<int>(seg.geometry.w), 0, w - rx);
-    int rh = std::clamp(static_cast<int>(seg.geometry.h), 0, h - ry);
-    finalPainter.drawRect(rx, ry, rw, rh);
+      // Clamp coordinates to valid range
+      int rx = std::clamp(static_cast<int>(seg.geometry.x), 0, w);
+      int ry = std::clamp(static_cast<int>(seg.geometry.y), 0, h);
+      int rw = std::clamp(static_cast<int>(seg.geometry.w), 0, w - rx);
+      int rh = std::clamp(static_cast<int>(seg.geometry.h), 0, h - ry);
+      ov.strokeRect(Onnx::Rect{
+          static_cast<float>(rx), static_cast<float>(ry),
+          static_cast<float>(rw), static_cast<float>(rh)});
 
-    QString label = QString("%1: %2")
-                        .arg(QString::fromStdString(seg.name))
-                        .arg(seg.confidence, 0, 'f', 2);
-
-    QPointF textPos(std::max(0, rx), std::max(10, ry - 5));
-    finalPainter.setPen(Qt::white);
-    finalPainter.drawText(textPos, label);
+      char label[256];
+      std::snprintf(
+          label, sizeof(label), "%s: %.2f", seg.name.c_str(),
+          static_cast<double>(seg.confidence));
+      ov.text(
+          14.f,
+          Onnx::Vec2{
+              static_cast<float>(std::max(0, rx)),
+              static_cast<float>(std::max(10, ry - 5))},
+          label);
+    }
   }
 
   return img;
 }
 
-inline QImage drawKeypoints(
+inline ImageData drawKeypoints(
     const unsigned char* input,
     int w,
     int h,
     float min_confidence,
     const auto& keypoints)
 {
-  QImage img(input, w, h, QImage::Format_RGBA8888);
+  ImageData img;
+  img.width = w;
+  img.height = h;
+  img.pixels.assign(
+      input, input + static_cast<std::size_t>(w) * h * 4);
 
   {
-    QPainter p(&img);
-    p.setClipRect(img.rect());
-    p.setPen(QPen(Qt::white, 4));
-    p.setBrush(Qt::NoBrush);
+    OnnxModels::Overlay ov(img.pixels.data(), w, h);
     for (const auto& kp : keypoints)
     {
       if (kp.x >= 0 && kp.x < w)
         if (kp.y >= 0 && kp.y < h)
         {
           float conf = std::clamp(static_cast<float>(kp.confidence()), 0.0f, 1.0f);
-          p.setPen(QPen(QColor::fromRgbF(1., 1., 1., conf), 4));
+          ov.color(Onnx::Rgba{1.f, 1.f, 1.f, conf});
           //if (kp.confidence() >= min_confidence)
-          p.drawEllipse(QPoint(kp.x, kp.y), 5, 5);
+          ov.fillCircle(
+              Onnx::Vec2{
+                  static_cast<float>(kp.x), static_cast<float>(kp.y)},
+              5.f);
         }
     }
   }
@@ -294,22 +310,35 @@ inline QImage drawKeypoints(
   return img;
 }
 
-// GAN-specific image utilities
-inline QImage normalizeToImage(
+// Set one RGBA8888 pixel (alpha forced opaque) in an ImageData buffer.
+inline void
+setRgb(ImageData& img, int x, int y, int r, int g, int b)
+{
+  unsigned char* p
+      = img.pixels.data() + (static_cast<std::size_t>(y) * img.width + x) * 4;
+  p[0] = static_cast<unsigned char>(r);
+  p[1] = static_cast<unsigned char>(g);
+  p[2] = static_cast<unsigned char>(b);
+  p[3] = 255;
+}
+
+// GAN-specific image utilities. Produce an RGBA8888 ImageData (was QImage
+// RGB888); the alpha channel is opaque.
+inline ImageData normalizeToImage(
     const float* data,
     const std::vector<int64_t>& shape,
     float min_val,
     float max_val)
 {
   if (shape.size() != 4)
-    return QImage();
+    return {};
 
   int channels = static_cast<int>(shape[1]);
   int height = static_cast<int>(shape[2]);
   int width = static_cast<int>(shape[3]);
 
   if (channels != 3)
-    return QImage();
+    return {};
 
   // Find actual min/max for better normalization
   float actual_min = data[0], actual_max = data[0];
@@ -319,7 +348,10 @@ inline QImage normalizeToImage(
     actual_max = std::max(actual_max, data[i]);
   }
 
-  QImage image(width, height, QImage::Format_RGB888);
+  ImageData image;
+  image.width = width;
+  image.height = height;
+  image.pixels.resize(static_cast<std::size_t>(width) * height * 4);
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
@@ -342,19 +374,23 @@ inline QImage normalizeToImage(
           0.0f,
           255.0f));
 
-      image.setPixel(x, y, qRgb(red, green, blue));
+      setRgb(image, x, y, red, green, blue);
     }
   }
 
   return image;
 }
 
-inline QImage nchwToQImage(const float* data, int width, int height, int channels)
+inline ImageData
+nchwToQImage(const float* data, int width, int height, int channels)
 {
   if (channels != 3)
-    return QImage();
+    return {};
 
-  QImage image(width, height, QImage::Format_RGB888);
+  ImageData image;
+  image.width = width;
+  image.height = height;
+  image.pixels.resize(static_cast<std::size_t>(width) * height * 4);
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
@@ -367,39 +403,40 @@ inline QImage nchwToQImage(const float* data, int width, int height, int channel
       int green = static_cast<int>(std::clamp(g * 255.0f, 0.0f, 255.0f));
       int blue = static_cast<int>(std::clamp(b * 255.0f, 0.0f, 255.0f));
 
-      image.setPixel(x, y, qRgb(red, green, blue));
+      setRgb(image, x, y, red, green, blue);
     }
   }
 
   return image;
 }
 
-// Convert QImage to tensor data in specified format
+// Convert an RGBA8888 ImageData to tensor data in the specified format (the
+// alpha channel is dropped).
 inline std::vector<float> imageToTensor(
-    const QImage& image,
+    const ImageData& image,
     const std::string& tensor_format,
     float input_mean = 0.0f,
     float input_std = 1.0f)
 {
-  if (image.isNull())
+  if (image.empty())
     return {};
 
-  // Convert to RGB format if necessary
-  QImage rgb_image = image.convertToFormat(QImage::Format_RGB888);
-  int width = rgb_image.width();
-  int height = rgb_image.height();
+  int width = image.width;
+  int height = image.height;
+  const unsigned char* src = image.pixels.data();
   std::vector<float> tensor_data(height * width * 3);
 
   if (tensor_format == "NCHW") {
     // NCHW format: [channels, height, width]
     for (int y = 0; y < height; ++y) {
       for (int x = 0; x < width; ++x) {
-        QRgb pixel = rgb_image.pixel(x, y);
+        const unsigned char* px
+            = src + (static_cast<std::size_t>(y) * width + x) * 4;
 
         // Normalize based on config
-        float r = (qRed(pixel) / 255.0f - input_mean) / input_std;
-        float g = (qGreen(pixel) / 255.0f - input_mean) / input_std;
-        float b = (qBlue(pixel) / 255.0f - input_mean) / input_std;
+        float r = (px[0] / 255.0f - input_mean) / input_std;
+        float g = (px[1] / 255.0f - input_mean) / input_std;
+        float b = (px[2] / 255.0f - input_mean) / input_std;
 
         // NCHW format: tensor[c][y][x]
         tensor_data[0 * height * width + y * width + x] = r; // R channel
@@ -411,12 +448,13 @@ inline std::vector<float> imageToTensor(
     // NHWC format: [height, width, channels]
     for (int y = 0; y < height; ++y) {
       for (int x = 0; x < width; ++x) {
-        QRgb pixel = rgb_image.pixel(x, y);
+        const unsigned char* px
+            = src + (static_cast<std::size_t>(y) * width + x) * 4;
 
         // Normalize to [0,1] range
-        float r = qRed(pixel) / 255.0f;
-        float g = qGreen(pixel) / 255.0f;
-        float b = qBlue(pixel) / 255.0f;
+        float r = px[0] / 255.0f;
+        float g = px[1] / 255.0f;
+        float b = px[2] / 255.0f;
 
         // NHWC format: tensor[y][x][c]
         size_t idx = y * width * 3 + x * 3;

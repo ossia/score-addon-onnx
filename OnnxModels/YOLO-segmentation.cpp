@@ -2,8 +2,6 @@
 
 #include <boost/algorithm/string.hpp>
 
-#include <QPainter>
-
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <Onnx/helpers/Yolo.hpp>
@@ -77,7 +75,7 @@ try
   outputs.image.create(in_tex.width, in_tex.height);
   memcpy(
       outputs.image.texture.bytes,
-      img.bits(),
+      img.pixels.data(),
       in_tex.width * in_tex.height * 4);
   outputs.image.texture.changed = true;
   std::swap(storage, t.storage);
