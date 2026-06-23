@@ -7,6 +7,7 @@
 #include <QPainter>
 #include <QPen>
 
+#include <Onnx/helpers/ImageBuffer.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxBase.hpp>
 #include <Onnx/helpers/Utilities.hpp>
@@ -34,26 +35,13 @@ inline FloatTensor nchw_tensorFromARGB(
   std::vector<std::int64_t> input_shape = port.shape;
   if(!input_shape.empty())
     input_shape[0] = 1;
-  QImage img
-      = QImage(source_bits, source_w, source_h, QImage::Format_RGBA8888);
-  img = std::move(img).scaled(
-      model_w,
-      model_h,
-      Qt::AspectRatioMode::KeepAspectRatioByExpanding,
-      Qt::SmoothTransformation);
-  if (model_w != img.width() || model_h != img.height())
-  {
-    // Center crop instead of top-left crop
-    int x = (img.width() - model_w) / 2;
-    int y = (img.height() - model_h) / 2;
-    img = img.copy(x, y, model_w, model_h);
-  }
-  img = std::move(img).convertToFormat(QImage::Format_RGB888);
+  auto rgba = resize_fill_crop_rgba(source_bits, source_w, source_h, model_w, model_h);
+  auto rgb = rgba_to_rgb(rgba.data(), model_w, model_h);
 
   input_tensor_values.resize(
       3 * model_w * model_h, boost::container::default_init);
 
-  auto ptr = (unsigned char*)img.constBits();
+  auto ptr = rgb.data();
   auto dst = input_tensor_values.data();
   auto dst_r = dst;
   auto dst_g = dst_r + model_w * model_h;
@@ -62,7 +50,7 @@ inline FloatTensor nchw_tensorFromARGB(
   nhwc_to_nchw<float>(
       model_w,
       model_h,
-      img.bytesPerLine(),
+      model_w * 3,
       ptr,
       dst_r,
       dst_g,
@@ -95,27 +83,14 @@ inline FloatTensor nchw_tensorFromRGBA(
   std::vector<std::int64_t> input_shape = port.shape;
   if(!input_shape.empty())
     input_shape[0] = 1;
-  QImage img
-      = QImage(source_bits, source_w, source_h, QImage::Format_RGBA8888);
-  img = img.scaled(
-      model_w,
-      model_h,
-      Qt::AspectRatioMode::KeepAspectRatioByExpanding,
-      Qt::SmoothTransformation);
-  if (model_w != img.width() || model_h != img.height())
-  {
-    // Center crop instead of top-left crop
-    int x = (img.width() - model_w) / 2;
-    int y = (img.height() - model_h) / 2;
-    img = img.copy(x, y, model_w, model_h);
-  }
-  img = std::move(img).convertToFormat(QImage::Format_RGB888);
+  auto rgba = resize_fill_crop_rgba(source_bits, source_w, source_h, model_w, model_h);
+  auto rgb = rgba_to_rgb(rgba.data(), model_w, model_h);
 
   // FIXME pass storage as input instead
   input_tensor_values.resize(
       3 * model_w * model_h, boost::container::default_init);
 
-  auto ptr = (unsigned char*)img.constBits();
+  auto ptr = rgb.data();
   auto dst = input_tensor_values.data();
   auto dst_r = dst;
   auto dst_g = dst_r + model_w * model_h;
@@ -123,7 +98,7 @@ inline FloatTensor nchw_tensorFromRGBA(
   nhwc_to_nchw<float>(
       model_w,
       model_h,
-      img.bytesPerLine(),
+      model_w * 3,
       ptr,
       dst_r,
       dst_g,
@@ -154,26 +129,12 @@ inline FloatTensor nhwc_rgb_tensorFromRGBA(
   std::vector<std::int64_t> input_shape = port.shape;
   if(!input_shape.empty())
     input_shape[0] = 1;
-  QImage img
-      = QImage(source_bits, source_w, source_h, QImage::Format_RGBA8888);
-  img = img.scaled(
-      model_w,
-      model_h,
-      Qt::AspectRatioMode::KeepAspectRatioByExpanding,
-      Qt::SmoothTransformation);
-  if (model_w != img.width() || model_h != img.height())
-  {
-    // Center crop instead of top-left crop
-    int x = (img.width() - model_w) / 2;
-    int y = (img.height() - model_h) / 2;
-    img = img.copy(x, y, model_w, model_h);
-  }
+  auto rgba = resize_fill_crop_rgba(source_bits, source_w, source_h, model_w, model_h);
 
   input_tensor_values.resize(
       3 * model_w * model_h, boost::container::default_init);
 
-  // FIXME does not work if img.bytesPerLine() != 4 * model_w;
-  auto ptr = (unsigned char*)img.constBits();
+  auto ptr = rgba.data();
   auto dst = input_tensor_values.data();
   for (int src_i = 0, dst_i = 0; dst_i < 3 * model_w * model_h;)
   {
