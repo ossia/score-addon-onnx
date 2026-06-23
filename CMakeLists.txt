@@ -4,7 +4,12 @@ if(EMSCRIPTEN)
   return()
 endif()
 
-project(score_addon_onnx LANGUAGES CXX)
+# C is needed for the ctx_overlay.c helper static library (see below). A score
+# build enables C via the top-level score project, but a standalone avnd-addon
+# build has no such parent, so enabling it here is required -- otherwise CMake's
+# generate step fails with "required internal CMake variable not set"
+# (CMAKE_C_COMPILE_OBJECT / CMAKE_C_ARCHIVE_CREATE / CMAKE_C_ARCHIVE_FINISH).
+project(score_addon_onnx LANGUAGES C CXX)
 
 # Max/MSP externals link the static CRT (/MT) on Windows, as the official
 # max-sdk-base requires. Set it for the whole addon -- before Avendish and the
@@ -21,7 +26,7 @@ if(NOT Avendish_FOUND)
   FetchContent_Declare(
     Avendish
     GIT_REPOSITORY "https://github.com/celtera/avendish"
-    GIT_TAG ebbbdf81a3c69831c50231877814b63852f9881c)
+    GIT_TAG fa0b8836b46723a15d89e06426f225f2431574db)
   FetchContent_Populate(Avendish)
   list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
   find_package(Avendish REQUIRED)
