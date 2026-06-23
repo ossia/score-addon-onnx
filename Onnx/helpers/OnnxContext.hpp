@@ -8,8 +8,12 @@
 #include <Onnx/helpers/Utilities.hpp>
 #include <onnxruntime_session_options_config_keys.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -50,7 +54,7 @@ try
   auto p = Ort::GetAvailableProviders();
   for (std::string& s : p)
   {
-    qDebug() << "Available provider: " << s.c_str();
+    std::fprintf(stderr, "Available provider: %s\n", s.c_str());
     if (s.ends_with("ExecutionProvider"))
       s.resize(s.size() - strlen("ExecutionProvider"));
     for (char& c : s)
@@ -58,10 +62,18 @@ try
   }
 
   std::string requested_provider = opts.provider;
-  if (auto env = qEnvironmentVariable("SCORE_ONNX_FORCE_PROVIDER");
-      !env.isEmpty())
+  if (const char* env = std::getenv("SCORE_ONNX_FORCE_PROVIDER");
+      env && *env)
   {
-    requested_provider = env.trimmed().toLower().toStdString();
+    std::string e = env;
+    // trim
+    auto notspace = [](unsigned char c) { return !std::isspace(c); };
+    e.erase(e.begin(), std::find_if(e.begin(), e.end(), notspace));
+    e.erase(std::find_if(e.rbegin(), e.rend(), notspace).base(), e.end());
+    for (char& c : e)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (!e.empty())
+      requested_provider = e;
   }
   if (requested_provider == "default")
   {
@@ -199,12 +211,12 @@ try
 }
 catch (const std::exception& e)
 {
-  qDebug() << "Onnxruntime: falling back to CPU: " << e.what();
+  std::fprintf(stderr, "Onnxruntime: falling back to CPU: %s\n", e.what());
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
 }
 catch (...)
 {
-  qDebug() << "OnnxRuntime: falling back to CPU: unknown error";
+  std::fprintf(stderr, "OnnxRuntime: falling back to CPU: unknown error\n");
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
 }
 
@@ -351,7 +363,7 @@ public:
       // Per-frame failure (bad/odd output shape on a frame, ORT hiccup): log and
       // rethrow so the node's operator() catch skips this frame. NEVER exit() —
       // that would kill the whole host process on a single transient throw.
-      qDebug() << "ERROR running model inference: " << exception.what();
+      std::fprintf(stderr, "ERROR running model inference: %s\n", exception.what());
       throw;
     }
   }

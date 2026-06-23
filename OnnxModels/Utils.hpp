@@ -11,7 +11,7 @@
 #include <Onnx/helpers/OnnxBase.hpp>
 #endif
 
-#include <QDebug>
+#include <cstdio>
 
 namespace OnnxModels
 {
@@ -66,7 +66,7 @@ public:
   {
     if (!library)
     {
-      qDebug("Could not load libonnxruntime!");
+      std::fprintf(stderr, "Could not load libonnxruntime!\n");
       return;
     }
 
