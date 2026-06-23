@@ -1,7 +1,5 @@
 #include "GenerativeImageGAN.hpp"
 
-#include <QImage>
-
 #include <Onnx/helpers/GAN.hpp>
 
 #include <random>
@@ -199,7 +197,7 @@ std::function<void(GenerativeImageGAN&)> GenerativeImageGAN::worker::work(
 
   try
   {
-    QImage result;
+    Onnx::ImageData result;
 
     if (model_type == "stylegan" && stylegan_model && stylegan_model->isReady())
     {
@@ -210,21 +208,18 @@ std::function<void(GenerativeImageGAN&)> GenerativeImageGAN::worker::work(
       result = singlenet_model->generateFromLatent(latent_vector);
     }
 
-    if (!result.isNull())
+    if (!result.empty())
     {
-      // Convert QImage to RGBA format for ossia
-      QImage rgba_image = result.convertToFormat(QImage::Format_RGBA8888);
-      
-      // Return a function that will be executed in the main thread
-      return [rgba_image = std::move(rgba_image)](GenerativeImageGAN& node) mutable
+      // result is already RGBA8888 (tightly packed) -> hand it to the main thread
+      return [rgba_image = std::move(result)](GenerativeImageGAN& node) mutable
       {
         node.inferenceInProgress = false;
-        
-        node.outputs.image.create(rgba_image.width(), rgba_image.height());
+
+        node.outputs.image.create(rgba_image.width, rgba_image.height);
         memcpy(
             node.outputs.image.texture.bytes,
-            rgba_image.constBits(),
-            rgba_image.width() * rgba_image.height() * 4);
+            rgba_image.pixels.data(),
+            rgba_image.width * rgba_image.height * 4);
         node.outputs.image.texture.changed = true;
       };
     }
