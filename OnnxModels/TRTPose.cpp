@@ -1,11 +1,11 @@
 #include "TRTPose.hpp"
 
-#include <QDebug>
-
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <Onnx/helpers/Trt.hpp>
 #include <Onnx/helpers/Utilities.hpp>
+
+#include <cstdio>
 
 namespace OnnxModels::TRTPose
 {
@@ -53,52 +53,17 @@ try
       input_height = static_cast<int>(spec.inputs[0].shape[2]);
   }
 
-  // Create tensor manually to avoid problematic Qt scaling in nchw_tensorFromRGBA
-  auto& input_shape = spec.inputs[0].shape;
-  QImage img(
-      in_tex.bytes, in_tex.width, in_tex.height, QImage::Format_RGBA8888);
-
-  // Only scale if dimensions don't match, and use KeepAspectRatio (not ByExpanding)
-  if (in_tex.width != input_width || in_tex.height != input_height)
-  {
-    img = img.scaled(
-        input_width,
-        input_height,
-        Qt::AspectRatioMode::KeepAspectRatio,
-        Qt::SmoothTransformation);
-
-    // Center crop/pad if needed
-    if (img.width() != input_width || img.height() != input_height)
-    {
-      QImage centered(input_width, input_height, QImage::Format_RGBA8888);
-      centered.fill(QColor(0, 0, 0, 255));
-      QPainter painter(&centered);
-      int x_offset = (input_width - img.width()) / 2;
-      int y_offset = (input_height - img.height()) / 2;
-      painter.drawImage(x_offset, y_offset, img);
-      img = centered;
-    }
-  }
-
-  img = std::move(img).convertToFormat(QImage::Format_RGB888);
-
-  storage.resize(
-      3 * input_width * input_height, boost::container::default_init);
-
-  auto ptr = (unsigned char*)img.constBits();
-  auto dst = storage.data();
-  auto dst_r = dst;
-  auto dst_g = dst_r + input_width * input_height;
-  auto dst_b = dst_g + input_width * input_height;
-
-  Onnx::nhwc_to_nchw<float>(
+  // Build the input tensor with the shared Qt-free helper (bilinear fill+crop
+  // resize to the model resolution, RGBA->RGB pack, NCHW with ImageNet
+  // normalization). Replaces the former QImage scale/centre-pad path.
+  auto t = Onnx::nchw_tensorFromRGBA(
+      spec.inputs[0],
+      in_tex.bytes,
+      in_tex.width,
+      in_tex.height,
       input_width,
       input_height,
-      img.bytesPerLine(),
-      ptr,
-      dst_r,
-      dst_g,
-      dst_b,
+      storage,
       {0.485f * 255.0f,
        0.456f * 255.0f,
        0.406f * 255.0f}, // ImageNet mean scaled to [0,255]
@@ -106,18 +71,14 @@ try
       // ImageNet std scaled to [0,255]
   );
 
-  Onnx::FloatTensor t{
-      .storage = {},
-      .value = Onnx::vec_to_tensor<float>(storage, input_shape)};
-  t.storage = std::move(storage);
-
   Ort::Value input_tensors[1] = {std::move(t.value)};
 
   // TRT-Pose has 2 outputs: confidence maps [1,18,H,W] and PAF [1,42,H,W]
   if (spec.output_names_char.size() != 2)
   {
-    qDebug() << "ERROR: Model should have 2 outputs, has:"
-             << spec.output_names_char.size();
+    std::fprintf(
+        stderr, "ERROR: Model should have 2 outputs, has: %zu\n",
+        spec.output_names_char.size());
     return;
   }
 
@@ -229,91 +190,25 @@ try
     }
   }
 
-  // Create visualization with confidence map overlay
-  QImage base_image(
-      in_tex.bytes, in_tex.width, in_tex.height, QImage::Format_RGBA8888);
-
-#if 0
-  // Always show confidence map overlay for debugging
-  auto cmap_overlay = pose_processor.visualizeConfidenceMaps(
-      cmap_data,
-      output_height,
-      output_width,
-      in_tex.width,
-      in_tex.height,
-      max_confidence);
-
-  // Add PAF overlay for debugging
-  auto paf_overlay = pose_processor.visualizePAF(
-      paf_data,
-      output_height,
-      output_width,
-      in_tex.width,
-      in_tex.height,
-      8.0f,   // Scale factor for arrow spacing
-      0.05f   // Magnitude threshold
-  );
-
-  // Add peaks overlay for debugging raw peak detection
-  auto peaks_overlay = pose_processor.visualizePeaks(
-      debug_peaks,
+  // Add pose skeleton if persons detected. The pose overlay is an RGBA8888
+  // image (black background); composite it additively (Qt's CompositionMode_Plus)
+  // onto the input frame, then write the result to the output texture (opaque).
+  auto pose_overlay = pose_processor.visualizePoses(
+      detected_persons,
       in_tex.width,
       in_tex.height,
       output_width,
-      output_height
-  );
+      output_height);
 
-  // Add PAF scores overlay for debugging connections
-  auto paf_scores_overlay = pose_processor.visualizePAFScores(
-      debug_peaks,
-      debug_paf_scores,
-      in_tex.width,
-      in_tex.height,
-      output_width,
-      output_height,
-      config.paf_threshold * 0.5f  // Lower threshold to see more connections
-  );
-#endif
-
-  // Add pose skeleton if persons detected
-  // if (!detected_persons.empty())
-  {
-    auto pose_overlay = pose_processor.visualizePoses(
-        detected_persons,
-        in_tex.width,
-        in_tex.height,
-        output_width,
-        output_height);
-
-    // Composite all overlays: confidence map + PAF + peaks + PAF scores + pose skeleton
-    QPainter composer(&base_image);
-    composer.setRenderHint(QPainter::Antialiasing);
-#if 0
-    composer.setCompositionMode(QPainter::CompositionMode_Overlay);
-    composer.drawImage(0, 0, cmap_overlay);
-    composer.drawImage(0, 0, paf_overlay);
-    composer.setCompositionMode(
-        QPainter::
-            CompositionMode_SourceOver); // Use normal blending for peaks and scores
-    composer.drawImage(0, 0, peaks_overlay);
-    composer.drawImage(0, 0, paf_scores_overlay);
-#endif
-    composer.setCompositionMode(QPainter::CompositionMode_Plus);
-    composer.drawImage(0, 0, pose_overlay);
-  }
-  // else
-  // {
-  //   // Only show confidence map if no poses detected
-  //   vis_image = cmap_overlay;
-  // }
-
-  auto vb = base_image.constBits();
+  const unsigned char* base = reinterpret_cast<const unsigned char*>(in_tex.bytes);
+  const unsigned char* ov = pose_overlay.pixels.data();
   outputs.image.create(in_tex.width, in_tex.height);
-  for (int i = 0; i < in_tex.width * in_tex.height * 4; i += 4)
+  const int N = in_tex.width * in_tex.height * 4;
+  for (int i = 0; i < N; i += 4)
   {
-    outputs.image.texture.bytes[i + 0] = vb[i + 0];
-    outputs.image.texture.bytes[i + 1] = vb[i + 1];
-    outputs.image.texture.bytes[i + 2] = vb[i + 2];
+    for (int c = 0; c < 3; ++c)
+      outputs.image.texture.bytes[i + c]
+          = static_cast<unsigned char>(std::min(255, base[i + c] + ov[i + c]));
     outputs.image.texture.bytes[i + 3] = 255;
   }
   outputs.image.texture.changed = true;

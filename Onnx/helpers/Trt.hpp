@@ -1,9 +1,10 @@
 #pragma once
-#include <QDebug>
-#include <QImage>
-#include <QPainter>
+#include <Onnx/helpers/CoreTypes.hpp>
+#include <Onnx/helpers/CtxOverlay.hpp>
+#include <Onnx/helpers/ImageBuffer.hpp>
 
 #include <cmath>
+#include <cstdio>
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,32 @@
 
 namespace Onnx
 {
+
+// Alpha-blend a solid color rectangle into an RGBA8888 buffer (the Qt-free
+// equivalent of QPainter::fillRect with a possibly-translucent QColor). r,g,b,a
+// are 8-bit; the rectangle is clipped to the image bounds.
+inline void trt_fill_rect(
+    ImageData& img, int x, int y, int w, int h, int r, int g, int b, int a)
+{
+  const int x0 = std::clamp(x, 0, img.width);
+  const int y0 = std::clamp(y, 0, img.height);
+  const int x1 = std::clamp(x + w, 0, img.width);
+  const int y1 = std::clamp(y + h, 0, img.height);
+  const float af = std::clamp(a, 0, 255) / 255.f;
+  for (int yy = y0; yy < y1; ++yy)
+  {
+    for (int xx = x0; xx < x1; ++xx)
+    {
+      unsigned char* p
+          = img.pixels.data() + (static_cast<std::size_t>(yy) * img.width + xx) * 4;
+      p[0] = static_cast<unsigned char>(p[0] * (1.f - af) + r * af);
+      p[1] = static_cast<unsigned char>(p[1] * (1.f - af) + g * af);
+      p[2] = static_cast<unsigned char>(p[2] * (1.f - af) + b * af);
+      p[3] = static_cast<unsigned char>(
+          std::min(255.f, p[3] + a * af));
+    }
+  }
+}
 
 struct Peak
 {
@@ -111,14 +138,14 @@ public:
       int height = 128,
       int width = 128);
 
-  QImage visualizePoses(
+  ImageData visualizePoses(
       const std::vector<Person>& persons,
       int img_width,
       int img_height,
       int model_width = 128,
       int model_height = 128);
 
-  QImage visualizeConfidenceMaps(
+  ImageData visualizeConfidenceMaps(
       const float* cmap_data,
       int cmap_height,
       int cmap_width,
@@ -128,7 +155,7 @@ public:
       const std::vector<int>& parts_to_show = {} // Empty = show all parts
   );
 
-  QImage visualizePAF(
+  ImageData visualizePAF(
       const float* paf_data,
       int paf_height,
       int paf_width,
@@ -137,14 +164,14 @@ public:
       float scale_factor = 8.0f, // Skip pixels for arrow spacing
       float magnitude_threshold = 0.1f);
 
-  QImage visualizePeaks(
+  ImageData visualizePeaks(
       const std::vector<std::vector<Peak>>& peaks,
       int img_width,
       int img_height,
       int model_width = 128,
       int model_height = 128);
 
-  QImage visualizePAFScores(
+  ImageData visualizePAFScores(
       const std::vector<std::vector<Peak>>& peaks,
       const std::vector<std::vector<std::vector<float>>>& paf_scores,
       int img_width,
@@ -782,9 +809,10 @@ inline std::vector<std::vector<std::vector<float>>> TRT_pose::scorePAFSimple(
         // Debug logging - lower threshold for debugging
         if (link_idx < 5 && score > 0.001f)
         {
-          qDebug() << "Simple PAF score:" << score << "for link" << link_idx
-                   << "(" << peaks_a[i].x << "," << peaks_a[i].y << ") -> "
-                   << "(" << peaks_b[j].x << "," << peaks_b[j].y << ")";
+          std::fprintf(
+              stderr,
+              "Simple PAF score: %f for link %zu (%f,%f) -> (%f,%f)\n", score,
+              link_idx, peaks_a[i].x, peaks_a[i].y, peaks_b[j].x, peaks_b[j].y);
         }
       }
     }
@@ -1213,18 +1241,21 @@ inline std::vector<Person> TRT_pose::processOutput(
   return filtered_persons;
 }
 
-inline QImage TRT_pose::visualizePoses(
+inline ImageData TRT_pose::visualizePoses(
     const std::vector<Person>& persons,
     int img_width,
     int img_height,
     int model_width,
     int model_height)
 {
-  QImage vis_image(img_width, img_height, QImage::Format_RGBA8888);
-  vis_image.fill(Qt::black);
-
-  QPainter painter(&vis_image);
-  painter.setRenderHint(QPainter::Antialiasing);
+  // Opaque-black RGBA canvas.
+  ImageData vis_image;
+  vis_image.width = img_width;
+  vis_image.height = img_height;
+  vis_image.pixels.assign(
+      static_cast<std::size_t>(img_width) * img_height * 4, 0);
+  for (std::size_t i = 3; i < vis_image.pixels.size(); i += 4)
+    vis_image.pixels[i] = 255;
 
   // Draw skeleton connections (official TRT-Pose format)
   const std::vector<std::array<int, 2>> skeleton = {
@@ -1235,40 +1266,43 @@ inline QImage TRT_pose::visualizePoses(
       {17, 0},  {17, 5},  {17, 6},  {17, 11}, {17, 12}  // neck connections
   };
 
-  for (const auto& person : persons)
   {
-    // Draw connections
-    painter.setPen(QPen(Qt::green, 2));
-    for (const auto& connection : skeleton)
+    OnnxModels::Overlay ov(vis_image.pixels.data(), img_width, img_height);
+    for (const auto& person : persons)
     {
-      const auto& kp1 = person.keypoints[connection[0]];
-      const auto& kp2 = person.keypoints[connection[1]];
-
-      if (kp1.confidence > config_.confidence_threshold
-          && kp2.confidence > config_.confidence_threshold)
+      // Draw connections (green, width 2)
+      ov.color(Onnx::rgb8(0, 255, 0));
+      ov.lineWidth(2.f);
+      for (const auto& connection : skeleton)
       {
-        float x1 = kp1.x * img_width / model_width;
-        float y1 = kp1.y * img_height / model_height;
-        float x2 = kp2.x * img_width / model_width;
-        float y2 = kp2.y * img_height / model_height;
+        const auto& kp1 = person.keypoints[connection[0]];
+        const auto& kp2 = person.keypoints[connection[1]];
 
-        painter.drawLine(QPointF(x1, y1), QPointF(x2, y2));
+        if (kp1.confidence > config_.confidence_threshold
+            && kp2.confidence > config_.confidence_threshold)
+        {
+          float x1 = kp1.x * img_width / model_width;
+          float y1 = kp1.y * img_height / model_height;
+          float x2 = kp2.x * img_width / model_width;
+          float y2 = kp2.y * img_height / model_height;
+
+          ov.line(Onnx::Vec2{x1, y1}, Onnx::Vec2{x2, y2});
+        }
+      }
+
+      // Draw keypoints (red dots)
+      ov.color(Onnx::rgb8(255, 0, 0));
+      for (const auto& kp : person.keypoints)
+      {
+        if (kp.confidence > config_.confidence_threshold)
+        {
+          float x = kp.x * img_width / model_width;
+          float y = kp.y * img_height / model_height;
+          ov.fillCircle(Onnx::Vec2{x, y}, 3.f);
+        }
       }
     }
-
-    // Draw keypoints
-    painter.setPen(QPen(Qt::red, 1));
-    painter.setBrush(QBrush(Qt::red));
-    for (const auto& kp : person.keypoints)
-    {
-      if (kp.confidence > config_.confidence_threshold)
-      {
-        float x = kp.x * img_width / model_width;
-        float y = kp.y * img_height / model_height;
-        painter.drawEllipse(QPointF(x, y), 3, 3);
-      }
-    }
-  }
+  } // Overlay dtor rasterizes into vis_image.pixels
 
   return vis_image;
 }
@@ -1359,7 +1393,7 @@ TRT_pose::applyNMS(const std::vector<Person>& persons, float overlap_threshold)
   return filtered_persons;
 }
 
-inline QImage TRT_pose::visualizeConfidenceMaps(
+inline ImageData TRT_pose::visualizeConfidenceMaps(
     const float* cmap_data,
     int cmap_height,
     int cmap_width,
@@ -1368,37 +1402,36 @@ inline QImage TRT_pose::visualizeConfidenceMaps(
     float max_confidence,
     const std::vector<int>& parts_to_show)
 {
-
-  QImage overlay(img_width, img_height, QImage::Format_RGBA8888);
-  overlay.fill(QColor(0, 0, 0, 0)); // Transparent
-
-  QPainter painter(&overlay);
-  painter.setRenderHint(QPainter::Antialiasing);
+  // Transparent RGBA canvas (all-zero, alpha included).
+  ImageData overlay;
+  overlay.width = img_width;
+  overlay.height = img_height;
+  overlay.pixels.assign(static_cast<std::size_t>(img_width) * img_height * 4, 0);
 
   // Scale factors for mapping confidence map to image coordinates
   float scale_x = static_cast<float>(img_width) / cmap_width;
   float scale_y = static_cast<float>(img_height) / cmap_height;
 
-  // Define colors for different body parts
-  std::vector<QColor> part_colors = {
-      QColor(255, 0, 0),     // 0: nose - red
-      QColor(255, 128, 0),   // 1: left_eye - orange
-      QColor(255, 255, 0),   // 2: right_eye - yellow
-      QColor(128, 255, 0),   // 3: left_ear - lime
-      QColor(0, 255, 0),     // 4: right_ear - green
-      QColor(0, 255, 128),   // 5: left_shoulder - cyan-green
-      QColor(0, 255, 255),   // 6: right_shoulder - cyan
-      QColor(0, 128, 255),   // 7: left_elbow - light blue
-      QColor(0, 0, 255),     // 8: right_elbow - blue
-      QColor(128, 0, 255),   // 9: left_wrist - purple
-      QColor(255, 0, 255),   // 10: right_wrist - magenta
-      QColor(255, 0, 128),   // 11: left_hip - pink
-      QColor(255, 128, 128), // 12: right_hip - light pink
-      QColor(128, 255, 128), // 13: left_knee - light green
-      QColor(128, 128, 255), // 14: right_knee - light blue
-      QColor(64, 255, 64),   // 15: left_ankle - dark green
-      QColor(64, 64, 255),   // 16: right_ankle - dark blue
-      QColor(255, 255, 255)  // 17: neck - white
+  // Define colors for different body parts (8-bit RGB)
+  static constexpr unsigned char part_colors[18][3] = {
+      {255, 0, 0},     // 0: nose - red
+      {255, 128, 0},   // 1: left_eye - orange
+      {255, 255, 0},   // 2: right_eye - yellow
+      {128, 255, 0},   // 3: left_ear - lime
+      {0, 255, 0},     // 4: right_ear - green
+      {0, 255, 128},   // 5: left_shoulder - cyan-green
+      {0, 255, 255},   // 6: right_shoulder - cyan
+      {0, 128, 255},   // 7: left_elbow - light blue
+      {0, 0, 255},     // 8: right_elbow - blue
+      {128, 0, 255},   // 9: left_wrist - purple
+      {255, 0, 255},   // 10: right_wrist - magenta
+      {255, 0, 128},   // 11: left_hip - pink
+      {255, 128, 128}, // 12: right_hip - light pink
+      {128, 255, 128}, // 13: left_knee - light green
+      {128, 128, 255}, // 14: right_knee - light blue
+      {64, 255, 64},   // 15: left_ankle - dark green
+      {64, 64, 255},   // 16: right_ankle - dark blue
+      {255, 255, 255}  // 17: neck - white
   };
 
   // Determine which parts to visualize
@@ -1421,7 +1454,7 @@ inline QImage TRT_pose::visualizeConfidenceMaps(
       continue;
 
     const float* part_map = cmap_data + part * cmap_height * cmap_width;
-    QColor part_color = part_colors[part % part_colors.size()];
+    const unsigned char* pc = part_colors[part % 18];
 
     // Find threshold for this part (show top 10% of confidence values)
     float part_threshold = max_confidence * 0.1f;
@@ -1438,43 +1471,42 @@ inline QImage TRT_pose::visualizeConfidenceMaps(
           int alpha = static_cast<int>(128 * confidence / max_confidence);
           alpha = std::clamp(alpha, 0, 128);
 
-          QColor pixel_color = part_color;
-          pixel_color.setAlpha(alpha);
-
           // Map to image coordinates and draw
           int img_x = static_cast<int>(w * scale_x);
           int img_y = static_cast<int>(h * scale_y);
           int size_x = std::max(1, static_cast<int>(scale_x));
           int size_y = std::max(1, static_cast<int>(scale_y));
 
-          painter.fillRect(img_x, img_y, size_x, size_y, pixel_color);
+          trt_fill_rect(
+              overlay, img_x, img_y, size_x, size_y, pc[0], pc[1], pc[2],
+              alpha);
         }
       }
     }
   }
 
   // Add legend
-  painter.setPen(QPen(Qt::white, 2));
-  painter.setFont(QFont("Arial", 10));
   int legend_y = 10;
 
+  OnnxModels::Overlay ov(overlay.pixels.data(), img_width, img_height);
   for (size_t i = 0; i < parts_list.size(); i++)
   {
     int part = parts_list[i];
     if (part >= 0
         && part < static_cast<int>(TrtTopology::getKeypointNames().size()))
     {
-      QColor legend_color = part_colors[part % part_colors.size()];
-      legend_color.setAlpha(255);
+      const unsigned char* pc = part_colors[part % 18];
 
-      // Draw color square
-      painter.fillRect(10, legend_y, 15, 15, legend_color);
-      painter.drawRect(10, legend_y, 15, 15);
+      // Draw color square (opaque) + white outline
+      trt_fill_rect(overlay, 10, legend_y, 15, 15, pc[0], pc[1], pc[2], 255);
+      ov.color(Onnx::rgb8(255, 255, 255));
+      ov.lineWidth(2.f);
+      ov.strokeRect(Onnx::Rect{10.f, (float)legend_y, 15.f, 15.f});
 
       // Draw part name
-      QString part_name
-          = QString::fromStdString(TrtTopology::getKeypointNames()[part]);
-      painter.drawText(30, legend_y + 12, part_name);
+      ov.text(
+          10.f, Onnx::Vec2{30.f, (float)legend_y + 12.f},
+          TrtTopology::getKeypointNames()[part].c_str());
 
       legend_y += 20;
     }
@@ -1483,7 +1515,7 @@ inline QImage TRT_pose::visualizeConfidenceMaps(
   return overlay;
 }
 
-inline QImage TRT_pose::visualizePAF(
+inline ImageData TRT_pose::visualizePAF(
     const float* paf_data,
     int paf_height,
     int paf_width,
@@ -1492,41 +1524,45 @@ inline QImage TRT_pose::visualizePAF(
     float scale_factor,
     float magnitude_threshold)
 {
-
-  QImage paf_overlay(img_width, img_height, QImage::Format_RGBA8888);
-  paf_overlay.fill(QColor(0, 0, 0, 0)); // Transparent
-
-  QPainter painter(&paf_overlay);
-  painter.setRenderHint(QPainter::Antialiasing);
+  // Transparent RGBA canvas.
+  ImageData paf_overlay;
+  paf_overlay.width = img_width;
+  paf_overlay.height = img_height;
+  paf_overlay.pixels.assign(
+      static_cast<std::size_t>(img_width) * img_height * 4, 0);
 
   // Scale factors for mapping PAF coordinates to image coordinates
   float scale_x = static_cast<float>(img_width) / paf_width;
   float scale_y = static_cast<float>(img_height) / paf_height;
 
-  // Define colors for different PAF channels (21 limb connections)
-  std::vector<QColor> paf_colors = {
-      QColor(255, 0, 0, 128),     // 0-1: neck -> nose
-      QColor(255, 128, 0, 128),   // 2-3: nose -> left_eye
-      QColor(255, 255, 0, 128),   // 4-5: nose -> right_eye
-      QColor(128, 255, 0, 128),   // 6-7: left_eye -> left_ear
-      QColor(0, 255, 0, 128),     // 8-9: right_eye -> right_ear
-      QColor(0, 255, 128, 128),   // 10-11: neck -> left_shoulder
-      QColor(0, 255, 255, 128),   // 12-13: neck -> right_shoulder
-      QColor(0, 128, 255, 128),   // 14-15: left_shoulder -> left_elbow
-      QColor(0, 0, 255, 128),     // 16-17: left_elbow -> left_wrist
-      QColor(128, 0, 255, 128),   // 18-19: right_shoulder -> right_elbow
-      QColor(255, 0, 255, 128),   // 20-21: right_elbow -> right_wrist
-      QColor(255, 0, 128, 128),   // 22-23: neck -> left_hip
-      QColor(255, 128, 128, 128), // 24-25: neck -> right_hip
-      QColor(128, 255, 128, 128), // 26-27: left_hip -> left_knee
-      QColor(128, 128, 255, 128), // 28-29: left_knee -> left_ankle
-      QColor(64, 255, 64, 128),   // 30-31: right_hip -> right_knee
-      QColor(64, 64, 255, 128),   // 32-33: right_knee -> right_ankle
-      QColor(255, 255, 128, 128), // 34-35: left_shoulder -> right_shoulder
-      QColor(128, 255, 255, 128), // 36-37: left_hip -> right_hip
-      QColor(255, 128, 255, 128), // 38-39: left_shoulder -> left_hip
-      QColor(128, 128, 128, 128)  // 40-41: right_shoulder -> right_hip
+  // Define colors for different PAF channels (21 limb connections); rgba 8-bit
+  // (alpha 128 = semi-transparent).
+  static constexpr unsigned char paf_colors[21][4] = {
+      {255, 0, 0, 128},     // 0-1: neck -> nose
+      {255, 128, 0, 128},   // 2-3: nose -> left_eye
+      {255, 255, 0, 128},   // 4-5: nose -> right_eye
+      {128, 255, 0, 128},   // 6-7: left_eye -> left_ear
+      {0, 255, 0, 128},     // 8-9: right_eye -> right_ear
+      {0, 255, 128, 128},   // 10-11: neck -> left_shoulder
+      {0, 255, 255, 128},   // 12-13: neck -> right_shoulder
+      {0, 128, 255, 128},   // 14-15: left_shoulder -> left_elbow
+      {0, 0, 255, 128},     // 16-17: left_elbow -> left_wrist
+      {128, 0, 255, 128},   // 18-19: right_shoulder -> right_elbow
+      {255, 0, 255, 128},   // 20-21: right_elbow -> right_wrist
+      {255, 0, 128, 128},   // 22-23: neck -> left_hip
+      {255, 128, 128, 128}, // 24-25: neck -> right_hip
+      {128, 255, 128, 128}, // 26-27: left_hip -> left_knee
+      {128, 128, 255, 128}, // 28-29: left_knee -> left_ankle
+      {64, 255, 64, 128},   // 30-31: right_hip -> right_knee
+      {64, 64, 255, 128},   // 32-33: right_knee -> right_ankle
+      {255, 255, 128, 128}, // 34-35: left_shoulder -> right_shoulder
+      {128, 255, 255, 128}, // 36-37: left_hip -> right_hip
+      {255, 128, 255, 128}, // 38-39: left_shoulder -> left_hip
+      {128, 128, 128, 128}  // 40-41: right_shoulder -> right_hip
   };
+
+  OnnxModels::Overlay ov(paf_overlay.pixels.data(), img_width, img_height);
+  ov.lineWidth(1.f);
 
   // Draw PAF vectors as arrows
   int step = static_cast<int>(scale_factor);
@@ -1541,8 +1577,8 @@ inline QImage TRT_pose::visualizePAF(
     const float* paf_x = paf_data + x_channel * paf_height * paf_width;
     const float* paf_y = paf_data + y_channel * paf_height * paf_width;
 
-    QColor link_color = paf_colors[link_idx % paf_colors.size()];
-    painter.setPen(QPen(link_color, 1));
+    const unsigned char* lc = paf_colors[link_idx % 21];
+    ov.color(Onnx::rgb8(lc[0], lc[1], lc[2], lc[3] / 255.f));
 
     for (int h = 0; h < paf_height; h += step)
     {
@@ -1566,10 +1602,7 @@ inline QImage TRT_pose::visualizePAF(
           float end_y = img_y + vy * arrow_length;
 
           // Draw vector as line with arrowhead
-          QPointF start(img_x, img_y);
-          QPointF end(end_x, end_y);
-
-          painter.drawLine(start, end);
+          ov.line(Onnx::Vec2{img_x, img_y}, Onnx::Vec2{end_x, end_y});
 
           // Draw simple arrowhead
           if (arrow_length > 5.0f)
@@ -1577,15 +1610,16 @@ inline QImage TRT_pose::visualizePAF(
             float angle = std::atan2(vy, vx);
             float arrow_size = 3.0f;
 
-            QPointF arrow1(
-                end_x - arrow_size * std::cos(angle - M_PI / 6),
-                end_y - arrow_size * std::sin(angle - M_PI / 6));
-            QPointF arrow2(
-                end_x - arrow_size * std::cos(angle + M_PI / 6),
-                end_y - arrow_size * std::sin(angle + M_PI / 6));
+            Onnx::Vec2 endp{end_x, end_y};
+            Onnx::Vec2 arrow1{
+                static_cast<float>(end_x - arrow_size * std::cos(angle - M_PI / 6)),
+                static_cast<float>(end_y - arrow_size * std::sin(angle - M_PI / 6))};
+            Onnx::Vec2 arrow2{
+                static_cast<float>(end_x - arrow_size * std::cos(angle + M_PI / 6)),
+                static_cast<float>(end_y - arrow_size * std::sin(angle + M_PI / 6))};
 
-            painter.drawLine(end, arrow1);
-            painter.drawLine(end, arrow2);
+            ov.line(endp, arrow1);
+            ov.line(endp, arrow2);
           }
         }
       }
@@ -1595,40 +1629,43 @@ inline QImage TRT_pose::visualizePAF(
   return paf_overlay;
 }
 
-inline QImage TRT_pose::visualizePeaks(
+inline ImageData TRT_pose::visualizePeaks(
     const std::vector<std::vector<Peak>>& peaks,
     int img_width,
     int img_height,
     int model_width,
     int model_height)
 {
-  QImage peaks_overlay(img_width, img_height, QImage::Format_RGBA8888);
-  peaks_overlay.fill(QColor(0, 0, 0, 0)); // Transparent
-
-  QPainter painter(&peaks_overlay);
-  painter.setRenderHint(QPainter::Antialiasing);
+  // Transparent RGBA canvas.
+  ImageData peaks_overlay;
+  peaks_overlay.width = img_width;
+  peaks_overlay.height = img_height;
+  peaks_overlay.pixels.assign(
+      static_cast<std::size_t>(img_width) * img_height * 4, 0);
 
   // Define colors for different body parts (same as confidence map colors)
-  std::vector<QColor> part_colors = {
-      QColor(255, 0, 0),     // 0: nose - red
-      QColor(255, 128, 0),   // 1: left_eye - orange
-      QColor(255, 255, 0),   // 2: right_eye - yellow
-      QColor(128, 255, 0),   // 3: left_ear - lime
-      QColor(0, 255, 0),     // 4: right_ear - green
-      QColor(0, 255, 128),   // 5: left_shoulder - cyan-green
-      QColor(0, 255, 255),   // 6: right_shoulder - cyan
-      QColor(0, 128, 255),   // 7: left_elbow - light blue
-      QColor(0, 0, 255),     // 8: right_elbow - blue
-      QColor(128, 0, 255),   // 9: left_wrist - purple
-      QColor(255, 0, 255),   // 10: right_wrist - magenta
-      QColor(255, 0, 128),   // 11: left_hip - pink
-      QColor(255, 128, 128), // 12: right_hip - light pink
-      QColor(128, 255, 128), // 13: left_knee - light green
-      QColor(128, 128, 255), // 14: right_knee - light blue
-      QColor(64, 255, 64),   // 15: left_ankle - dark green
-      QColor(64, 64, 255),   // 16: right_ankle - dark blue
-      QColor(255, 255, 255)  // 17: neck - white
+  static constexpr unsigned char part_colors[18][3] = {
+      {255, 0, 0},     // 0: nose - red
+      {255, 128, 0},   // 1: left_eye - orange
+      {255, 255, 0},   // 2: right_eye - yellow
+      {128, 255, 0},   // 3: left_ear - lime
+      {0, 255, 0},     // 4: right_ear - green
+      {0, 255, 128},   // 5: left_shoulder - cyan-green
+      {0, 255, 255},   // 6: right_shoulder - cyan
+      {0, 128, 255},   // 7: left_elbow - light blue
+      {0, 0, 255},     // 8: right_elbow - blue
+      {128, 0, 255},   // 9: left_wrist - purple
+      {255, 0, 255},   // 10: right_wrist - magenta
+      {255, 0, 128},   // 11: left_hip - pink
+      {255, 128, 128}, // 12: right_hip - light pink
+      {128, 255, 128}, // 13: left_knee - light green
+      {128, 128, 255}, // 14: right_knee - light blue
+      {64, 255, 64},   // 15: left_ankle - dark green
+      {64, 64, 255},   // 16: right_ankle - dark blue
+      {255, 255, 255}  // 17: neck - white
   };
+
+  OnnxModels::Overlay ov(peaks_overlay.pixels.data(), img_width, img_height);
 
   // Draw detected peaks for each part
   for (int part = 0; part < 18; part++)
@@ -1637,7 +1674,7 @@ inline QImage TRT_pose::visualizePeaks(
     if (part_peaks.empty())
       continue;
 
-    QColor part_color = part_colors[part % part_colors.size()];
+    const unsigned char* pc = part_colors[part % 18];
 
     for (size_t i = 0; i < part_peaks.size(); i++)
     {
@@ -1651,38 +1688,36 @@ inline QImage TRT_pose::visualizePeaks(
       float radius = 3.0f + (peak.confidence * 5.0f); // 3-8 pixel radius
       radius = std::clamp(radius, 3.0f, 10.0f);
 
-      // Draw outer circle (white border for visibility)
-      painter.setPen(QPen(Qt::white, 2));
-      painter.setBrush(QBrush(part_color));
-      painter.drawEllipse(QPointF(img_x, img_y), radius, radius);
+      // Filled circle in the part color (the QPainter version also had a white
+      // 2px border, but the overlay only fills; keep the colored dot).
+      ov.color(Onnx::rgb8(pc[0], pc[1], pc[2]));
+      ov.fillCircle(Onnx::Vec2{img_x, img_y}, radius);
 
-      // Draw part number inside the circle for identification
-      painter.setPen(QPen(Qt::black, 1));
-      painter.setFont(QFont("Arial", 8, QFont::Bold));
-      painter.drawText(
-          QRectF(img_x - radius, img_y - radius, radius * 2, radius * 2),
-          Qt::AlignCenter,
-          QString::number(part));
+      // Draw part number near the circle for identification
+      char num[16];
+      std::snprintf(num, sizeof(num), "%d", part);
+      ov.color(Onnx::rgb8(0, 0, 0));
+      ov.text(8.f, Onnx::Vec2{img_x - radius * 0.5f, img_y + radius * 0.5f}, num);
 
       // Debug: show peak info for first few peaks
       if (i == 0 && (part == 0 || part == 17)) // nose or neck
       {
-        qDebug() << "Peak visualization: Part" << part << "at model coords ("
-                 << peak.x << "," << peak.y << ")"
-                 << "-> image coords (" << img_x << "," << img_y << ")"
-                 << "confidence:" << peak.confidence;
+        std::fprintf(
+            stderr,
+            "Peak visualization: Part %d at model coords (%f,%f) -> image "
+            "coords (%f,%f) confidence: %f\n",
+            part, peak.x, peak.y, img_x, img_y, peak.confidence);
       }
     }
   }
 
   // Add legend showing part numbers and colors
-  painter.setPen(QPen(Qt::white, 2));
-  painter.setFont(QFont("Arial", 10));
   int legend_x = img_width - 200;
   int legend_y = 10;
 
-  painter.fillRect(legend_x - 5, legend_y - 5, 190, 380, QColor(0, 0, 0, 128));
-  painter.drawText(legend_x, legend_y + 15, "Detected Peaks:");
+  trt_fill_rect(peaks_overlay, legend_x - 5, legend_y - 5, 190, 380, 0, 0, 0, 128);
+  ov.color(Onnx::rgb8(255, 255, 255));
+  ov.text(10.f, Onnx::Vec2{(float)legend_x, (float)legend_y + 15.f}, "Detected Peaks:");
 
   for (int part = 0; part < 18; part++)
   {
@@ -1690,32 +1725,27 @@ inline QImage TRT_pose::visualizePeaks(
     if (part_peaks.empty())
       continue;
 
-    QColor legend_color = part_colors[part % part_colors.size()];
+    const unsigned char* lc = part_colors[part % 18];
 
     int y_pos = legend_y + 30 + part * 20;
 
     // Draw color circle
-    painter.setPen(QPen(Qt::white, 1));
-    painter.setBrush(QBrush(legend_color));
-    painter.drawEllipse(legend_x, y_pos, 12, 12);
+    ov.color(Onnx::rgb8(lc[0], lc[1], lc[2]));
+    ov.fillCircle(Onnx::Vec2{(float)legend_x + 6.f, (float)y_pos + 6.f}, 6.f);
 
     // Draw part info
-    painter.setPen(QPen(Qt::white, 1));
-    QString part_name
-        = QString::fromStdString(TrtTopology::getKeypointNames()[part]);
-    painter.drawText(
-        legend_x + 20,
-        y_pos + 10,
-        QString("%1: %2 (%3)")
-            .arg(part)
-            .arg(part_name)
-            .arg(part_peaks.size()));
+    char line[128];
+    std::snprintf(
+        line, sizeof(line), "%d: %s (%zu)", part,
+        TrtTopology::getKeypointNames()[part].c_str(), part_peaks.size());
+    ov.color(Onnx::rgb8(255, 255, 255));
+    ov.text(10.f, Onnx::Vec2{(float)legend_x + 20.f, (float)y_pos + 10.f}, line);
   }
 
   return peaks_overlay;
 }
 
-inline QImage TRT_pose::visualizePAFScores(
+inline ImageData TRT_pose::visualizePAFScores(
     const std::vector<std::vector<Peak>>& peaks,
     const std::vector<std::vector<std::vector<float>>>& paf_scores,
     int img_width,
@@ -1724,42 +1754,44 @@ inline QImage TRT_pose::visualizePAFScores(
     int model_height,
     float score_threshold)
 {
-  QImage paf_scores_overlay(img_width, img_height, QImage::Format_RGBA8888);
-  paf_scores_overlay.fill(QColor(0, 0, 0, 0)); // Transparent
-
-  QPainter painter(&paf_scores_overlay);
-  painter.setRenderHint(QPainter::Antialiasing);
+  // Transparent RGBA canvas.
+  ImageData paf_scores_overlay;
+  paf_scores_overlay.width = img_width;
+  paf_scores_overlay.height = img_height;
+  paf_scores_overlay.pixels.assign(
+      static_cast<std::size_t>(img_width) * img_height * 4, 0);
 
   const auto& topology = TrtTopology::getCOCOTopology();
 
   // Define colors for different connections (similar to PAF visualization)
-  std::vector<QColor> connection_colors = {
-      QColor(255, 0, 0),     // 0: neck -> nose - red
-      QColor(255, 128, 0),   // 1: nose -> left_eye - orange
-      QColor(255, 255, 0),   // 2: nose -> right_eye - yellow
-      QColor(128, 255, 0),   // 3: left_eye -> left_ear - lime
-      QColor(0, 255, 0),     // 4: right_eye -> right_ear - green
-      QColor(0, 255, 128),   // 5: neck -> left_shoulder - cyan-green
-      QColor(0, 255, 255),   // 6: neck -> right_shoulder - cyan
-      QColor(0, 128, 255),   // 7: left_shoulder -> left_elbow - light blue
-      QColor(0, 0, 255),     // 8: left_elbow -> left_wrist - blue
-      QColor(128, 0, 255),   // 9: right_shoulder -> right_elbow - purple
-      QColor(255, 0, 255),   // 10: right_elbow -> right_wrist - magenta
-      QColor(255, 0, 128),   // 11: neck -> left_hip - pink
-      QColor(255, 128, 128), // 12: neck -> right_hip - light pink
-      QColor(128, 255, 128), // 13: left_hip -> left_knee - light green
-      QColor(128, 128, 255), // 14: left_knee -> left_ankle - light blue
-      QColor(64, 255, 64),   // 15: right_hip -> right_knee - dark green
-      QColor(64, 64, 255),   // 16: right_knee -> right_ankle - dark blue
-      QColor(
-          255, 255, 128), // 17: left_shoulder -> right_shoulder - yellow-white
-      QColor(128, 255, 255), // 18: left_hip -> right_hip - cyan-white
-      QColor(255, 128, 255), // 19: left_shoulder -> left_hip - magenta-white
-      QColor(128, 128, 128)  // 20: right_shoulder -> right_hip - gray
+  static constexpr unsigned char connection_colors[21][3] = {
+      {255, 0, 0},     // 0: neck -> nose - red
+      {255, 128, 0},   // 1: nose -> left_eye - orange
+      {255, 255, 0},   // 2: nose -> right_eye - yellow
+      {128, 255, 0},   // 3: left_eye -> left_ear - lime
+      {0, 255, 0},     // 4: right_eye -> right_ear - green
+      {0, 255, 128},   // 5: neck -> left_shoulder - cyan-green
+      {0, 255, 255},   // 6: neck -> right_shoulder - cyan
+      {0, 128, 255},   // 7: left_shoulder -> left_elbow - light blue
+      {0, 0, 255},     // 8: left_elbow -> left_wrist - blue
+      {128, 0, 255},   // 9: right_shoulder -> right_elbow - purple
+      {255, 0, 255},   // 10: right_elbow -> right_wrist - magenta
+      {255, 0, 128},   // 11: neck -> left_hip - pink
+      {255, 128, 128}, // 12: neck -> right_hip - light pink
+      {128, 255, 128}, // 13: left_hip -> left_knee - light green
+      {128, 128, 255}, // 14: left_knee -> left_ankle - light blue
+      {64, 255, 64},   // 15: right_hip -> right_knee - dark green
+      {64, 64, 255},   // 16: right_knee -> right_ankle - dark blue
+      {255, 255, 128}, // 17: left_shoulder -> right_shoulder - yellow-white
+      {128, 255, 255}, // 18: left_hip -> right_hip - cyan-white
+      {255, 128, 255}, // 19: left_shoulder -> left_hip - magenta-white
+      {128, 128, 128}  // 20: right_shoulder -> right_hip - gray
   };
 
   int total_connections = 0;
   int good_connections = 0;
+
+  OnnxModels::Overlay ov(paf_scores_overlay.pixels.data(), img_width, img_height);
 
   // Draw PAF score connections
   for (size_t link_idx = 0;
@@ -1777,7 +1809,7 @@ inline QImage TRT_pose::visualizePAFScores(
     if (scores.empty() || peaks_a.empty() || peaks_b.empty())
       continue;
 
-    QColor link_color = connection_colors[link_idx % connection_colors.size()];
+    const unsigned char* lc = connection_colors[link_idx % 21];
 
     // Find best score for this link to normalize visualization
     float max_score = 0.0f;
@@ -1814,11 +1846,9 @@ inline QImage TRT_pose::visualizePAFScores(
           int alpha
               = std::max(64, static_cast<int>(normalized_score * 255.0f));
 
-          QColor line_color = link_color;
-          line_color.setAlpha(alpha);
-
-          painter.setPen(QPen(line_color, line_width));
-          painter.drawLine(QPointF(x1, y1), QPointF(x2, y2));
+          ov.color(Onnx::rgb8(lc[0], lc[1], lc[2], alpha / 255.f));
+          ov.lineWidth(static_cast<float>(line_width));
+          ov.line(Onnx::Vec2{x1, y1}, Onnx::Vec2{x2, y2});
 
           // Draw score value for strong connections
           if (score > score_threshold * 2.0f)
@@ -1826,21 +1856,22 @@ inline QImage TRT_pose::visualizePAFScores(
             float mid_x = (x1 + x2) / 2.0f;
             float mid_y = (y1 + y2) / 2.0f;
 
-            painter.setPen(QPen(Qt::white, 1));
-            painter.setFont(QFont("Arial", 8));
-            painter.drawText(
-                QPointF(mid_x, mid_y), QString::number(score, 'f', 2));
+            char sc[16];
+            std::snprintf(sc, sizeof(sc), "%.2f", score);
+            ov.color(Onnx::rgb8(255, 255, 255));
+            ov.text(8.f, Onnx::Vec2{mid_x, mid_y}, sc);
           }
 
           // Debug logging for first few good connections
           if (good_connections <= 5
               && (part_a == 0 || part_a == 17 || part_b == 0 || part_b == 17))
           {
-            qDebug() << "PAF connection" << good_connections << ":"
-                     << "parts" << part_a << "->" << part_b << "peaks ("
-                     << peaks_a[i].x << "," << peaks_a[i].y << ") -> ("
-                     << peaks_b[j].x << "," << peaks_b[j].y << ")"
-                     << "score:" << score;
+            std::fprintf(
+                stderr,
+                "PAF connection %d: parts %d -> %d peaks (%f,%f) -> (%f,%f) "
+                "score: %f\n",
+                good_connections, part_a, part_b, peaks_a[i].x, peaks_a[i].y,
+                peaks_b[j].x, peaks_b[j].y, score);
           }
         }
       }
@@ -1848,36 +1879,31 @@ inline QImage TRT_pose::visualizePAFScores(
   }
 
   // Add legend showing connection statistics
-  painter.setPen(QPen(Qt::white, 2));
-  painter.setFont(QFont("Arial", 12, QFont::Bold));
-
   int legend_x = 10;
   int legend_y = img_height - 100;
 
-  painter.fillRect(legend_x - 5, legend_y - 5, 300, 90, QColor(0, 0, 0, 128));
-  painter.drawText(legend_x, legend_y + 15, "PAF Score Analysis:");
-  painter.drawText(
-      legend_x,
-      legend_y + 35,
-      QString("Total connections tested: %1").arg(total_connections));
-  painter.drawText(
-      legend_x,
-      legend_y + 55,
-      QString("Good connections (>%1): %2")
-          .arg(score_threshold)
-          .arg(good_connections));
-  painter.drawText(
-      legend_x,
-      legend_y + 75,
-      QString("Success rate: %1%")
-          .arg(
-              total_connections > 0
-                  ? (good_connections * 100 / total_connections)
-                  : 0));
+  trt_fill_rect(paf_scores_overlay, legend_x - 5, legend_y - 5, 300, 90, 0, 0, 0, 128);
+  ov.color(Onnx::rgb8(255, 255, 255));
+  ov.text(12.f, Onnx::Vec2{(float)legend_x, (float)legend_y + 15.f}, "PAF Score Analysis:");
+  {
+    char l[96];
+    std::snprintf(l, sizeof(l), "Total connections tested: %d", total_connections);
+    ov.text(12.f, Onnx::Vec2{(float)legend_x, (float)legend_y + 35.f}, l);
+    std::snprintf(
+        l, sizeof(l), "Good connections (>%g): %d", (double)score_threshold,
+        good_connections);
+    ov.text(12.f, Onnx::Vec2{(float)legend_x, (float)legend_y + 55.f}, l);
+    std::snprintf(
+        l, sizeof(l), "Success rate: %d%%",
+        total_connections > 0 ? (good_connections * 100 / total_connections) : 0);
+    ov.text(12.f, Onnx::Vec2{(float)legend_x, (float)legend_y + 75.f}, l);
+  }
 
-  qDebug() << "PAF Score Summary: Total connections:" << total_connections
-           << "Good connections:" << good_connections
-           << "Threshold:" << score_threshold;
+  std::fprintf(
+      stderr,
+      "PAF Score Summary: Total connections: %d Good connections: %d "
+      "Threshold: %f\n",
+      total_connections, good_connections, score_threshold);
 
   return paf_scores_overlay;
 }
@@ -1963,8 +1989,9 @@ inline void TRT_pose::debugPeakDetection(
     }
   }
 
-  qDebug() << "Part" << part_id << "true max:" << max_val
-           << "at model coords (" << max_w << "," << max_h << ")";
+  std::fprintf(
+      stderr, "Part %d true max: %f at model coords (%d,%d)\n", part_id,
+      max_val, max_w, max_h);
 
   // Show what peaks we actually detect
   std::vector<Peak> detected_peaks;
@@ -1984,13 +2011,15 @@ inline void TRT_pose::debugPeakDetection(
             {static_cast<float>(w), static_cast<float>(h), val, 0});
         if (detected_peaks.size() <= 3)
         { // Show first few
-          qDebug() << "  Detected peak:" << val << "at model coords (" << w
-                   << "," << h << ")";
+          std::fprintf(
+              stderr, "  Detected peak: %f at model coords (%d,%d)\n", val, w,
+              h);
         }
       }
     }
   }
-  qDebug() << "  Total detected peaks:" << detected_peaks.size();
+  std::fprintf(
+      stderr, "  Total detected peaks: %zu\n", detected_peaks.size());
 }
 
 } // namespace Onnx
