@@ -144,11 +144,21 @@ else()
   target_include_directories(score_addon_onnx_models PUBLIC "${eigen3onnx_SOURCE_DIR}")
 endif()
 
+# Explicit per-object back-ends (mirroring score-addon-cv). The image objects take
+# a texture input, which has no meaning in Pd -- avendish's Pd binding then fails to
+# compile ("fixed_texture_input has no member 'value'") -- so they target the
+# texture-capable back-ends only. The pure value/control objects (the RapidLib
+# regressor/classifier, the QwenLLM text model) keep Pd. `dump` (the SDK-free target
+# the portability smoke builds) and `ossia` are in both. Ignored in a score build.
+set(ONNX_TEXTURE_BACKENDS dump ossia max touchdesigner:TOP godot:TEXTURE python)        # texture I/O
+set(ONNX_DATA_BACKENDS    dump ossia pd max touchdesigner:CHOP_MESSAGE godot:NODE python) # value I/O
+
 avnd_addon_object(
   BASE score_addon_onnx_models
   C_NAME yolo_blob
   CLASS YOLO7BlobDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/YOLO-blob.hpp
     OnnxModels/YOLO-blob.cpp)
@@ -158,6 +168,7 @@ avnd_addon_object(
   C_NAME yolo_segmentation
   CLASS YOLO8Segmentation
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/YOLO-segmentation.hpp
     OnnxModels/YOLO-segmentation.cpp)
@@ -167,6 +178,7 @@ avnd_addon_object(
   C_NAME resnet
   CLASS ResnetDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/Resnet.hpp
     OnnxModels/Resnet.cpp)
@@ -176,6 +188,7 @@ avnd_addon_object(
   C_NAME enet
   CLASS EmotionNetDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/ENet.hpp
     OnnxModels/ENet.cpp)
@@ -185,6 +198,7 @@ avnd_addon_object(
   C_NAME yolo_pose
   CLASS PoseDetector
   NAMESPACE OnnxModels::Yolo
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/YOLO-pose.hpp
     OnnxModels/YOLO-pose.cpp)
@@ -194,6 +208,7 @@ avnd_addon_object(
   C_NAME blazepose
   CLASS BlazePoseDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/BlazePose.hpp
     OnnxModels/BlazePose.cpp)
@@ -203,6 +218,7 @@ avnd_addon_object(
   C_NAME trtpose
   CLASS TRTPoseDetector
   NAMESPACE OnnxModels::TRTPose
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/TRTPose.hpp
     OnnxModels/TRTPose.cpp)
@@ -212,6 +228,7 @@ avnd_addon_object(
   C_NAME pose_detector
   CLASS PoseDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/PoseDetector.hpp
     OnnxModels/PoseDetector_internal.hpp
@@ -226,6 +243,7 @@ avnd_addon_object(
   C_NAME depthanything2
   CLASS DepthAnythingV2
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/DepthAnything2.hpp
     OnnxModels/DepthAnything2.cpp)
@@ -235,6 +253,7 @@ avnd_addon_object(
   C_NAME regressor
   CLASS Regressor
   NAMESPACE RapidlibModels
+  BACKENDS ${ONNX_DATA_BACKENDS}
   SOURCES
     RapidlibModels/Regressor.hpp
     RapidlibModels/Regressor.cpp)
@@ -244,6 +263,7 @@ avnd_addon_object(
   C_NAME classifier
   CLASS Classifier
   NAMESPACE RapidlibModels
+  BACKENDS ${ONNX_DATA_BACKENDS}
   SOURCES
     RapidlibModels/Classifier.hpp
     RapidlibModels/Classifier.cpp)
@@ -259,6 +279,7 @@ avnd_addon_object(
   C_NAME fastvlm
   CLASS FastVLMNode
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/FastVLM.hpp
     OnnxModels/FastVLM.cpp
@@ -270,6 +291,7 @@ avnd_addon_object(
   C_NAME qwenllm
   CLASS QwenLLMNode
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_DATA_BACKENDS}
   SOURCES
     OnnxModels/QwenLLM.hpp
     OnnxModels/QwenLLM.cpp
@@ -282,6 +304,7 @@ avnd_addon_object(
   C_NAME generative_image_gan
   CLASS GenerativeImageGAN
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/GenerativeImageGAN.hpp
     OnnxModels/GenerativeImageGAN.cpp)
@@ -291,6 +314,7 @@ avnd_addon_object(
   C_NAME image_to_image_gan
   CLASS ImageToImageGAN
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/ImageToImageGAN.hpp
     OnnxModels/ImageToImageGAN.cpp)
