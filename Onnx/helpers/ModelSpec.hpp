@@ -1,8 +1,4 @@
 #pragma once
-#include <Process/Dataflow/PortType.hpp>
-
-#include <ossia/network/common/parameter_properties.hpp>
-
 #include <Onnx/helpers/TensorType.hpp>
 
 #include <string>
@@ -15,8 +11,6 @@ struct ModelSpec
   struct Port
   {
     std::string name;
-    Process::PortType port_type{};
-    ossia::val_type data_type{};
     std::vector<int64_t> shape;
     TensorElemType elem_type{TensorElemType::Float};
   };

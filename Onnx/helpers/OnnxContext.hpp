@@ -1,6 +1,4 @@
 #pragma once
-#include <ossia/detail/algorithms.hpp>
-
 #include <Onnx/helpers/Debug.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/Profile.hpp>
@@ -11,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <ranges>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +20,15 @@
 
 namespace Onnx
 {
+// Replaces ossia::contains (formerly ossia/detail/algorithms.hpp): a plain
+// "does this range contain this value" check, kept here so the helpers stay
+// free of any ossia/score include in a standalone build.
+template <typename Range, typename Value>
+inline bool contains(const Range& r, const Value& v)
+{
+  return std::ranges::find(r, v) != std::ranges::end(r);
+}
+
 struct Options
 {
   std::string provider = "default";
@@ -77,27 +85,27 @@ try
   }
   if (requested_provider == "default")
   {
-    if (ossia::contains(p, "cuda"))
+    if (contains(p, "cuda"))
       requested_provider = "cuda";
 #if defined(_WIN32)
-    else if (ossia::contains(p, "dml"))
+    else if (contains(p, "dml"))
       requested_provider = "dml";
 #endif
-    else if (ossia::contains(p, "rocm"))
+    else if (contains(p, "rocm"))
       requested_provider = "rocm";
-    else if (ossia::contains(p, "openvino"))
+    else if (contains(p, "openvino"))
       requested_provider = "openvino";
 #if defined(__APPLE__)
-    else if (ossia::contains(p, "coreml"))
+    else if (contains(p, "coreml"))
       requested_provider = "coreml";
 #endif
-    else if (ossia::contains(p, "webgpu"))
+    else if (contains(p, "webgpu"))
       requested_provider = "webgpu";
-    else if (ossia::contains(p, "cpu"))
+    else if (contains(p, "cpu"))
       requested_provider = "cpu";
   }
 
-  if (requested_provider == "cuda" && ossia::contains(p, "cuda"))
+  if (requested_provider == "cuda" && contains(p, "cuda"))
   {
     using namespace Ort;
 
@@ -127,7 +135,7 @@ try
     session_options.AppendExecutionProvider_CUDA_V2(*cuda_option_v2);
   }
 
-  if (requested_provider == "tensorrt" && ossia::contains(p, "tensorrt"))
+  if (requested_provider == "tensorrt" && contains(p, "tensorrt"))
   {
     using namespace Ort;
     const std::vector keys{
@@ -146,7 +154,7 @@ try
     // FIXME release options
   }
 
-  if (requested_provider == "rocm" && ossia::contains(p, "rocm"))
+  if (requested_provider == "rocm" && contains(p, "rocm"))
   {
     using namespace Ort;
     OrtROCMProviderOptions* options{};
@@ -156,7 +164,7 @@ try
     // FIXME release options
   }
 
-  if (requested_provider == "openvino" && ossia::contains(p, "openvino"))
+  if (requested_provider == "openvino" && contains(p, "openvino"))
   {
     using namespace Ort;
 
@@ -170,7 +178,7 @@ try
   }
 
 #if _WIN32
-  if (requested_provider == "dml" && ossia::contains(p, "dml"))
+  if (requested_provider == "dml" && contains(p, "dml"))
   {
     using namespace Ort;
 
@@ -180,7 +188,7 @@ try
 #endif
 
 #if __APPLE__
-  if (requested_provider == "coreml" && ossia::contains(p, "coreml"))
+  if (requested_provider == "coreml" && contains(p, "coreml"))
   {
     using namespace Ort;
 
@@ -195,7 +203,7 @@ try
   }
 #endif
 
-  if (requested_provider == "cpu" && ossia::contains(p, "cpu"))
+  if (requested_provider == "cpu" && contains(p, "cpu"))
   {
     int cpus = std::thread::hardware_concurrency();
     session_options.SetIntraOpNumThreads(std::max(cpus / 2, 1));
@@ -285,8 +293,6 @@ private:
 
       spec.inputs.push_back(
           {.name = name,
-           .port_type = {},
-           .data_type = {},
            .shape = input_tensor_type.GetShape(),
            .elem_type = fromOrtElementType(input_tensor_type.GetElementType())});
 
@@ -309,8 +315,6 @@ private:
 
       spec.outputs.push_back(
           {.name = name,
-           .port_type = {},
-           .data_type = {},
            .shape = output_tensor_type.GetShape(),
            .elem_type = fromOrtElementType(output_tensor_type.GetElementType())});
 
