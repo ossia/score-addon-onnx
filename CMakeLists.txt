@@ -88,6 +88,28 @@ endif()
 
 avnd_addon_init(NAME score_addon_onnx_models)
 
+# Eigen: PoseTracker.hpp (the pose_detector object) includes <Eigen/Dense>. A
+# score build provides it globally; standalone resolves it here (header-only).
+# Attached PUBLIC so it propagates through the base to the objects + back-ends.
+if(NOT TARGET Eigen3::Eigen)
+  find_package(Eigen3 QUIET)
+endif()
+if(TARGET Eigen3::Eigen)
+  target_link_libraries(score_addon_onnx_models PUBLIC Eigen3::Eigen)
+else()
+  include(FetchContent)
+  FetchContent_Declare(
+    Eigen3onnx
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG 3.4.0
+    GIT_SHALLOW TRUE)
+  FetchContent_GetProperties(Eigen3onnx)
+  if(NOT eigen3onnx_POPULATED)
+    FetchContent_Populate(Eigen3onnx)
+  endif()
+  target_include_directories(score_addon_onnx_models PUBLIC "${eigen3onnx_SOURCE_DIR}")
+endif()
+
 avnd_addon_object(
   BASE score_addon_onnx_models
   C_NAME yolo_blob
