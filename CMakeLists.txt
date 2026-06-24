@@ -90,7 +90,7 @@ avnd_addon_init(NAME score_addon_onnx_models)
 
 avnd_addon_object(
   BASE score_addon_onnx_models
-  C_NAME yolo-blob
+  C_NAME yolo_blob
   CLASS YOLO7BlobDetector
   NAMESPACE OnnxModels
   SOURCES
@@ -99,7 +99,7 @@ avnd_addon_object(
 
 avnd_addon_object(
   BASE score_addon_onnx_models
-  C_NAME yolo-segmentation
+  C_NAME yolo_segmentation
   CLASS YOLO8Segmentation
   NAMESPACE OnnxModels
   SOURCES
@@ -126,7 +126,7 @@ avnd_addon_object(
 
 avnd_addon_object(
   BASE score_addon_onnx_models
-  C_NAME yolo-pose
+  C_NAME yolo_pose
   CLASS PoseDetector
   NAMESPACE OnnxModels::Yolo
   SOURCES
@@ -153,7 +153,7 @@ avnd_addon_object(
 
 avnd_addon_object(
   BASE score_addon_onnx_models
-  C_NAME pose-detector
+  C_NAME pose_detector
   CLASS PoseDetector
   NAMESPACE OnnxModels
   SOURCES
@@ -223,7 +223,7 @@ endif()
 
 avnd_addon_object(
   BASE score_addon_onnx_models
-  C_NAME generative-image-gan
+  C_NAME generative_image_gan
   CLASS GenerativeImageGAN
   NAMESPACE OnnxModels
   SOURCES
@@ -232,7 +232,7 @@ avnd_addon_object(
 
 avnd_addon_object(
   BASE score_addon_onnx_models
-  C_NAME image-to-image-gan
+  C_NAME image_to_image_gan
   CLASS ImageToImageGAN
   NAMESPACE OnnxModels
   SOURCES
