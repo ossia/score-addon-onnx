@@ -19,6 +19,8 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+set(AVND_USES_EXCEPTIONS ON CACHE BOOL "" FORCE)
+
 # Use the Avendish the host (ossia score) provides; otherwise fetch it.
 find_package(Avendish QUIET)
 if(NOT Avendish_FOUND)
