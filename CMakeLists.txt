@@ -48,18 +48,18 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rapidlib.cmake")
 # standalone lanes. Default it ON so those two objects build everywhere the tokenizer
 # compiles; the rest of the addon (YOLO*, Pose*, Depth*, Resnet, ENet, GAN, rapidlib
 # regressor/classifier) only needs plain onnxruntime and is unaffected by this switch.
+#
+# Windows was previously force-disabled: the upstream extensions did not compile with
+# clang + libc++ (the ossia Windows toolchain), as base/file_sys.h built a std::ifstream
+# from a std::wstring -- an MSVC-STL-only overload (issue #985, now #1071). The submodule
+# now tracks the ossia fork carrying the one-line libc++ fix (filed upstream as
+# microsoft/onnxruntime-extensions#1084), so the Windows guard is gone and the tokenizer
+# objects build on every non-wasm back-end.
 option(SCORE_ONNX_ENABLE_EXTENSIONS
   "Build onnxruntime-extensions (tokenizers) and the LLM/VLM objects that need them"
   ON)
 
-# onnxruntime-extensions does not build on Windows here (issue #985); never enable it
-# there, in a score or a standalone build.
-if(WIN32)
-  set(SCORE_ONNX_ENABLE_EXTENSIONS 0)
-endif()
-
 if(SCORE_ONNX_ENABLE_EXTENSIONS)
-  # disabled due to https://github.com/microsoft/onnxruntime-extensions/issues/985
   set(ENABLE_TESTS 0)
   set(ENABLE_PYTHON 0)
   set(ENABLE_JAVA 0)
@@ -216,8 +216,8 @@ avnd_addon_object(
 
 # FastVLM and QwenLLM are the only objects that #include the onnxruntime-extensions
 # tokenizer headers (Onnx/helpers/TokenIO.hpp etc.), so they are built only when the
-# extensions subbuild above ran -- i.e. everywhere except Windows (issue #985), score
-# and standalone alike. The remaining objects compile against plain onnxruntime regardless.
+# extensions subbuild above ran -- now every non-wasm back-end, score and standalone
+# alike. The remaining objects compile against plain onnxruntime regardless.
 if(SCORE_ONNX_ENABLE_EXTENSIONS)
 avnd_addon_object(
   BASE score_addon_onnx_models
