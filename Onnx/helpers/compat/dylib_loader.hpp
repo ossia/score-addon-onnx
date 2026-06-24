@@ -109,7 +109,10 @@ inline std::string get_exe_folder()
 #elif defined(__APPLE__)
   char buf[16384];
   uint32_t size = sizeof(buf);
-  extern int _NSGetExecutablePath(char*, uint32_t*);
+  // extern "C": without it this declares ossia::_NSGetExecutablePath (C++ linkage,
+  // mangled) inside the enclosing namespace, which nothing defines -> "Undefined
+  // symbols for architecture arm64". C linkage binds it to the system function.
+  extern "C" int _NSGetExecutablePath(char*, uint32_t*);
   if(_NSGetExecutablePath(buf, &size) == 0)
     path = buf;
 #else
