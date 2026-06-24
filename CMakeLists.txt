@@ -250,6 +250,9 @@ target_sources(score_addon_onnx_models
     Onnx/helpers/ModelSpec.hpp
     Onnx/helpers/OnnxBase.hpp
     Onnx/helpers/OnnxContext.hpp
+    Onnx/helpers/compat/buffer_pool.hpp
+    Onnx/helpers/compat/dylib_loader.hpp
+    Onnx/helpers/compat/safe_math.hpp
     Onnx/helpers/Profile.hpp
     Onnx/helpers/SkeletonFormats.hpp
     Onnx/helpers/BlazeFace.hpp

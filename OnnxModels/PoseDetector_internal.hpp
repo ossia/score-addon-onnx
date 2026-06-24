@@ -9,7 +9,10 @@
 // Helpers used by a single file stay `static` in that file.
 #include "PoseDetector.hpp"
 
-#include <ossia/math/safe_math.hpp>
+// ossia::safe_isnan / safe_isinf come from a vendored, API-compatible copy
+// under Onnx/helpers/compat so this header carries no ossia/ include in either
+// build (the fast-math-safe bit-pattern checks are identical to ossia's).
+#include <Onnx/helpers/compat/safe_math.hpp>
 
 #include <Onnx/helpers/CtxOverlay.hpp>
 

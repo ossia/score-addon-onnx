@@ -15,7 +15,13 @@
 // allocates nothing. The cold path (empty pool -> make_unique) matches the
 // first-frame allocation profile we already have. release() happens on the
 // worker thread, after work() has moved the results out.
-#include <ossia/detail/buffer_pool.hpp>
+//
+// The pool type (ossia::object_pool) is provided by a vendored, API-compatible
+// copy under Onnx/helpers/compat so this header carries no ossia/ include; in a
+// score build the compat header transparently uses moodycamel's ConcurrentQueue
+// (same lock-free backing as the real ossia header), standalone falls back to a
+// mutex-guarded queue with the same semantics.
+#include <Onnx/helpers/compat/buffer_pool.hpp>
 
 #include <memory>
 

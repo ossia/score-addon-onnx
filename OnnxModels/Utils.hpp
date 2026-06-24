@@ -1,12 +1,13 @@
 #pragma once
 
-#include <ossia/detail/thread.hpp>
-
 #include <halp/file_port.hpp>
 #include <halp/meta.hpp>
 
 #if defined(ORT_API_MANUAL_INIT)
-#include <ossia/detail/dylib_loader.hpp>
+// ossia::dylib_loader / ossia::get_exe_folder come from a vendored,
+// API-compatible copy under Onnx/helpers/compat so this header carries no
+// ossia/ include in either build.
+#include <Onnx/helpers/compat/dylib_loader.hpp>
 
 #include <Onnx/helpers/OnnxBase.hpp>
 #endif
