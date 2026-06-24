@@ -17,3 +17,9 @@ add_library(rapidlib STATIC
 )
 target_include_directories(rapidlib PUBLIC 3rdparty/RapidLib/)
 target_compile_definitions(rapidlib PUBLIC RAPIDLIB_DISABLE_JSONCPP)
+# This static lib is linked into the per-object shared libraries (classifier /
+# regressor pull in modelSet / neuralNetwork / libsvm, whose vtable relocations
+# are not PIC). A score build sets CMAKE_POSITION_INDEPENDENT_CODE globally;
+# standalone does not, so the .so link fails with "recompile with -fPIC". Mirror
+# the other helper static libs (imageops, ctx_overlay) and force PIC here.
+set_target_properties(rapidlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
