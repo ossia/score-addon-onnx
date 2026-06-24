@@ -1,6 +1,5 @@
 #pragma once
-#include <ossia/detail/pod_vector.hpp>
-#include <ossia/detail/small_vector.hpp>
+#include <boost/container/small_vector.hpp>
 
 #include <OnnxModels/Utils.hpp>
 #include <cmath>
@@ -45,7 +44,7 @@ public:
     ModelPort<"Mapping model"> mapping_model;
     ModelPort<"Synthesis model"> synthesis_model;
 
-    halp::val_port<"Latent Vector", ossia::small_pod_vector<float, 16>>
+    halp::val_port<"Latent Vector", boost::container::small_vector<float, 16>>
         latent_dims;
 
     halp::hslider_f32<"Scale", halp::range{-10., 10., 1.}> scale;

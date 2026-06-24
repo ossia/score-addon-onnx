@@ -1,6 +1,13 @@
 #include "FastVLM.hpp"
 
-#include <ossia/detail/fmt.hpp>
+// fmt is header-only and available in both the score and standalone builds;
+// include it directly so this file stays free of any ossia/ include (it used to
+// pull ossia/detail/fmt.hpp, a thin wrapper over <fmt/format.h>).
+#if defined(check) // Thanks Unreal...
+#undef check
+#endif
+#include <fmt/format.h>
+#include <fmt/ostream.h>
 
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>

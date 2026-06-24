@@ -1,6 +1,5 @@
 #pragma once
-#include <ossia/detail/pod_vector.hpp>
-
+#include <boost/container/vector.hpp>
 #include <boost/dynamic_bitset.hpp>
 
 #include <Onnx/helpers/ModelSpec.hpp>
@@ -352,7 +351,7 @@ struct YOLO_pose
         // 1. Grab the pose indiceswith global confidence > minimum
         const float* data = outputTensor.front().GetTensorData<float>();
         const float* recog = data + 4 * 8400;
-        thread_local ossia::pod_vector<int> idx;
+        thread_local boost::container::vector<int> idx;
         idx.clear();
         idx.resize(8400, boost::container::default_init);
 
@@ -408,7 +407,7 @@ struct YOLO_pose
       else if (Nfloats == 300 * 57)
       { // YOLO 26 Implementation (1, 300, 57)
         const float* data = outputTensor.front().GetTensorData<float>();
-        thread_local ossia::pod_vector<int> idx;
+        thread_local boost::container::vector<int> idx;
         idx.clear();
         idx.resize(300, boost::container::default_init);
 
