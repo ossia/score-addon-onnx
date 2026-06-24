@@ -87,6 +87,16 @@ endif()
 
 avnd_addon_init(NAME score_addon_onnx_models)
 
+# C++ standard. Avendish sets cxx_std_23 on its per-object targets, but its
+# standalone base target (avnd_addon_init) gets none -- so it falls to the
+# compiler default (C++17 on the CI gcc-13/14 / Apple Clang lanes). The base
+# compiles the shared helper TUs (GAN.cpp -> Images.hpp/Utilities.hpp), which use
+# std::span, abbreviated-template auto params and range-for-with-init -- all C++20+
+# -- and failed with "'span' is not a member of 'std'" (<span> is empty pre-C++20).
+# Require it explicitly here, PUBLIC so the objects + back-ends stay consistent. A
+# score build is unaffected (it already builds at >= C++23).
+target_compile_features(score_addon_onnx_models PUBLIC cxx_std_23)
+
 # Boost.Container: the decoupled helpers (Images/OnnxBase/Yolo/...) store tensor
 # input in boost::container::vector for its default_init no-zero-fill resize.
 # Avendish already pulls Boost in via find_package, but only links Boost::boost
@@ -399,6 +409,9 @@ set(SCORE_ONNX_IMAGEOPS_SRC
     Onnx/helpers/TensorToTexture.cpp)
 add_library(score_onnx_imageops STATIC ${SCORE_ONNX_IMAGEOPS_SRC})
 target_include_directories(score_onnx_imageops PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# Own static lib, so it needs the C++ standard set independently of the base (same
+# C++20+ helper headers, same C++17-default trap on the CI lanes).
+target_compile_features(score_onnx_imageops PRIVATE cxx_std_23)
 set_target_properties(score_onnx_imageops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
   target_compile_options(score_onnx_imageops PRIVATE -O3)
