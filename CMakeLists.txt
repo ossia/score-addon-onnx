@@ -101,15 +101,26 @@ target_compile_features(score_addon_onnx_models PUBLIC cxx_std_23)
 
 # Boost.Container: the decoupled helpers (Images/OnnxBase/Yolo/...) store tensor
 # input in boost::container::vector for its default_init no-zero-fill resize.
-# Avendish already pulls Boost in via find_package, but only links Boost::boost
+# Avendish already pulls Boost in (find_dependency), but only links Boost::boost
 # onto its per-object targets; the base target compiles the shared helper TUs
 # (GAN.cpp -> Images.hpp -> <boost/container/vector.hpp>) directly, so it needs
 # Boost on its own include path. A score build supplies Boost globally; standalone
 # does not. PUBLIC so it reaches the objects + back-ends, mirroring Eigen below.
-if(NOT TARGET Boost::boost)
-  find_package(Boost REQUIRED)
+#
+# Do NOT call find_package(Boost) here: the standalone CI forces
+# Boost_NO_BOOST_CMAKE=ON, which routes find_package(Boost) through the removed
+# FindBoost module (CMP0167) and fails to locate Boost >= 1.89 even with BOOST_ROOT
+# set ("Could NOT find Boost: missing Boost_INCLUDE_DIR"). Reuse whatever Avendish /
+# the host already resolved instead.
+if(TARGET Boost::boost)
+  target_link_libraries(score_addon_onnx_models PUBLIC Boost::boost)
+elseif(TARGET Boost::headers)
+  target_link_libraries(score_addon_onnx_models PUBLIC Boost::headers)
+elseif(Boost_INCLUDE_DIRS)
+  target_include_directories(score_addon_onnx_models PUBLIC ${Boost_INCLUDE_DIRS})
+elseif(DEFINED BOOST_ROOT)
+  target_include_directories(score_addon_onnx_models PUBLIC "${BOOST_ROOT}/include")
 endif()
-target_link_libraries(score_addon_onnx_models PUBLIC Boost::boost)
 
 # Eigen: PoseTracker.hpp (the pose_detector object) includes <Eigen/Dense>. A
 # score build provides it globally; standalone resolves it here (header-only).
