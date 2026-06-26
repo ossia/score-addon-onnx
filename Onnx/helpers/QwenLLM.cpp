@@ -6,6 +6,7 @@
 #include <ext_status.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 
@@ -29,9 +30,21 @@ QwenLLMInference::QwenLLMInference(
   sessionOptions.AddConfigEntry("model.type", "decoder_only");
   sessionOptions.AddConfigEntry("model.architecture", "qwen");
 
-  // Load the model
+  // Load the model. ORT's path-based Session ctor takes const ORTCHAR_T*, which
+  // is wchar_t on Windows -- pass a const char* there and it fails to compile.
+  // Decode the UTF-8 byte path to a wstring on Windows (same as FastVLM.cpp).
+#if defined(_WIN32)
+  auto modelPath_str
+      = std::filesystem::path(
+            std::u8string(
+                reinterpret_cast<const char8_t*>(modelPath.data()),
+                modelPath.size()))
+            .wstring();
+#else
+  auto modelPath_str = modelPath;
+#endif
   modelSession = std::make_unique<Ort::Session>(
-      env, modelPath.data(), sessionOptions);
+      env, modelPath_str.data(), sessionOptions);
 
   if (tokenizerModelPath.ends_with("tokenizer.json"))
     tokenizerModelPath = tokenizerModelPath.substr(
