@@ -7,6 +7,15 @@
 // std::isnan / std::isinf are constant-folded to 0 under -ffast-math
 // (__FINITE_MATH_ONLY__), so these bit-pattern fallbacks keep working when the
 // pipeline is compiled fast-math. Keep API-compatible with ossia.
+//
+// When the real libossia header is reachable (a score build pulls it into the
+// same TU transitively), defer to it: defining our own ossia::safe_isnan /
+// safe_isinf alongside it is a redefinition (both are inline, same signature,
+// same namespace). Only supply the vendored copy when libossia is absent
+// (standalone back-ends, where ossia/ is not on the include path).
+#if __has_include(<ossia/math/safe_math.hpp>)
+#include <ossia/math/safe_math.hpp>
+#else
 #include <cmath>
 #include <cstdint>
 
@@ -64,3 +73,4 @@ inline bool safe_isinf(double val) noexcept
 }
 
 }
+#endif // __has_include(<ossia/math/safe_math.hpp>)
