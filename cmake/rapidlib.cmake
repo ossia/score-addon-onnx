@@ -17,6 +17,13 @@ add_library(rapidlib STATIC
 )
 target_include_directories(rapidlib PUBLIC 3rdparty/RapidLib/)
 target_compile_definitions(rapidlib PUBLIC RAPIDLIB_DISABLE_JSONCPP)
+# RapidLib's sources use range-based for with an initializer (C++20). A score
+# build sets the C++ standard globally so this compiles; a standalone avnd-addon
+# build has no such parent, so MSVC falls to its /std:c++17 default and hard-errors
+# (C7585: "range-based for statement with an initializer requires at least
+# '/std:c++20'"). gcc/clang accept it as an extension, so only the Windows/MSVC
+# standalone lanes failed. Require it on the target; own static lib, own standard.
+target_compile_features(rapidlib PUBLIC cxx_std_20)
 # This static lib is linked into the per-object shared libraries (classifier /
 # regressor pull in modelSet / neuralNetwork / libsvm, whose vtable relocations
 # are not PIC). A score build sets CMAKE_POSITION_INDEPENDENT_CODE globally;
