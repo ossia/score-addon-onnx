@@ -9,6 +9,12 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+// Declares _NSGetExecutablePath with C linkage. Declaring it ourselves needs a
+// linkage-specification (extern "C"), which is only legal at namespace scope --
+// not inside the get_exe_folder() body -- so use the system header instead.
+#include <mach-o/dyld.h>
+#endif
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -109,10 +115,6 @@ inline std::string get_exe_folder()
 #elif defined(__APPLE__)
   char buf[16384];
   uint32_t size = sizeof(buf);
-  // extern "C": without it this declares ossia::_NSGetExecutablePath (C++ linkage,
-  // mangled) inside the enclosing namespace, which nothing defines -> "Undefined
-  // symbols for architecture arm64". C linkage binds it to the system function.
-  extern "C" int _NSGetExecutablePath(char*, uint32_t*);
   if(_NSGetExecutablePath(buf, &size) == 0)
     path = buf;
 #else
