@@ -4818,7 +4818,16 @@ void        ctx_string_append_float   (CtxString *string, float val);
 /* glyph index: 
  !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghi
   jklmnopqrstuvwxyz{|}~  */
+// MSVC has no __attribute__((packed)); it reads __attribute__ as a struct tag
+// and errors ("'packed' uses undefined struct '__attribute__'"). The font table
+// is parsed as a raw byte blob (ctx_load_font_ctx, sizeof ctx_font_ascii), so
+// the 9-byte record layout is load-bearing -- restore it with #pragma pack.
+#if defined(_MSC_VER)
+#pragma pack(push,1)
+static const struct {uint8_t code; uint32_t a; uint32_t b;}
+#else
 static const struct __attribute__ ((packed)) {uint8_t code; uint32_t a; uint32_t b;}
+#endif
 ctx_font_ascii[]={
 {15, 0x00000000, 0x000009b7},/* length:2487 CTX_SUBDIV:8 CTX_BAKE_FONT_SIZE:160 */
 {'(', 0x00000010, 0x00000002},/* Roboto Regular*/
@@ -7309,6 +7318,9 @@ ctx_font_ascii[]={
 {'8', 0x3446292f, 0x0a300a16},
 {'8', 0xdc4d0030, 0xa11ddc1d},
 };
+#if defined(_MSC_VER)
+#pragma pack(pop)
+#endif
 #define ctx_font_ascii_name "Roboto Regular"
 #endif
 #endif //_CTX_INTERNAL_FONT_

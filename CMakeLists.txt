@@ -391,6 +391,17 @@ if(WIN32 AND NOT MINGW)
     ${CMAKE_CURRENT_SOURCE_DIR}/Onnx/helpers/msvc-compat)
   # MSVC's <math.h> only defines M_PI etc. when this is set before it is included.
   target_compile_definitions(score_onnx_ctx_overlay PRIVATE _USE_MATH_DEFINES)
+  # Two ctx.h GCC-isms MSVC can't parse are behind #ifndef-guarded config knobs,
+  # so force the portable branches instead of patching the vendored header:
+  #   CTX_FORCE_INLINES (default 1) -> CTX_INLINE = inline __attribute__((always_inline))
+  #   SQUOZE_USE_BUILTIN_CLZ (default 1) -> __builtin_clz()
+  # =0 picks plain `inline` and the manual bit-scan loop. MSVC still inlines at
+  # /O2, and the clz fallback is only on the cold squoze text path -- no rasterizer
+  # perf impact. (CTX_BRANCH_HINTS already defaults to 0, so __builtin_expect is
+  # not compiled; the cpuid asm is behind CTX_X86_64, which is never defined.)
+  target_compile_definitions(score_onnx_ctx_overlay PRIVATE
+    CTX_FORCE_INLINES=0
+    SQUOZE_USE_BUILTIN_CLZ=0)
 endif()
 set_target_properties(score_onnx_ctx_overlay PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
