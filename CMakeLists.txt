@@ -402,6 +402,10 @@ if(WIN32 AND NOT MINGW)
   target_compile_definitions(score_onnx_ctx_overlay PRIVATE
     CTX_FORCE_INLINES=0
     SQUOZE_USE_BUILTIN_CLZ=0)
+  # ctx.h uses GCC's __restrict__ spelling (24 sites, the rasterizer composite
+  # hot path); MSVC spells it __restrict. Map one to the other so the qualifier
+  # (and its alias-optimization hint) survives rather than dropping it.
+  target_compile_definitions(score_onnx_ctx_overlay PRIVATE __restrict__=__restrict)
 endif()
 set_target_properties(score_onnx_ctx_overlay PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
