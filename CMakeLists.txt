@@ -19,14 +19,19 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# <windows.h> (pulled in by onnxruntime, ctx.h and our dylib_loader) defines
-# min() and max() as macros, which mangles every std::min / std::max /
-# std::numeric_limits<T>::max() in the onnx C++ objects ("C2589: '(' illegal
-# token on right side of '::'"). A score build sets this globally; a standalone
-# avnd-addon build does not. Define it for the whole addon, before any target,
-# so every object and helper TU sees it. (No effect off Windows.)
+# Windows-wide preprocessor defines for the whole addon, before any target, so
+# every object and helper TU is covered (a score build sets these globally; a
+# standalone avnd-addon build does not). No effect off Windows.
+#  - NOMINMAX: <windows.h> (pulled in by onnxruntime, ctx.h and our dylib_loader)
+#    otherwise defines min()/max() as macros, mangling every std::min / std::max /
+#    std::numeric_limits<T>::max() in the onnx C++ objects ("C2589: '(' illegal
+#    token on right side of '::'").
+#  - _USE_MATH_DEFINES: MSVC's <cmath>/<math.h> only define M_PI etc. when this is
+#    set before they are included; ROI.hpp / Trt.hpp / PoseDetector_tracking.cpp
+#    use M_PI ("C2065: 'M_PI': undeclared identifier"). (ctx_overlay sets it on its
+#    own C target too; this covers the C++ objects.)
 if(WIN32)
-  add_compile_definitions(NOMINMAX)
+  add_compile_definitions(NOMINMAX _USE_MATH_DEFINES)
 endif()
 
 set(AVND_USES_EXCEPTIONS ON CACHE BOOL "" FORCE)
