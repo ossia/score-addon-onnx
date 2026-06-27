@@ -25042,7 +25042,7 @@ ctx_rasterizer_fill (CtxRasterizer *rasterizer)
   int blit_width = rasterizer->blit_width;
   int blit_height = rasterizer->blit_height;
 
-  CtxSegment temp[preserved_count]; /* copy of already built up path's poly line
+  CTX_SCRATCH(CtxSegment, temp, preserved_count); /* copy of already built up path's poly line
                                        XXX - by building a large enough path
                                        the stack can be smashed!
                                      */
@@ -25634,8 +25634,8 @@ ctx_rasterizer_stroke (CtxRasterizer *rasterizer)
   }
 #endif
 
-  CtxSegment temp[count]; /* copy of already built up path's poly line  */
-  memcpy (temp, rasterizer->edge_list.entries, sizeof (temp) );
+  CTX_SCRATCH_SZ(CtxSegment, temp, count); /* copy of already built up path's poly line  */
+  memcpy (temp, rasterizer->edge_list.entries, CTX_SCRATCH_BYTES(temp) );
 #if CTX_FAST_FILL_RECT
 #if CTX_FAST_STROKE_RECT
   if (rasterizer->edge_list.count == 5)
@@ -25878,7 +25878,7 @@ foo:
 #endif
   if (preserved)
     {
-      memcpy (rasterizer->edge_list.entries, temp, sizeof (temp) );
+      memcpy (rasterizer->edge_list.entries, temp, CTX_SCRATCH_BYTES(temp) );
       rasterizer->edge_list.count = count;
       rasterizer->preserve = 0;
     }
@@ -26217,20 +26217,20 @@ static void
 _ctx_rasterizer_clip (CtxRasterizer *rasterizer)
 {
   int count = rasterizer->edge_list.count;
-  CtxSegment temp[count+1]; /* copy of already built up path's poly line  */
+  CTX_SCRATCH_SZ(CtxSegment, temp, count+1); /* copy of already built up path's poly line  */
   rasterizer->state->has_clipped=1;
   rasterizer->state->gstate.clipped=1;
   //if (rasterizer->preserve)
-    { memcpy (temp + 1, rasterizer->edge_list.entries, sizeof (temp) - sizeof (temp[0]));
+    { memcpy (temp + 1, rasterizer->edge_list.entries, CTX_SCRATCH_BYTES(temp) - sizeof (temp[0]));
       temp[0].code = CTX_NOP;
       temp[0].u32[0] = count;
-      ctx_state_set_blob (rasterizer->state, SQZ_clip, (char*)temp, sizeof(temp));
+      ctx_state_set_blob (rasterizer->state, SQZ_clip, (char*)temp, CTX_SCRATCH_BYTES(temp));
     }
   ctx_rasterizer_clip_apply (rasterizer, temp);
   _ctx_rasterizer_reset (rasterizer);
   if (rasterizer->preserve)
     {
-      memcpy (rasterizer->edge_list.entries, temp + 1, sizeof (temp) - sizeof(temp[0]));
+      memcpy (rasterizer->edge_list.entries, temp + 1, CTX_SCRATCH_BYTES(temp) - sizeof(temp[0]));
       rasterizer->edge_list.count = count;
       rasterizer->preserve = 0;
     }
@@ -26865,8 +26865,8 @@ ctx_rasterizer_process (Ctx *ctx, const CtxCommand *c)
           float *dashes = state->gstate.dashes;
           float factor = ctx_matrix_get_scale (&state->gstate.transform);
 
-          CtxSegment temp[count]; /* copy of already built up path's poly line  */
-          memcpy (temp, rasterizer->edge_list.entries, sizeof (temp));
+          CTX_SCRATCH_SZ(CtxSegment, temp, count); /* copy of already built up path's poly line  */
+          memcpy (temp, rasterizer->edge_list.entries, CTX_SCRATCH_BYTES(temp));
           int start = 0;
           int end   = 0;
       CtxMatrix transform_backup = state->gstate.transform;
@@ -44198,8 +44198,8 @@ static int ctx_kb_raw_open (int skip)
           int got_a = 0;
           int got_z = 0;
           size_t nchar = KEY_MAX/8+1;
-          unsigned char bits[nchar];
-          if (ioctl (fd, EVIOCGBIT(EV_KEY, sizeof (bits)), &bits)>=0)
+          unsigned CTX_SCRATCH_SZ(char, bits, nchar);
+          if (ioctl (fd, EVIOCGBIT(EV_KEY, CTX_SCRATCH_BYTES(bits)), &bits)>=0)
           {
             got_a = bits[KEY_A/8] & (1 << (KEY_A & 7));
             got_z = bits[KEY_Z/8] & (1 << (KEY_Z & 7));
@@ -44429,11 +44429,11 @@ static int ctx_linux_ts_open (void)
     fd = open(path, O_RDONLY | O_CLOEXEC );
     unsigned long evbits = 0;
     size_t nabs  = ABS_MAX/8+1;
-    unsigned char absbits[nabs];
+    unsigned CTX_SCRATCH_SZ(char, absbits, nabs);
     unsigned long propbits = 0;
     if (fd != -1)
     {
-      if (ioctl (fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), &absbits) != -1)
+      if (ioctl (fd, EVIOCGBIT(EV_ABS, CTX_SCRATCH_BYTES(absbits)), &absbits) != -1)
       if (ioctl (fd, EVIOCGPROP(sizeof (unsigned long)), &propbits) != -1)
       if (ioctl (fd, EVIOCGBIT(0, sizeof (unsigned long)), &evbits) != -1)
       {
@@ -44441,9 +44441,9 @@ static int ctx_linux_ts_open (void)
         {
           int touch = 0;
           size_t nchar = KEY_MAX/8+1;
-          unsigned char bits[nchar];
+          unsigned CTX_SCRATCH_SZ(char, bits, nchar);
 #define CHECK_BIT(bits,bitno)   bits[(bitno)/8] & (1 << ((bitno) & 7));
-          if (ioctl (fd, EVIOCGBIT(EV_KEY, sizeof (bits)), &bits)>=0)
+          if (ioctl (fd, EVIOCGBIT(EV_KEY, CTX_SCRATCH_BYTES(bits)), &bits)>=0)
             touch = CHECK_BIT(bits, BTN_TOUCH);
           int pointer = propbits & (1<<INPUT_PROP_POINTER);
           int x_axis         = CHECK_BIT(absbits, ABS_X);
@@ -44493,11 +44493,11 @@ static int ctx_linux_tpad_open (void)
     fd = open(path, O_RDONLY | O_CLOEXEC );
     unsigned long evbits = 0;
     size_t nabs  = ABS_MAX/8+1;
-    unsigned char absbits[nabs];
+    unsigned CTX_SCRATCH_SZ(char, absbits, nabs);
     unsigned long propbits = 0;
     if (fd != -1)
     {
-      if (ioctl (fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), &absbits) != -1)
+      if (ioctl (fd, EVIOCGBIT(EV_ABS, CTX_SCRATCH_BYTES(absbits)), &absbits) != -1)
       if (ioctl (fd, EVIOCGPROP(sizeof (unsigned long)), &propbits) != -1)
       if (ioctl (fd, EVIOCGBIT(0, sizeof (unsigned long)), &evbits) != -1)
       {
@@ -44505,9 +44505,9 @@ static int ctx_linux_tpad_open (void)
         {
           int touch = 0;
           size_t nchar = KEY_MAX/8+1;
-          unsigned char bits[nchar];
+          unsigned CTX_SCRATCH_SZ(char, bits, nchar);
 #define CHECK_BIT(bits,bitno)   bits[(bitno)/8] & (1 << ((bitno) & 7));
-          if (ioctl (fd, EVIOCGBIT(EV_KEY, sizeof (bits)), &bits)>=0)
+          if (ioctl (fd, EVIOCGBIT(EV_KEY, CTX_SCRATCH_BYTES(bits)), &bits)>=0)
             touch = CHECK_BIT(bits, BTN_TOUCH);
           int pointer = propbits & (1<<INPUT_PROP_POINTER);
           //int x_axis         = CHECK_BIT(absbits, ABS_X);
@@ -55427,7 +55427,7 @@ static int _ctx_resolve_font (const char *name)
   }
 #endif
 
-  char temp[ctx_strlen (name)+8];
+  CTX_SCRATCH_SZ(char, temp, ctx_strlen (name)+8);
   /* first we look for exact */
   for (int i = 0; ret < 0 && i < ctx_font_count; i ++)
     {
@@ -55446,22 +55446,22 @@ static int _ctx_resolve_font (const char *name)
   /* then we normalize some names */
   if (!strncmp (name, "Helvetica", 9))
   {
-     memset(temp,0,sizeof(temp));
-     strncpy (temp, name + 4, sizeof(temp)-1);
+     memset(temp,0,CTX_SCRATCH_BYTES(temp));
+     strncpy (temp, name + 4, CTX_SCRATCH_BYTES(temp)-1);
      memcpy (temp, "Arrrr", 5);  // this matches Arial and Arimo
      name = temp;
   }
   else if (!strncmp (name, "Monospace", 9))
   {
-     memset(temp,0,sizeof(temp));
-     strncpy (temp, name + 2, sizeof(temp)-1);
+     memset(temp,0,CTX_SCRATCH_BYTES(temp));
+     strncpy (temp, name + 2, CTX_SCRATCH_BYTES(temp)-1);
      memcpy (temp, "Courier", 7); 
      name = temp;
   }
   else if (!strncmp (name, "Mono ", 5))
   {
-    memset(temp,0,sizeof(temp));
-    strncpy (temp+ 3, name, sizeof(temp)-1-3);
+    memset(temp,0,CTX_SCRATCH_BYTES(temp));
+    strncpy (temp+ 3, name, CTX_SCRATCH_BYTES(temp)-1-3);
     memcpy (temp, "Courier ", 8); 
     name = temp;
   }
