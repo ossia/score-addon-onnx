@@ -46,7 +46,7 @@ if(NOT Avendish_FOUND)
     # feature/addon-packaging: adds avnd_addon_package + avnd_create_{touchdesigner,
     # godot}_package used below to bundle libonnxruntime into the standalone packages.
     # Revert to a main commit once the branch is merged.
-    GIT_TAG 6e1fd278e38c104884c7ff5e13d8061ff5bb3d87)
+    GIT_TAG 6660f3d25924c304e8bf42cae76ab766d23f7dda)
   FetchContent_Populate(Avendish)
   list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
   find_package(Avendish REQUIRED)
