@@ -43,9 +43,9 @@ if(NOT Avendish_FOUND)
   FetchContent_Declare(
     Avendish
     GIT_REPOSITORY "https://github.com/celtera/avendish"
-    # feature/addon-packaging: adds avnd_addon_package + avnd_create_{touchdesigner,
-    # godot}_package used below to bundle libonnxruntime into the standalone packages.
-    # Revert to a main commit once the branch is merged.
+    # avendish master: provides avnd_addon_package + avnd_create_{max_addon,
+    # touchdesigner,godot}_package used below to bundle libonnxruntime into the
+    # standalone packages.
     GIT_TAG 6660f3d25924c304e8bf42cae76ab766d23f7dda)
   FetchContent_Populate(Avendish)
   list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
