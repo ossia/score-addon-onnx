@@ -21,7 +21,9 @@ jobs:
   # godot. wasm omitted: links onnxruntime, which ships prebuilt for desktop
   # only.
   standalone:
-    uses: ossia/actions/.github/workflows/avnd-addon.yml@master
+    # TEMP (packaging-validate): feature workflow that zips the CMake-assembled,
+    # onnxruntime-bundled package. Revert to @master once the passthrough merges.
+    uses: ossia/actions/.github/workflows/avnd-addon.yml@feature/cmake-package-passthrough
     secrets: inherit
     with:
       pd: true
