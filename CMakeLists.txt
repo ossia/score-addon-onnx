@@ -19,6 +19,16 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# <windows.h> (pulled in by onnxruntime, ctx.h and our dylib_loader) defines
+# min() and max() as macros, which mangles every std::min / std::max /
+# std::numeric_limits<T>::max() in the onnx C++ objects ("C2589: '(' illegal
+# token on right side of '::'"). A score build sets this globally; a standalone
+# avnd-addon build does not. Define it for the whole addon, before any target,
+# so every object and helper TU sees it. (No effect off Windows.)
+if(WIN32)
+  add_compile_definitions(NOMINMAX)
+endif()
+
 set(AVND_USES_EXCEPTIONS ON CACHE BOOL "" FORCE)
 
 # Use the Avendish the host (ossia score) provides; otherwise fetch it.
