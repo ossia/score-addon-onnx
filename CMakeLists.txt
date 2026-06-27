@@ -524,3 +524,20 @@ if(SCORE_ONNX_PROFILE)
   target_compile_definitions(score_addon_onnx_models PRIVATE ONNX_PROFILE)
   target_compile_definitions(score_onnx_imageops PRIVATE ONNX_PROFILE)
 endif()
+
+# Standalone distributable packages. Bundle the prebuilt libonnxruntime into the
+# Max / TouchDesigner / Godot packages so every object can dlopen it from beside
+# its own plugin module at runtime (Max support/, TD Plugins/, Godot
+# bin/<os>-<arch>/ -- see Onnx/helpers/compat/dylib_loader.hpp get_module_folder()).
+# avnd_addon_package reads the per-backend externals avnd_make_* registered and
+# assembles one package per backend under <build>/package/<name>/, ready for CI to
+# zip + upload. Ignored in a score build (the host bundles onnxruntime itself) and
+# when building against an Avendish without the packaging helpers.
+if(NOT AVND_ADDON_SCORE AND COMMAND avnd_addon_package)
+  avnd_addon_package(
+    NAME score-addon-onnx
+    SOURCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}"
+    PACKAGE_ROOT "${CMAKE_BINARY_DIR}/package"
+    BACKENDS max touchdesigner godot
+    SUPPORT ${ONNXRUNTIME_SUPPORT_FILES})
+endif()
