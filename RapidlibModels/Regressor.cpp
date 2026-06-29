@@ -2,7 +2,7 @@
 
 #include "src/regression.h"
 
-#include <ossia/math/safe_math.hpp>
+#include <Onnx/helpers/compat/safe_math.hpp>
 
 #include <algorithm>
 

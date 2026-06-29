@@ -4301,6 +4301,23 @@ int       ctx_get_render_threads   (Ctx *ctx);
 #define CTX_MAX_SCANLINE_LENGTH 4096
 #endif
 
+// --- MSVC has no C99 variable-length arrays; the composite/rasterizer scratch
+// buffers below are sized at runtime. Map them to _alloca (function-scoped,
+// freed on return) on MSVC, and keep the plain VLA on gcc/clang so those builds
+// are byte-for-byte unchanged. CTX_SCRATCH_SZ also remembers the byte size so a
+// later sizeof(buf) keeps working (a raw pointer's sizeof would be wrong on MSVC);
+// read it back through CTX_SCRATCH_BYTES. ---
+#if defined(_MSC_VER)
+#include <malloc.h>
+#define CTX_SCRATCH(type,name,n)    type *name = (type *)_alloca (sizeof (type) * (size_t)(n))
+#define CTX_SCRATCH_SZ(type,name,n) const size_t name##_sz_ = sizeof (type) * (size_t)(n); type *name = (type *)_alloca (name##_sz_)
+#define CTX_SCRATCH_BYTES(name)     (name##_sz_)
+#else
+#define CTX_SCRATCH(type,name,n)    type name[n]
+#define CTX_SCRATCH_SZ(type,name,n) type name[n]
+#define CTX_SCRATCH_BYTES(name)     (sizeof (name))
+#endif
+
 
 #ifndef CTX_MAX_CBS
 #define CTX_MAX_CBS              64 // was 128 - each kb is kind of big
@@ -4818,7 +4835,16 @@ void        ctx_string_append_float   (CtxString *string, float val);
 /* glyph index: 
  !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghi
   jklmnopqrstuvwxyz{|}~  */
+// MSVC has no __attribute__((packed)); it reads __attribute__ as a struct tag
+// and errors ("'packed' uses undefined struct '__attribute__'"). The font table
+// is parsed as a raw byte blob (ctx_load_font_ctx, sizeof ctx_font_ascii), so
+// the 9-byte record layout is load-bearing -- restore it with #pragma pack.
+#if defined(_MSC_VER)
+#pragma pack(push,1)
+static const struct {uint8_t code; uint32_t a; uint32_t b;}
+#else
 static const struct __attribute__ ((packed)) {uint8_t code; uint32_t a; uint32_t b;}
+#endif
 ctx_font_ascii[]={
 {15, 0x00000000, 0x000009b7},/* length:2487 CTX_SUBDIV:8 CTX_BAKE_FONT_SIZE:160 */
 {'(', 0x00000010, 0x00000002},/* Roboto Regular*/
@@ -7309,6 +7335,9 @@ ctx_font_ascii[]={
 {'8', 0x3446292f, 0x0a300a16},
 {'8', 0xdc4d0030, 0xa11ddc1d},
 };
+#if defined(_MSC_VER)
+#pragma pack(pop)
+#endif
 #define ctx_font_ascii_name "Roboto Regular"
 #endif
 #endif //_CTX_INTERNAL_FONT_
@@ -14905,8 +14934,8 @@ ctx_u8 (CtxCode code,
 static void
 ctx_process_cmd_str_with_len (Ctx *ctx, CtxCode code, const char *string, uint32_t arg0, uint32_t arg1, int len)
 {
-  CtxEntry commands[1 + 2 + (len+1+1)/9];
-  memset (commands, 0, sizeof (commands) );
+  CTX_SCRATCH_SZ(CtxEntry, commands, 1 + 2 + (len+1+1)/9);
+  memset (commands, 0, CTX_SCRATCH_BYTES(commands) );
   commands[0] = ctx_u32 (code, arg0, arg1);
   commands[1].code = CTX_DATA;
   commands[1].data.u32[0] = len;
@@ -17953,7 +17982,7 @@ ctx_fragment_color_RGBAF (CtxRasterizer *rasterizer, float x, float y, float z, 
 static void ctx_fragment_image_RGBAF (CtxRasterizer *rasterizer, float x, float y, float z, void *out, int count, float dx, float dy, float dz)
 {
   float *outf = (float *) out;
-  uint8_t rgba[4 * count];
+  CTX_SCRATCH(uint8_t, rgba, 4 * count);
   CtxSource *g = &rasterizer->state->gstate.source_fill;
 #if CTX_ENABLE_CM
   CtxBuffer *buffer = g->texture.buffer->color_managed?g->texture.buffer->color_managed:g->texture.buffer;
@@ -18459,7 +18488,7 @@ ctx_RGBA8_source_over_normal_fragment (CTX_COMPOSITE_ARGUMENTS)
   float ud = 0; float vd = 0;
   float w0 = 1; float wd = 0;
   ctx_init_uv (rasterizer, x0, rasterizer->scanline/CTX_FULL_AA, &u0, &v0, &w0, &ud, &vd, &wd);
-  uint8_t _tsrc[4 * (count)];
+  CTX_SCRATCH(uint8_t, _tsrc, 4 * (count));
   rasterizer->fragment (rasterizer, u0, v0, w0, &_tsrc[0], count, ud, vd, wd);
   ctx_RGBA8_source_over_normal_buf (count,
                        dst, src, coverage, rasterizer, x0, &_tsrc[0]);
@@ -18475,7 +18504,7 @@ CTX_SIMD_SUFFIX(ctx_RGBA8_source_over_normal_full_cov_fragment) (CTX_COMPOSITE_A
   if (CTX_LIKELY(ctx_matrix_no_perspective (transform)))
   {
     float u0, v0, ud, vd, w0, wd;
-    uint8_t _tsrc[4 * count];
+    CTX_SCRATCH(uint8_t, _tsrc, 4 * count);
     ctx_init_uv (rasterizer, x0, scan, &u0, &v0, &w0, &ud, &vd, &wd);
     for (int y = 0; y < scanlines; y++)
     {
@@ -18489,7 +18518,7 @@ CTX_SIMD_SUFFIX(ctx_RGBA8_source_over_normal_full_cov_fragment) (CTX_COMPOSITE_A
   }
   else
   {
-    uint8_t _tsrc[4 * count];
+    CTX_SCRATCH(uint8_t, _tsrc, 4 * count);
     for (int y = 0; y < scanlines; y++)
     {
       float u0, v0, ud, vd, w0, wd;
@@ -18509,7 +18538,7 @@ ctx_RGBA8_source_copy_normal_fragment (CTX_COMPOSITE_ARGUMENTS)
   float ud = 0; float vd = 0;
   float w0 = 1; float wd = 0;
   ctx_init_uv (rasterizer, x0, rasterizer->scanline/CTX_FULL_AA, &u0, &v0, &w0, &ud, &vd, &wd);
-  uint8_t _tsrc[4 * (count)];
+  CTX_SCRATCH(uint8_t, _tsrc, 4 * (count));
   rasterizer->fragment (rasterizer, u0, v0, w0, &_tsrc[0], count, ud, vd, wd);
   ctx_RGBA8_source_copy_normal_buf (count,
                        dst, src, coverage, rasterizer, x0, &_tsrc[0]);
@@ -18622,7 +18651,7 @@ static inline void \
 ctx_u8_blend_##name (int components, uint8_t * __restrict__ dst, uint8_t *src, uint8_t *blended, int count)\
 {\
   for (int j = 0; j < count; j++) { \
-  uint8_t *s=src; uint8_t b[components];\
+  uint8_t *s=src; CTX_SCRATCH(uint8_t, b, components);\
   ctx_u8_deassociate_alpha (components, dst, b);\
     CODE;\
   blended[components-1] = src[components-1];\
@@ -18770,7 +18799,7 @@ static int ctx_u8_get_sat (int components, uint8_t *c)
 static void ctx_u8_set_lum (int components, uint8_t *c, uint8_t lum)
 {
   int d = lum - ctx_u8_get_lum (components, c);
-  int tc[components];
+  CTX_SCRATCH(int, tc, components);
   for (int i = 0; i < components - 1; i++)
   {
     tc[i] = c[i] + d;
@@ -18898,7 +18927,7 @@ __ctx_u8_porter_duff (CtxRasterizer         *rasterizer,
   ctx_porter_duff_factors (compositing_mode, &f_s, &f_d);
   CtxGState *gstate = &rasterizer->state->gstate;
   uint8_t global_alpha_u8 = gstate->global_alpha_u8;
-  uint8_t tsrc[components * count];
+  CTX_SCRATCH(uint8_t, tsrc, components * count);
   int src_step = 0;
 
   if (gstate->source_fill.type == CTX_SOURCE_COLOR)
@@ -18929,7 +18958,7 @@ __ctx_u8_porter_duff (CtxRasterizer         *rasterizer,
     if (CTX_UNLIKELY(global_alpha_u8 != 255))
       cov = (cov * global_alpha_u8 + 255) >> 8;
 
-    uint8_t csrc[components];
+    CTX_SCRATCH(uint8_t, csrc, components);
     for (int c = 0; c < components; c++)
       csrc[c] = (src[c] * cov + 255) >> 8;
 
@@ -19307,7 +19336,7 @@ ctx_setup_RGB8 (CtxRasterizer *rasterizer)
 static inline void
 ctx_composite_convert (CTX_COMPOSITE_ARGUMENTS)
 {
-  uint8_t pixels[count * rasterizer->format->ebpp];
+  CTX_SCRATCH(uint8_t, pixels, count * rasterizer->format->ebpp);
   rasterizer->format->to_comp (rasterizer, x0, dst, &pixels[0], count);
   rasterizer->comp_op (count, &pixels[0], rasterizer->color, coverage, rasterizer, x0);
   rasterizer->format->from_comp (rasterizer, x0, &pixels[0], dst, count);
@@ -19497,7 +19526,7 @@ static float ctx_float_get_sat (int components, float *c)
 static void ctx_float_set_lum (int components, float *c, float lum)
 {
   float d = lum - ctx_float_get_lum (components, c);
-  float tc[components];
+  CTX_SCRATCH(float, tc, components);
   for (int i = 0; i < components - 1; i++)
   {
     tc[i] = c[i] + d;
@@ -19547,7 +19576,7 @@ static void ctx_float_set_sat (int components, float *c, float sat)
 static inline void \
 ctx_float_blend_##name (int components, float * __restrict__ dst, float *src, float *blended)\
 {\
-  float *s = src; float b[components];\
+  float *s = src; CTX_SCRATCH(float, b, components);\
   ctx_float_deassociate_alpha (components, dst, b);\
     CODE;\
   blended[components-1] = s[components-1];\
@@ -19675,7 +19704,7 @@ ctx_float_porter_duff (CtxRasterizer         *rasterizer,
   
   if (rasterizer->state->gstate.source_fill.type == CTX_SOURCE_COLOR)
   {
-    float tsrc[components];
+    CTX_SCRATCH_SZ(float, tsrc, components);
 
     while (count--)
     {
@@ -19694,7 +19723,7 @@ ctx_float_porter_duff (CtxRasterizer         *rasterizer,
         continue;
       }
 #endif
-      memcpy (tsrc, rasterizer->color, sizeof(tsrc));
+      memcpy (tsrc, rasterizer->color, CTX_SCRATCH_BYTES(tsrc));
 
       if (blend != CTX_BLEND_NORMAL)
         ctx_float_blend (components, blend, dstf, tsrc, tsrc);
@@ -19737,7 +19766,7 @@ ctx_float_porter_duff (CtxRasterizer         *rasterizer,
   }
   else
   {
-    float tsrc[components];
+    CTX_SCRATCH(float, tsrc, components);
     float u0 = 0; float v0 = 0;
     float ud = 0; float vd = 0;
     float w0 = 1; float wd = 0;
@@ -20101,8 +20130,8 @@ ctx_fragment_color_GRAYAF (CtxRasterizer *rasterizer, float x, float y, float z,
 
 static void ctx_fragment_image_GRAYAF (CtxRasterizer *rasterizer, float x, float y, float z, void *out, int count, float dx, float dy, float dz)
 {
-  uint8_t rgba[4*count];
-  float rgbaf[4*count];
+  CTX_SCRATCH(uint8_t, rgba, 4*count);
+  CTX_SCRATCH(float, rgbaf, 4*count);
   CtxSource *g = &rasterizer->state->gstate.source_fill;
 #if CTX_ENABLE_CM
          CtxBuffer *buffer = g->texture.buffer->color_managed?g->texture.buffer->color_managed:g->texture.buffer;
@@ -20260,7 +20289,7 @@ ctx_composite_GRAYF (CTX_COMPOSITE_ARGUMENTS)
 {
   float *dstf = (float*)dst;
 
-  float temp[count*2];
+  CTX_SCRATCH(float, temp, count*2);
   for (unsigned int i = 0; i < count; i++)
   {
     temp[i*2] = dstf[i];
@@ -20315,7 +20344,7 @@ ctx_composite_BGRA8 (CTX_COMPOSITE_ARGUMENTS)
   // of gradient or image
   //
   //
-  uint8_t pixels[count * 4];
+  CTX_SCRATCH(uint8_t, pixels, count * 4);
   ctx_BGRA8_to_RGBA8 (rasterizer, x0, dst, &pixels[0], count);
   rasterizer->comp_op (count, &pixels[0], rasterizer->color, coverage, rasterizer, x0);
   ctx_BGRA8_to_RGBA8  (rasterizer, x0, &pixels[0], dst, count);
@@ -20340,7 +20369,7 @@ static void
 ctx_fragment_other_CMYKAF (CtxRasterizer *rasterizer, float x, float y, float z, void *out, int count, float dx, float dy, float dz)
 {
   float *cmyka = (float*)out;
-  float _rgba[4 * count];
+  CTX_SCRATCH(float, _rgba, 4 * count);
   float *rgba = &_rgba[0];
   CtxGState *gstate = &rasterizer->state->gstate;
   switch (gstate->source_fill.type)
@@ -20595,7 +20624,7 @@ ctx_CMYKAF_to_CMYKA8 (CtxRasterizer *rasterizer, float *src, uint8_t *dst, int c
 static void
 ctx_composite_CMYKA8 (CTX_COMPOSITE_ARGUMENTS)
 {
-  float pixels[count * 5];
+  CTX_SCRATCH(float, pixels, count * 5);
   ctx_CMYKA8_to_CMYKAF (rasterizer, dst, &pixels[0], count);
   rasterizer->comp_op (count, (uint8_t *) &pixels[0], rasterizer->color, coverage, rasterizer, x0);
   ctx_CMYKAF_to_CMYKA8 (rasterizer, &pixels[0], dst, count);
@@ -20652,7 +20681,7 @@ ctx_CMYKAF_to_CMYK8 (CtxRasterizer *rasterizer, float *src, uint8_t *dst, int co
 static void
 ctx_composite_CMYK8 (CTX_COMPOSITE_ARGUMENTS)
 {
-  float pixels[count * 5];
+  CTX_SCRATCH(float, pixels, count * 5);
   ctx_CMYK8_to_CMYKAF (rasterizer, dst, &pixels[0], count);
   rasterizer->comp_op (count, (uint8_t *) &pixels[0], src, coverage, rasterizer, x0);
   ctx_CMYKAF_to_CMYK8 (rasterizer, &pixels[0], dst, count);
@@ -20730,7 +20759,7 @@ ctx_composite_BGR8 (CTX_COMPOSITE_ARGUMENTS)
   }
 #endif
 
-  uint8_t pixels[count * 4];
+  CTX_SCRATCH(uint8_t, pixels, count * 4);
   ctx_BGR8_to_RGBA8 (rasterizer, x0, dst, &pixels[0], count);
   rasterizer->comp_op (count, &pixels[0], rasterizer->color, coverage, rasterizer, x0);
   ctx_RGBA8_to_BGR8 (rasterizer, x0, &pixels[0], dst, count);
@@ -20809,7 +20838,7 @@ ctx_composite_RGB8 (CTX_COMPOSITE_ARGUMENTS)
   }
 #endif
 
-  uint8_t pixels[count * 4];
+  CTX_SCRATCH(uint8_t, pixels, count * 4);
   ctx_RGB8_to_RGBA8 (rasterizer, x0, dst, &pixels[0], count);
   rasterizer->comp_op (count, &pixels[0], rasterizer->color, coverage, rasterizer, x0);
   ctx_RGBA8_to_RGB8 (rasterizer, x0, &pixels[0], dst, count);
@@ -21378,7 +21407,7 @@ ctx_fragment_color_GRAYA8 (CtxRasterizer *rasterizer, float x, float y, float z,
 
 static void ctx_fragment_image_GRAYA8 (CtxRasterizer *rasterizer, float x, float y, float z, void *out, int count, float dx, float dy, float dz)
 {
-  uint8_t rgba[4*count];
+  CTX_SCRATCH(uint8_t, rgba, 4*count);
   CtxSource *g = &rasterizer->state->gstate.source_fill;
 #if CTX_ENABLE_CM
          CtxBuffer *buffer = g->texture.buffer->color_managed?g->texture.buffer->color_managed:g->texture.buffer;
@@ -21700,7 +21729,7 @@ ctx_composite_RGB332 (CTX_COMPOSITE_ARGUMENTS)
     return;
   }
 #endif
-  uint8_t pixels[count * 4];
+  CTX_SCRATCH(uint8_t, pixels, count * 4);
   ctx_RGB332_to_RGBA8 (rasterizer, x0, dst, &pixels[0], count);
   rasterizer->comp_op (count, &pixels[0], rasterizer->color, coverage, rasterizer, x0);
   ctx_RGBA8_to_RGB332 (rasterizer, x0, &pixels[0], dst, count);
@@ -21804,7 +21833,7 @@ ctx_RGBA8_source_copy_normal_color (CTX_COMPOSITE_ARGUMENTS);
 static void
 ctx_composite_RGB565 (CTX_COMPOSITE_ARGUMENTS)
 {
-  uint8_t pixels[count * 4];
+  CTX_SCRATCH(uint8_t, pixels, count * 4);
   ctx_RGB565_to_RGBA8 (rasterizer, x0, dst, &pixels[0], count);
   rasterizer->comp_op (count, &pixels[0], rasterizer->color, coverage, rasterizer, x0);
   ctx_RGBA8_to_RGB565 (rasterizer, x0, &pixels[0], dst, count);
@@ -21820,7 +21849,7 @@ ctx_RGBA8_to_RGB565_BS (CtxRasterizer *rasterizer, int x, const uint8_t *rgba, v
 static void
 ctx_composite_RGB565_BS (CTX_COMPOSITE_ARGUMENTS)
 {
-  uint8_t pixels[count * 4];
+  CTX_SCRATCH(uint8_t, pixels, count * 4);
   ctx_RGB565_BS_to_RGBA8 (rasterizer, x0, dst, &pixels[0], count);
   rasterizer->comp_op (count, &pixels[0], rasterizer->color, coverage, rasterizer, x0);
   ctx_RGBA8_to_RGB565_BS (rasterizer, x0, &pixels[0], dst, count);
@@ -22304,8 +22333,8 @@ y1, 0);
 
   /* fallback */
   {
-    uint8_t coverage[width];
-    memset (coverage, cov, sizeof (coverage) );
+    CTX_SCRATCH_SZ(uint8_t, coverage, width);
+    memset (coverage, cov, CTX_SCRATCH_BYTES(coverage) );
     uint8_t *rasterizer_src = rasterizer->color;
     ctx_apply_coverage_fun apply_coverage =
       rasterizer->apply_coverage;
@@ -22389,7 +22418,7 @@ CTX_SIMD_SUFFIX (ctx_composite_fill_rect) (CtxRasterizer *rasterizer,
   if ((width >0) & (height>0))
   {
      uint8_t *dst = ( (uint8_t *) rasterizer->buf);
-     uint8_t coverage[width+2];
+     CTX_SCRATCH(uint8_t, coverage, width+2);
      uint32_t x0i = (int)x0+has_left;
      uint32_t x1i = (int)x1-has_right;
      uint32_t y0i = (int)y0+has_top;
@@ -23630,8 +23659,8 @@ ctx_rasterizer_apply_grads_generic (CtxRasterizer *rasterizer,
 #if static_OPAQUE
                        uint8_t *opaque = &rasterizer->opaque[0];
 #else
-                       uint8_t opaque[width];
-                       memset (opaque, 255, sizeof (opaque));
+                       CTX_SCRATCH_SZ(uint8_t, opaque, width);
+                       memset (opaque, 255, CTX_SCRATCH_BYTES(opaque));
 #endif
                        apply_coverage (width,
                                    &dst[((first + pre) * bpp)/8],
@@ -24019,7 +24048,7 @@ ctx_rasterizer_rasterize_edges2 (CtxRasterizer *rasterizer, const int fill_rule,
     // sometimes reached by stroking code
     return;
   }
-  uint8_t _coverage[pixs + 32]; // XXX this might hide some valid asan warnings
+  CTX_SCRATCH(uint8_t, _coverage, pixs + 32); // XXX this might hide some valid asan warnings
   uint8_t *coverage = &_coverage[0];
   ctx_apply_coverage_fun apply_coverage = rasterizer->apply_coverage;
 
@@ -24215,10 +24244,10 @@ ctx_rasterizer_rasterize_edges2 (CtxRasterizer *rasterizer, const int fill_rule,
       (gstate->compositing_mode == CTX_COMPOSITE_CLEAR)))
   {
      /* fill in the rest of the blitrect when compositing mode permits it */
-     uint8_t nocoverage[rasterizer->blit_width];
+     CTX_SCRATCH_SZ(uint8_t, nocoverage, rasterizer->blit_width);
      int gscan_start = gstate->clip_min_y * CTX_FULL_AA;
      //int gscan_end = gstate->clip_max_y * CTX_FULL_AA;
-     memset (nocoverage, 0, sizeof(nocoverage));
+     memset (nocoverage, 0, CTX_SCRATCH_BYTES(nocoverage));
      int startx   = gstate->clip_min_x;
      int endx     = gstate->clip_max_x;
      int clipw    = endx-startx + 1;
@@ -24309,7 +24338,7 @@ ctx_rasterizer_rasterize_edges3 (CtxRasterizer *rasterizer, const int fill_rule)
   minx *= (minx>0);
  
   int pixs = maxx - minx + 1;
-  uint8_t _coverage[pixs+16]; // XXX this might hide some valid asan warnings
+  CTX_SCRATCH(uint8_t, _coverage, pixs+16); // XXX this might hide some valid asan warnings
   uint8_t *coverage = &_coverage[0];
   ctx_apply_coverage_fun apply_coverage = rasterizer->apply_coverage;
 
@@ -25013,7 +25042,7 @@ ctx_rasterizer_fill (CtxRasterizer *rasterizer)
   int blit_width = rasterizer->blit_width;
   int blit_height = rasterizer->blit_height;
 
-  CtxSegment temp[preserved_count]; /* copy of already built up path's poly line
+  CTX_SCRATCH(CtxSegment, temp, preserved_count); /* copy of already built up path's poly line
                                        XXX - by building a large enough path
                                        the stack can be smashed!
                                      */
@@ -25605,8 +25634,8 @@ ctx_rasterizer_stroke (CtxRasterizer *rasterizer)
   }
 #endif
 
-  CtxSegment temp[count]; /* copy of already built up path's poly line  */
-  memcpy (temp, rasterizer->edge_list.entries, sizeof (temp) );
+  CTX_SCRATCH_SZ(CtxSegment, temp, count); /* copy of already built up path's poly line  */
+  memcpy (temp, rasterizer->edge_list.entries, CTX_SCRATCH_BYTES(temp) );
 #if CTX_FAST_FILL_RECT
 #if CTX_FAST_STROKE_RECT
   if (rasterizer->edge_list.count == 5)
@@ -25849,7 +25878,7 @@ foo:
 #endif
   if (preserved)
     {
-      memcpy (rasterizer->edge_list.entries, temp, sizeof (temp) );
+      memcpy (rasterizer->edge_list.entries, temp, CTX_SCRATCH_BYTES(temp) );
       rasterizer->edge_list.count = count;
       rasterizer->preserve = 0;
     }
@@ -26188,20 +26217,20 @@ static void
 _ctx_rasterizer_clip (CtxRasterizer *rasterizer)
 {
   int count = rasterizer->edge_list.count;
-  CtxSegment temp[count+1]; /* copy of already built up path's poly line  */
+  CTX_SCRATCH_SZ(CtxSegment, temp, count+1); /* copy of already built up path's poly line  */
   rasterizer->state->has_clipped=1;
   rasterizer->state->gstate.clipped=1;
   //if (rasterizer->preserve)
-    { memcpy (temp + 1, rasterizer->edge_list.entries, sizeof (temp) - sizeof (temp[0]));
+    { memcpy (temp + 1, rasterizer->edge_list.entries, CTX_SCRATCH_BYTES(temp) - sizeof (temp[0]));
       temp[0].code = CTX_NOP;
       temp[0].u32[0] = count;
-      ctx_state_set_blob (rasterizer->state, SQZ_clip, (char*)temp, sizeof(temp));
+      ctx_state_set_blob (rasterizer->state, SQZ_clip, (char*)temp, CTX_SCRATCH_BYTES(temp));
     }
   ctx_rasterizer_clip_apply (rasterizer, temp);
   _ctx_rasterizer_reset (rasterizer);
   if (rasterizer->preserve)
     {
-      memcpy (rasterizer->edge_list.entries, temp + 1, sizeof (temp) - sizeof(temp[0]));
+      memcpy (rasterizer->edge_list.entries, temp + 1, CTX_SCRATCH_BYTES(temp) - sizeof(temp[0]));
       rasterizer->edge_list.count = count;
       rasterizer->preserve = 0;
     }
@@ -26836,8 +26865,8 @@ ctx_rasterizer_process (Ctx *ctx, const CtxCommand *c)
           float *dashes = state->gstate.dashes;
           float factor = ctx_matrix_get_scale (&state->gstate.transform);
 
-          CtxSegment temp[count]; /* copy of already built up path's poly line  */
-          memcpy (temp, rasterizer->edge_list.entries, sizeof (temp));
+          CTX_SCRATCH_SZ(CtxSegment, temp, count); /* copy of already built up path's poly line  */
+          memcpy (temp, rasterizer->edge_list.entries, CTX_SCRATCH_BYTES(temp));
           int start = 0;
           int end   = 0;
       CtxMatrix transform_backup = state->gstate.transform;
@@ -44169,8 +44198,8 @@ static int ctx_kb_raw_open (int skip)
           int got_a = 0;
           int got_z = 0;
           size_t nchar = KEY_MAX/8+1;
-          unsigned char bits[nchar];
-          if (ioctl (fd, EVIOCGBIT(EV_KEY, sizeof (bits)), &bits)>=0)
+          unsigned CTX_SCRATCH_SZ(char, bits, nchar);
+          if (ioctl (fd, EVIOCGBIT(EV_KEY, CTX_SCRATCH_BYTES(bits)), &bits)>=0)
           {
             got_a = bits[KEY_A/8] & (1 << (KEY_A & 7));
             got_z = bits[KEY_Z/8] & (1 << (KEY_Z & 7));
@@ -44400,11 +44429,11 @@ static int ctx_linux_ts_open (void)
     fd = open(path, O_RDONLY | O_CLOEXEC );
     unsigned long evbits = 0;
     size_t nabs  = ABS_MAX/8+1;
-    unsigned char absbits[nabs];
+    unsigned CTX_SCRATCH_SZ(char, absbits, nabs);
     unsigned long propbits = 0;
     if (fd != -1)
     {
-      if (ioctl (fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), &absbits) != -1)
+      if (ioctl (fd, EVIOCGBIT(EV_ABS, CTX_SCRATCH_BYTES(absbits)), &absbits) != -1)
       if (ioctl (fd, EVIOCGPROP(sizeof (unsigned long)), &propbits) != -1)
       if (ioctl (fd, EVIOCGBIT(0, sizeof (unsigned long)), &evbits) != -1)
       {
@@ -44412,9 +44441,9 @@ static int ctx_linux_ts_open (void)
         {
           int touch = 0;
           size_t nchar = KEY_MAX/8+1;
-          unsigned char bits[nchar];
+          unsigned CTX_SCRATCH_SZ(char, bits, nchar);
 #define CHECK_BIT(bits,bitno)   bits[(bitno)/8] & (1 << ((bitno) & 7));
-          if (ioctl (fd, EVIOCGBIT(EV_KEY, sizeof (bits)), &bits)>=0)
+          if (ioctl (fd, EVIOCGBIT(EV_KEY, CTX_SCRATCH_BYTES(bits)), &bits)>=0)
             touch = CHECK_BIT(bits, BTN_TOUCH);
           int pointer = propbits & (1<<INPUT_PROP_POINTER);
           int x_axis         = CHECK_BIT(absbits, ABS_X);
@@ -44464,11 +44493,11 @@ static int ctx_linux_tpad_open (void)
     fd = open(path, O_RDONLY | O_CLOEXEC );
     unsigned long evbits = 0;
     size_t nabs  = ABS_MAX/8+1;
-    unsigned char absbits[nabs];
+    unsigned CTX_SCRATCH_SZ(char, absbits, nabs);
     unsigned long propbits = 0;
     if (fd != -1)
     {
-      if (ioctl (fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), &absbits) != -1)
+      if (ioctl (fd, EVIOCGBIT(EV_ABS, CTX_SCRATCH_BYTES(absbits)), &absbits) != -1)
       if (ioctl (fd, EVIOCGPROP(sizeof (unsigned long)), &propbits) != -1)
       if (ioctl (fd, EVIOCGBIT(0, sizeof (unsigned long)), &evbits) != -1)
       {
@@ -44476,9 +44505,9 @@ static int ctx_linux_tpad_open (void)
         {
           int touch = 0;
           size_t nchar = KEY_MAX/8+1;
-          unsigned char bits[nchar];
+          unsigned CTX_SCRATCH_SZ(char, bits, nchar);
 #define CHECK_BIT(bits,bitno)   bits[(bitno)/8] & (1 << ((bitno) & 7));
-          if (ioctl (fd, EVIOCGBIT(EV_KEY, sizeof (bits)), &bits)>=0)
+          if (ioctl (fd, EVIOCGBIT(EV_KEY, CTX_SCRATCH_BYTES(bits)), &bits)>=0)
             touch = CHECK_BIT(bits, BTN_TOUCH);
           int pointer = propbits & (1<<INPUT_PROP_POINTER);
           //int x_axis         = CHECK_BIT(absbits, ABS_X);
@@ -55398,7 +55427,7 @@ static int _ctx_resolve_font (const char *name)
   }
 #endif
 
-  char temp[ctx_strlen (name)+8];
+  CTX_SCRATCH_SZ(char, temp, ctx_strlen (name)+8);
   /* first we look for exact */
   for (int i = 0; ret < 0 && i < ctx_font_count; i ++)
     {
@@ -55417,22 +55446,22 @@ static int _ctx_resolve_font (const char *name)
   /* then we normalize some names */
   if (!strncmp (name, "Helvetica", 9))
   {
-     memset(temp,0,sizeof(temp));
-     strncpy (temp, name + 4, sizeof(temp)-1);
+     memset(temp,0,CTX_SCRATCH_BYTES(temp));
+     strncpy (temp, name + 4, CTX_SCRATCH_BYTES(temp)-1);
      memcpy (temp, "Arrrr", 5);  // this matches Arial and Arimo
      name = temp;
   }
   else if (!strncmp (name, "Monospace", 9))
   {
-     memset(temp,0,sizeof(temp));
-     strncpy (temp, name + 2, sizeof(temp)-1);
+     memset(temp,0,CTX_SCRATCH_BYTES(temp));
+     strncpy (temp, name + 2, CTX_SCRATCH_BYTES(temp)-1);
      memcpy (temp, "Courier", 7); 
      name = temp;
   }
   else if (!strncmp (name, "Mono ", 5))
   {
-    memset(temp,0,sizeof(temp));
-    strncpy (temp+ 3, name, sizeof(temp)-1-3);
+    memset(temp,0,CTX_SCRATCH_BYTES(temp));
+    strncpy (temp+ 3, name, CTX_SCRATCH_BYTES(temp)-1-3);
     memcpy (temp, "Courier ", 8); 
     name = temp;
   }

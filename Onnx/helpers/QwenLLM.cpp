@@ -1,12 +1,12 @@
 #include "QwenLLM.hpp"
 
-#include <QDebug>
-
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <cmath>
+#include <cstdio>
 #include <ext_status.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 
@@ -30,9 +30,21 @@ QwenLLMInference::QwenLLMInference(
   sessionOptions.AddConfigEntry("model.type", "decoder_only");
   sessionOptions.AddConfigEntry("model.architecture", "qwen");
 
-  // Load the model
+  // Load the model. ORT's path-based Session ctor takes const ORTCHAR_T*, which
+  // is wchar_t on Windows -- pass a const char* there and it fails to compile.
+  // Decode the UTF-8 byte path to a wstring on Windows (same as FastVLM.cpp).
+#if defined(_WIN32)
+  auto modelPath_str
+      = std::filesystem::path(
+            std::u8string(
+                reinterpret_cast<const char8_t*>(modelPath.data()),
+                modelPath.size()))
+            .wstring();
+#else
+  auto modelPath_str = modelPath;
+#endif
   modelSession = std::make_unique<Ort::Session>(
-      env, modelPath.data(), sessionOptions);
+      env, modelPath_str.data(), sessionOptions);
 
   if (tokenizerModelPath.ends_with("tokenizer.json"))
     tokenizerModelPath = tokenizerModelPath.substr(
@@ -349,7 +361,7 @@ std::vector<float> QwenLLMInference::runModel(
                 kvShape.data(),
                 kvShape.size()));
       } else {
-        qDebug() << "QwenLLM: WARNING - KV cache" << i << "is empty";
+        std::fprintf(stderr, "QwenLLM: WARNING - KV cache %d is empty\n", (int)i);
       }
     }
   }
@@ -394,7 +406,7 @@ std::vector<float> QwenLLMInference::runModel(
     
     int64_t lastDim = logitsShape.back();
     if (lastDim != vocabSize) {
-      qDebug() << "WARNING: Last dimension" << lastDim << "doesn't match vocab size" << vocabSize;
+      std::fprintf(stderr, "WARNING: Last dimension %lld doesn't match vocab size %lld\n", (long long)lastDim, (long long)vocabSize);
     }
     
     // For safety, only take the logits for the last token (most recent position)
@@ -457,14 +469,14 @@ std::vector<float> QwenLLMInference::runModel(
       }
       else
       {
-        qDebug() << "QwenLLM: WARNING - KV output" << i << "is not float16, skipping";
+        std::fprintf(stderr, "QwenLLM: WARNING - KV output %d is not float16, skipping\n", (int)i);
       }
     }
 
     return logits;
   }
   catch (const Ort::Exception& e) {
-    qDebug() << "ORT Exception in runModel:" << e.what();
+    std::fprintf(stderr, "ORT Exception in runModel: %s\n", e.what());
     throw;
   }
 }

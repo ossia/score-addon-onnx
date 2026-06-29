@@ -2,12 +2,13 @@
 
 #include <boost/container/vector.hpp>
 
-#include <QImage>
+#include <Onnx/helpers/ImageBuffer.hpp>
 
 #include <onnxruntime_cxx_api.h>
 #include <ortx_tokenizer.h>
 
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,7 @@ public:
   ~FastVLMInference();
 
   std::string generateResponse(
-      const QImage& image,
+      const Onnx::ImageData& image,
       const std::string& prompt,
       float temperature = 1.0f);
 

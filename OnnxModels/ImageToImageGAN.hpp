@@ -1,4 +1,5 @@
 #pragma once
+#include <Onnx/helpers/ImageBuffer.hpp>
 #include <OnnxModels/Utils.hpp>
 #include <cmath>
 #include <halp/controls.hpp>
@@ -64,12 +65,12 @@ public:
   struct worker
   {
     std::function<void(
-        QImage,
+        Onnx::ImageData,
         std::shared_ptr<Onnx::ImageTranslationGAN>)>
         request;
 
     static std::function<void(ImageToImageGAN&)> work(
-        QImage input_image,
+        Onnx::ImageData input_image,
         std::shared_ptr<Onnx::ImageTranslationGAN> translation_model);
   } worker;
 

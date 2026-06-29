@@ -1,7 +1,7 @@
 #include "QwenLLM.hpp"
 
-#include <QDebug>
 #include <chrono>
+#include <cstdio>
 
 namespace OnnxModels
 {
@@ -22,7 +22,7 @@ try
   if (inputs.model.file.filename.empty()
       || inputs.tokenizer.file.filename.empty())
   {
-    qDebug() << "QwenLLM: Model or tokenizer path is empty";
+    std::fprintf(stderr, "QwenLLM: Model or tokenizer path is empty\n");
     return;
   }
 
@@ -32,11 +32,11 @@ try
   last_model_path = inputs.model.file.filename;
   last_tokenizer_path = inputs.tokenizer.file.filename;
 
-  qDebug() << "QwenLLM: Model initialized successfully";
+  std::fprintf(stderr, "QwenLLM: Model initialized successfully\n");
 }
 catch (const std::exception& e)
 {
-  qDebug() << "QwenLLM initialization error:" << e.what();
+  std::fprintf(stderr, "QwenLLM initialization error: %s\n", e.what());
   llm.reset();
 }
 
@@ -71,13 +71,13 @@ try
   if (!available)
   {
     outputs.response.value = "ONNX Runtime not available";
-    qDebug() << "QwenLLM: ONNX Runtime not available";
+    std::fprintf(stderr, "QwenLLM: ONNX Runtime not available\n");
     return;
   }
 
   if (needs_reinit())
   {
-    qDebug() << "QwenLLM: Need to reinitialize model";
+    std::fprintf(stderr, "QwenLLM: Need to reinitialize model\n");
     initialize_model();
   }
 
@@ -98,14 +98,14 @@ try
 }
 catch (const std::exception& e)
 {
-  qDebug() << "QwenLLM processing error:" << e.what();
+  std::fprintf(stderr, "QwenLLM processing error: %s\n", e.what());
   outputs.response.value = std::string("Error: ") + e.what();
   outputs.isGenerating.value = false;
   inference_in_progress = false;
 }
 catch (...)
 {
-  qDebug() << "QwenLLM unknown error";
+  std::fprintf(stderr, "QwenLLM unknown error\n");
   outputs.response.value = "Unknown error occurred";
   outputs.isGenerating.value = false;
   inference_in_progress = false;
@@ -155,7 +155,7 @@ std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(
   }
   catch (...)
   {
-    qDebug() << "Unknown inference error";
+    std::fprintf(stderr, "Unknown inference error\n");
     return [](QwenLLMNode& node)
     {
       node.inference_in_progress = false;

@@ -6,6 +6,7 @@
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <queue>

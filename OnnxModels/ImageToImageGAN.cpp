@@ -1,7 +1,5 @@
 #include "ImageToImageGAN.hpp"
 
-#include <QImage>
-
 #include <Onnx/helpers/GAN.hpp>
 
 namespace OnnxModels
@@ -69,14 +67,17 @@ void ImageToImageGAN::requestInference()
   if (!in_tex.bytes || in_tex.width <= 0 || in_tex.height <= 0)
     return;
 
-  // Convert texture to QImage
-  QImage input_image(
-      reinterpret_cast<const uchar*>(in_tex.bytes),
-      in_tex.width,
-      in_tex.height,
-      QImage::Format_RGBA8888);
+  // Wrap the input RGBA8888 texture in a Qt-free ImageData (deep copy so the
+  // worker thread owns its pixels).
+  Onnx::ImageData input_image;
+  input_image.width = in_tex.width;
+  input_image.height = in_tex.height;
+  input_image.pixels.assign(
+      reinterpret_cast<const unsigned char*>(in_tex.bytes),
+      reinterpret_cast<const unsigned char*>(in_tex.bytes)
+          + static_cast<std::size_t>(in_tex.width) * in_tex.height * 4);
 
-  if (input_image.isNull())
+  if (input_image.empty())
     return;
 
   // Mark inference as in progress
@@ -109,10 +110,10 @@ void ImageToImageGAN::operator()()
 
 // Worker thread implementation
 std::function<void(ImageToImageGAN&)> ImageToImageGAN::worker::work(
-    QImage input_image,
+    Onnx::ImageData input_image,
     std::shared_ptr<Onnx::ImageTranslationGAN> translation_model)
 {
-  if (input_image.isNull() || !translation_model)
+  if (input_image.empty() || !translation_model)
   {
     return [](ImageToImageGAN& node)
     {
@@ -122,28 +123,25 @@ std::function<void(ImageToImageGAN&)> ImageToImageGAN::worker::work(
 
   try
   {
-    QImage result;
+    Onnx::ImageData result;
 
     if (translation_model->isReady())
     {
       result = translation_model->transformImage(input_image);
     }
 
-    if (!result.isNull())
+    if (!result.empty())
     {
-      // Convert QImage to RGBA format for ossia
-      QImage rgba_image = result.convertToFormat(QImage::Format_RGBA8888);
-      
-      // Return a function that will be executed in the main thread
-      return [rgba_image = std::move(rgba_image)](ImageToImageGAN& node) mutable
+      // result is already RGBA8888 (tightly packed) -> hand it to the main thread
+      return [rgba_image = std::move(result)](ImageToImageGAN& node) mutable
       {
         node.inferenceInProgress = false;
-        
-        node.outputs.image.create(rgba_image.width(), rgba_image.height());
+
+        node.outputs.image.create(rgba_image.width, rgba_image.height);
         memcpy(
             node.outputs.image.texture.bytes,
-            rgba_image.constBits(),
-            rgba_image.width() * rgba_image.height() * 4);
+            rgba_image.pixels.data(),
+            rgba_image.width * rgba_image.height * 4);
         node.outputs.image.texture.changed = true;
       };
     }

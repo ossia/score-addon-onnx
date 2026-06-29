@@ -1,7 +1,6 @@
 #include "FastVLM.hpp"
 
-#include <QDebug>
-#include <QImage>
+#include <cstdio>
 
 namespace OnnxModels
 {
@@ -43,7 +42,7 @@ void FastVLMNode::initializeModel()
   }
   catch (const std::exception& e)
   {
-    qDebug() << "FastVLM initialization error:" << e.what();
+    std::fprintf(stderr, "FastVLM initialization error: %s\n", e.what());
     vlm.reset();
   }
 }
@@ -58,14 +57,17 @@ void FastVLMNode::requestInference()
   if (!in_tex.bytes || in_tex.width <= 0 || in_tex.height <= 0)
     return;
 
-  // Convert texture to QImage
-  QImage image(
-      reinterpret_cast<const uchar*>(in_tex.bytes),
-      in_tex.width,
-      in_tex.height,
-      QImage::Format_RGBA8888);
+  // Wrap the input RGBA8888 texture in a Qt-free ImageData (deep copy so the
+  // worker thread owns its pixels).
+  Onnx::ImageData image;
+  image.width = in_tex.width;
+  image.height = in_tex.height;
+  image.pixels.assign(
+      reinterpret_cast<const unsigned char*>(in_tex.bytes),
+      reinterpret_cast<const unsigned char*>(in_tex.bytes)
+          + static_cast<std::size_t>(in_tex.width) * in_tex.height * 4);
 
-  if (image.isNull())
+  if (image.empty())
     return;
 
   // Mark inference as in progress
@@ -113,23 +115,23 @@ try
 }
 catch (const std::exception& e)
 {
-  qDebug() << "FastVLM processing error:" << e.what();
+  std::fprintf(stderr, "FastVLM processing error: %s\n", e.what());
   outputs.response.value = std::string("Error: ") + e.what();
 }
 catch (...)
 {
-  qDebug() << "FastVLM unknown error";
+  std::fprintf(stderr, "FastVLM unknown error\n");
   outputs.response.value = "Unknown error occurred";
 }
 
 // Worker thread implementation
 std::function<void(FastVLMNode&)> FastVLMNode::worker::work(
-    QImage image,
+    Onnx::ImageData image,
     std::string prompt,
     float temperature,
     std::shared_ptr<Onnx::FastVLMInference> vlm)
 {
-  if (!vlm || image.isNull() || prompt.empty())
+  if (!vlm || image.empty() || prompt.empty())
   {
     return [](FastVLMNode& node)
     {

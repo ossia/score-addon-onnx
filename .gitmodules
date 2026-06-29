@@ -3,4 +3,4 @@
 	url = https://github.com/jcelerier/RapidLib
 [submodule "3rdparty/onnxruntime-extensions"]
 	path = 3rdparty/onnxruntime-extensions
-	url = https://github.com/microsoft/onnxruntime-extensions.git
+	url = https://github.com/ossia/onnxruntime-extensions.git

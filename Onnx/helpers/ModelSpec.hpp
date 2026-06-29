@@ -1,10 +1,4 @@
 #pragma once
-#include <Process/Dataflow/PortType.hpp>
-
-#include <ossia/network/common/parameter_properties.hpp>
-
-#include <QDebug>
-
 #include <Onnx/helpers/TensorType.hpp>
 
 #include <string>
@@ -17,8 +11,6 @@ struct ModelSpec
   struct Port
   {
     std::string name;
-    Process::PortType port_type{};
-    ossia::val_type data_type{};
     std::vector<int64_t> shape;
     TensorElemType elem_type{TensorElemType::Float};
   };
@@ -76,22 +68,4 @@ struct ModelSpec
     return *this;
   }
 };
-
-inline QDebug operator<<(QDebug s, const ModelSpec& spec)
-{
-  s << "Model: " << spec.input_names.size() << spec.output_names.size()
-    << "\n";
-  for (auto& port : spec.input_names)
-    s << " - i: " << port.c_str() << "\n";
-  for (auto& port : spec.inputs)
-    s << "   => " << port.name.c_str() << (int)port.port_type << (int)port.data_type
-      << port.shape << "\n";
-  for (auto& port : spec.output_names)
-    s << " - o: " << port.c_str() << "\n";
-  for (auto& port : spec.outputs)
-    s << "   => " << port.name.c_str() << (int)port.port_type << (int)port.data_type
-      << port.shape << "\n";
-
-  return s;
-}
 }

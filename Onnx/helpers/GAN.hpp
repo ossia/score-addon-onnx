@@ -1,7 +1,6 @@
 #pragma once
 
-#include <QDebug>
-#include <QImage>
+#include <Onnx/helpers/ImageBuffer.hpp>
 
 #include <onnxruntime_cxx_api.h>
 
@@ -43,7 +42,7 @@ struct GANConfig
 };
 
 // Helper function to update GANConfig with model specifications  
-void updateConfigWithModelSpec(GANConfig& config, const ModelSpec& spec, const QImage& input_image = QImage());
+void updateConfigWithModelSpec(GANConfig& config, const ModelSpec& spec, const Onnx::ImageData& input_image = Onnx::ImageData{});
 
 // StyleGAN-like architecture (mapping + synthesis)
 class StyleGANModel
@@ -60,11 +59,11 @@ private:
 public:
   StyleGANModel(const GANConfig& config);
 
-  QImage generateRandom();
-  QImage generateFromLatent(const std::vector<float>& latent);
-  QImage transformImage(const QImage& input_image)
+  Onnx::ImageData generateRandom();
+  Onnx::ImageData generateFromLatent(const std::vector<float>& latent);
+  Onnx::ImageData transformImage(const Onnx::ImageData& input_image)
   {
-    return QImage();
+    return Onnx::ImageData{};
   } // Not supported
   size_t getLatentSize() const { return config_.latent_dim; }
   std::pair<int, int> getOutputSize() const
@@ -77,8 +76,8 @@ public:
 
 private:
   std::vector<float> runMapping(const std::vector<float>& z_vector);
-  QImage runSynthesis(const std::vector<float>& w_vector);
-  QImage tensorToImage(const float* data, const std::vector<int64_t>& shape);
+  Onnx::ImageData runSynthesis(const std::vector<float>& w_vector);
+  Onnx::ImageData tensorToImage(const float* data, const std::vector<int64_t>& shape);
 };
 
 // Single-network GAN architecture (e.g., EigenGAN)
@@ -95,11 +94,11 @@ private:
 public:
   SingleNetworkGAN(const GANConfig& config);
 
-  QImage generateRandom();
-  QImage generateFromLatent(const std::vector<float>& latent);
-  QImage transformImage(const QImage& input_image)
+  Onnx::ImageData generateRandom();
+  Onnx::ImageData generateFromLatent(const std::vector<float>& latent);
+  Onnx::ImageData transformImage(const Onnx::ImageData& input_image)
   {
-    return QImage();
+    return Onnx::ImageData{};
   } // Not supported
   size_t getLatentSize() const { return config_.latent_dim; }
   std::pair<int, int> getOutputSize() const
@@ -111,8 +110,8 @@ public:
   bool isGenerativeModel() const { return true; }
 
 private:
-  QImage runGenerator(const std::vector<std::vector<float>>& inputs);
-  QImage tensorToImage(const float* data, const std::vector<int64_t>& shape);
+  Onnx::ImageData runGenerator(const std::vector<std::vector<float>>& inputs);
+  Onnx::ImageData tensorToImage(const float* data, const std::vector<int64_t>& shape);
 };
 
 // Image-to-image translation architecture (e.g., AnimeGANv3)
@@ -128,12 +127,12 @@ private:
 public:
   ImageTranslationGAN(const GANConfig& config);
 
-  QImage generateRandom() { return QImage(); } // Not supported
-  QImage generateFromLatent(const std::vector<float>& latent)
+  Onnx::ImageData generateRandom() { return Onnx::ImageData{}; } // Not supported
+  Onnx::ImageData generateFromLatent(const std::vector<float>& latent)
   {
-    return QImage();
+    return Onnx::ImageData{};
   } // Not supported
-  QImage transformImage(const QImage& input_image);
+  Onnx::ImageData transformImage(const Onnx::ImageData& input_image);
   size_t getLatentSize() const { return 0; } // No latent space
   std::pair<int, int> getOutputSize() const
   {
@@ -150,9 +149,9 @@ public:
   }
 
 private:
-  QImage runTranslation(const QImage& input_image);
-  QImage tensorToImage(const float* data, const std::vector<int64_t>& shape);
-  std::vector<float> imageToTensor(const QImage& image);
+  Onnx::ImageData runTranslation(const Onnx::ImageData& input_image);
+  Onnx::ImageData tensorToImage(const float* data, const std::vector<int64_t>& shape);
+  std::vector<float> imageToTensor(const Onnx::ImageData& image);
 };
 
 // Factory for creating different GAN models

@@ -35,9 +35,24 @@ if(FETCHCONTENT_FULLY_DISCONNECTED)
 endif()
 
 # URLs of the latest release
+# The score build wants the GPU (CUDA) package on Windows/Linux x64 for runtime
+# acceleration. Standalone / portability builds (pd/max/python/dump/...) only need the
+# C++ API to compile and run for introspection -- they have no CUDA toolkit and pulling
+# the multi-hundred-MB gpu_cuda13 archive is pure overhead -- so they take the prebuilt
+# CPU package, exactly like the celtera ml template. AVND_ADDON_SCORE is set by
+# Avendish's AvendishAddon.cmake (1 when building in/against ossia score, 0 standalone).
 set(ONNXRUNTIME_VERSION "1.24.1")
+if(AVND_ADDON_SCORE)
+  set(_ort_gpu 1)
+else()
+  set(_ort_gpu 0)
+endif()
 if(WIN32)
-  set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-win-x64-gpu_cuda13-${ONNXRUNTIME_VERSION}.zip")
+  if(_ort_gpu)
+    set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-win-x64-gpu_cuda13-${ONNXRUNTIME_VERSION}.zip")
+  else()
+    set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-win-x64-${ONNXRUNTIME_VERSION}.zip")
+  endif()
 elseif(APPLE)
   if(CMAKE_OSX_ARCHITECTURES MATCHES ".*x86.*")
     # Last version to support x64 builds
@@ -49,8 +64,10 @@ elseif(APPLE)
 else()
   if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64.*")
     set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-aarch64-${ONNXRUNTIME_VERSION}.tgz")
-  else()
+  elseif(_ort_gpu)
     set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-gpu_cuda13-${ONNXRUNTIME_VERSION}.tgz")
+  else()
+    set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz")
   endif()
 endif()
 
@@ -83,6 +100,18 @@ if(WIN32)
     NO_DEFAULT_PATH
   )
   file(GLOB onnxruntime_DLLS "${onnxruntime_SOURCE_DIR}/lib/*.dll")
+endif()
+
+# The prebuilt runtime shared library/libraries, to bundle into the standalone
+# Max/TouchDesigner/Godot packages (avnd_addon_package SUPPORT). The objects
+# dlopen these at startup and find them relative to their own module (see
+# Onnx/helpers/compat/dylib_loader.hpp get_module_folder()).
+if(APPLE)
+  file(GLOB ONNXRUNTIME_SUPPORT_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dylib")
+elseif(WIN32)
+  file(GLOB ONNXRUNTIME_SUPPORT_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dll")
+else()
+  file(GLOB ONNXRUNTIME_SUPPORT_FILES "${onnxruntime_SOURCE_DIR}/lib/*.so*")
 endif()
 
 find_path(onnxruntime_INCLUDE_DIRS
@@ -128,6 +157,16 @@ target_include_directories(onnxruntime INTERFACE "${onnxruntime_INCLUDE_DIRS}")
 # Good practice: using an alias with :: in the name ensure that
 # we're going to get quick errors if the library is not found
 add_library(onnxruntime::onnxruntime ALIAS onnxruntime)
+
+# In a standalone / portability build the dump + standalone back-end executables link
+# onnxruntime and are run during the build (introspection); make the prebuilt shared
+# library findable through rpath, like the celtera ml template. Score builds bundle
+# onnxruntime themselves (see the install() block above) and set their own rpath, so
+# only do this for the standalone case. Must be set before the targets are created.
+if(NOT AVND_ADDON_SCORE)
+  list(APPEND CMAKE_BUILD_RPATH "${onnxruntime_SOURCE_DIR}/lib")
+  list(APPEND CMAKE_INSTALL_RPATH "${onnxruntime_SOURCE_DIR}/lib")
+endif()
 
 
 if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES AND NOT SCORE_NO_INSTALL_ONNXRUNTIME)

@@ -1,138 +1,81 @@
 #pragma once
-#include <QDebug>
-
+// Qt-free debug helpers: map the ORT enums to human-readable strings. These
+// used to be QDebug operator<< overloads; now they return const char* so the
+// (compiled) standalone objects don't pull in <QDebug>. Callers print with
+// std::fprintf(stderr, ...).
 #include <Onnx/helpers/OnnxBase.hpp>
 
-inline QDebug operator<<(QDebug s, ONNXType t)
+namespace Onnx
+{
+inline const char* to_string(ONNXType t)
 {
   switch (t)
   {
     case ONNX_TYPE_UNKNOWN:
-      return s << "unknown";
+      return "unknown";
     case ONNX_TYPE_TENSOR:
-      return s << "tensor";
+      return "tensor";
     case ONNX_TYPE_SEQUENCE:
-      return s << "sequence";
+      return "sequence";
     case ONNX_TYPE_MAP:
-      return s << "map";
+      return "map";
     case ONNX_TYPE_OPAQUE:
-      return s << "opaque";
+      return "opaque";
     case ONNX_TYPE_SPARSETENSOR:
-      return s << "sparse tensor";
+      return "sparse tensor";
     case ONNX_TYPE_OPTIONAL:
-      return s << "optional";
+      return "optional";
   }
-  return s;
+  return "?";
 }
 
-inline QDebug operator<<(QDebug s, ONNXTensorElementDataType t)
+inline const char* to_string(ONNXTensorElementDataType t)
 {
   switch (t)
   {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED:
-      return s << "UNDEFINED";
+      return "UNDEFINED";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-      return s << "FLOAT"; // maps to c type float
+      return "FLOAT";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
-      return s << "UINT8"; // maps to c type uint8_t
+      return "UINT8";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
-      return s << "INT8"; // maps to c type int8_t
+      return "INT8";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
-      return s << "UINT16"; // maps to c type uint16_t
+      return "UINT16";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
-      return s << "INT16"; // maps to c type int16_t
+      return "INT16";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-      return s << "INT32"; // maps to c type int32_t
+      return "INT32";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-      return s << "INT64"; // maps to c type int64_t
+      return "INT64";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING:
-      return s << "STRING"; // maps to c++ type std::string
+      return "STRING";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
-      return s << "BOOL";
+      return "BOOL";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-      return s << "FLOAT16";
+      return "FLOAT16";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-      return s << "DOUBLE"; // maps to c type double
+      return "DOUBLE";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
-      return s << "UINT32"; // maps to c type uint32_t
+      return "UINT32";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
-      return s << "UINT64"; // maps to c type uint64_t
+      return "UINT64";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64:
-      return s
-             << "COMPLEX64"; // complex with float32 real and imaginary components
+      return "COMPLEX64";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128:
-      return s
-             << "COMPLEX128"; // complex with float64 real and imaginary components
+      return "COMPLEX128";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
-      return s
-             << "BFLOAT16"; // Non-IEEE floating-point format based on IEEE754 single-precision
+      return "BFLOAT16";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
-      return s
-             << "FLOAT8E4M3FN"; // Non-IEEE floating-point format based on IEEE754 single-precision
+      return "FLOAT8E4M3FN";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ:
-      return s
-             << "FLOAT8E4M3FNUZ"; // Non-IEEE floating-point format based on IEEE754 single-precision
+      return "FLOAT8E4M3FNUZ";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2:
-      return s
-             << "FLOAT8E5M2"; // Non-IEEE floating-point format based on IEEE754 single-precision
+      return "FLOAT8E5M2";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ:
-      return s
-             << "FLOAT8E5M2FNUZ"; // Non-IEEE floating-point format based on IEEE754 single-precision
+      return "FLOAT8E5M2FNUZ";
   }
-  return s;
+  return "?";
 }
-
-inline QDebug operator<<(QDebug s, const Ort::ConstTensorTypeAndShapeInfo& t)
-{
-  s << "\n - element type: " << t.GetElementType() << "["
-    << t.GetElementCount() << "]";
-  s << "\n - dimensions: " << t.GetDimensionsCount();
-  s << "\n - shape: " << t.GetShape();
-  return s;
-}
-
-inline QDebug operator<<(QDebug s, const Ort::ConstSequenceTypeInfo& t)
-{
-  s << "\n - element type: " << t.GetSequenceElementType();
-  return s;
-}
-
-inline QDebug operator<<(QDebug s, const Ort::ConstMapTypeInfo& t)
-{
-  s << "\n - element type: " << t.GetMapKeyType() << " -> "
-    << t.GetMapValueType();
-  return s;
-}
-
-inline QDebug operator<<(QDebug s, const Ort::ConstOptionalTypeInfo& t)
-{
-  s << "\n - element type: " << t.GetOptionalElementType();
-  return s;
-}
-
-inline QDebug operator<<(QDebug s, const Ort::ConstTypeInfo& t)
-{
-  switch (t.GetONNXType())
-  {
-    case ONNX_TYPE_UNKNOWN:
-      return s << "unknown";
-    case ONNX_TYPE_TENSOR:
-      return s << "tensor: " << t.GetTensorTypeAndShapeInfo();
-    case ONNX_TYPE_SEQUENCE:
-      return s << "sequence: " << t.GetSequenceTypeInfo();
-    case ONNX_TYPE_MAP:
-      return s << "map: " << t.GetMapTypeInfo();
-    case ONNX_TYPE_OPAQUE:
-      return s << "opaque";
-    case ONNX_TYPE_SPARSETENSOR:
-      return s << "sparse tensor";
-    case ONNX_TYPE_OPTIONAL:
-      return s << "optional: " << t.GetOptionalTypeInfo();
-  }
-  return s;
-}
-
-inline QDebug operator<<(QDebug s, const Ort::TypeInfo& t)
-{
-  return s << t.GetConst();
 }

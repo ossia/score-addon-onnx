@@ -3,19 +3,25 @@
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 
+#include <fstream>
+#include <string>
+
 namespace OnnxModels
 {
 struct Resnet
 {
   // Output format: 1000 float values representing the Imagenet classes.
-  QList<QByteArray> classes;
+  std::vector<std::string> classes;
   Resnet() { }
 
   void loadClasses(std::string_view filePath)
   {
-    QFile f(QString::fromUtf8(filePath.data(), filePath.size()));
-    if (f.open(QIODevice::ReadOnly))
-      classes = f.readAll().split('\n');
+    classes.clear();
+    std::ifstream f{std::string(filePath)};
+    if (!f)
+      return;
+    for (std::string line; std::getline(f, line);)
+      classes.push_back(line);
   }
 
   struct recognition_type
@@ -55,11 +61,11 @@ struct Resnet
       for (int i = 0; i < 5; i++)
       {
         int the_class = idx[i];
-        if (the_class >= 0 && the_class < classes.size())
+        if (the_class >= 0 && the_class < (int)classes.size())
         {
           float value = recog[the_class];
 
-          out.push_back({classes[the_class].toStdString(), value});
+          out.push_back({classes[the_class], value});
         }
       }
     }
@@ -71,9 +77,9 @@ struct EmotionNet
   // Input format: float32[batch_size,3,224,224]
   // Output format: float values representing the emotion classes.
   // tensor: float32[batch_size,8] or ,10 if is_mtl
-  QList<QByteArray> classes_7;
-  QList<QByteArray> classes_8;
-  QList<QByteArray> classes_10;
+  std::vector<std::string> classes_7;
+  std::vector<std::string> classes_8;
+  std::vector<std::string> classes_10;
   EmotionNet()
   {
     classes_7 = {
@@ -129,7 +135,7 @@ struct EmotionNet
       auto& classes = N == 7 ? classes_7 : (N == 8 ? classes_8 : classes_10);
       for (int i = 0; i < std::min(N, 8); i++)
       {
-        out.push_back({classes[i].toStdString(), recog[i]});
+        out.push_back({classes[i], recog[i]});
       }
     }
   }
