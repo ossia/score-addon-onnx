@@ -102,6 +102,18 @@ if(WIN32)
   file(GLOB onnxruntime_DLLS "${onnxruntime_SOURCE_DIR}/lib/*.dll")
 endif()
 
+# The prebuilt runtime shared library/libraries, to bundle into the standalone
+# Max/TouchDesigner/Godot packages (avnd_addon_package SUPPORT). The objects
+# dlopen these at startup and find them relative to their own module (see
+# Onnx/helpers/compat/dylib_loader.hpp get_module_folder()).
+if(APPLE)
+  file(GLOB ONNXRUNTIME_SUPPORT_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dylib")
+elseif(WIN32)
+  file(GLOB ONNXRUNTIME_SUPPORT_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dll")
+else()
+  file(GLOB ONNXRUNTIME_SUPPORT_FILES "${onnxruntime_SOURCE_DIR}/lib/*.so*")
+endif()
+
 find_path(onnxruntime_INCLUDE_DIRS
     NAMES onnxruntime_cxx_api.h
     PATHS "${onnxruntime_SOURCE_DIR}/include"

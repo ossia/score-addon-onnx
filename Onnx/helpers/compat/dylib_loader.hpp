@@ -9,6 +9,12 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+// Declares _NSGetExecutablePath with C linkage. Declaring it ourselves needs a
+// linkage-specification (extern "C"), which is only legal at namespace scope --
+// not inside the get_exe_folder() body -- so use the system header instead.
+#include <mach-o/dyld.h>
+#endif
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -109,7 +115,6 @@ inline std::string get_exe_folder()
 #elif defined(__APPLE__)
   char buf[16384];
   uint32_t size = sizeof(buf);
-  extern int _NSGetExecutablePath(char*, uint32_t*);
   if(_NSGetExecutablePath(buf, &size) == 0)
     path = buf;
 #else
@@ -118,6 +123,43 @@ inline std::string get_exe_folder()
   if(n > 0)
     path.assign(buf, (std::size_t)n);
 #endif
+  auto pos = path.find_last_of("/\\");
+  if(pos != std::string::npos)
+    path.resize(pos);
+  return path;
+}
+
+// ossia::get_module_folder() — the directory of the shared library / plugin that
+// contains THIS code, as opposed to the host executable. When loaded as a Max /
+// TouchDesigner / Godot plugin, get_exe_folder() returns the host app's folder,
+// not the plugin's -- so resources bundled inside the plugin's own package (e.g.
+// libonnxruntime in a support/ or sibling folder) can't be found relative to it.
+// dladdr / GetModuleHandleEx resolve the address of a function back to the module
+// file it lives in. Falls back to get_exe_folder() if resolution fails (e.g. a
+// fully static link, where this code is in the main executable anyway).
+inline std::string get_module_folder()
+{
+  std::string path;
+#if defined(_WIN32)
+  HMODULE hm = nullptr;
+  if(GetModuleHandleExA(
+         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+             | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+         reinterpret_cast<LPCSTR>(&get_module_folder), &hm)
+     != 0)
+  {
+    char buf[32768];
+    DWORD n = GetModuleFileNameA(hm, buf, sizeof(buf));
+    path.assign(buf, n);
+  }
+#else
+  Dl_info info{};
+  if(dladdr(reinterpret_cast<const void*>(&get_module_folder), &info)
+     && info.dli_fname)
+    path = info.dli_fname;
+#endif
+  if(path.empty())
+    return get_exe_folder();
   auto pos = path.find_last_of("/\\");
   if(pos != std::string::npos)
     path.resize(pos);

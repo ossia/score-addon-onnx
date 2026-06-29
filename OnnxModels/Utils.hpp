@@ -28,6 +28,11 @@ public:
       : library{{
 
 #if defined(__linux__)
+            // Bundled next to / near the plugin in its package (Godot bin/<os-arch>/,
+            // etc.) -- resolved relative to this module, not the host executable.
+            ossia::get_module_folder() + "/libonnxruntime.so.1",
+            ossia::get_module_folder() + "/../libonnxruntime.so.1",
+            ossia::get_module_folder() + "/../support/libonnxruntime.so.1",
             "lib/libonnxruntime.so.1",
             "../lib/libonnxruntime.so.1",
             "./_deps/onnxruntime-src/lib/libonnxruntime.so.1",
@@ -41,6 +46,16 @@ public:
                 + "/../_deps/onnxruntime-src/lib/libonnxruntime.so.1",
             "libonnxruntime.so.1",
 #elif defined(__APPLE__)
+            // Bundled inside the plugin's own package, resolved relative to this
+            // module (not the host app): sibling (TouchDesigner Plugins/), one up
+            // (Godot bin/<os-arch>/ next to the .framework), the Max package
+            // support/ (externals/<x>.mxo/Contents/MacOS -> ../../../../support),
+            // or a bundle Frameworks/ folder.
+            ossia::get_module_folder() + "/libonnxruntime.dylib",
+            ossia::get_module_folder() + "/../libonnxruntime.dylib",
+            ossia::get_module_folder()
+                + "/../../../../support/libonnxruntime.dylib",
+            ossia::get_module_folder() + "/../Frameworks/libonnxruntime.dylib",
             "./_deps/onnxruntime-src/lib/libonnxruntime.dylib",
             "../_deps/onnxruntime-src/lib/libonnxruntime.dylib",
             ossia::get_exe_folder() + "/libonnxruntime.dylib",
@@ -53,6 +68,12 @@ public:
             ossia::get_exe_folder() + "/../Frameworks/libonnxruntime.dylib",
             "libonnxruntime.dylib",
 #elif defined(_WIN32)
+            // Bundled next to the plugin .dll/.mxe64 in its package, or in the Max
+            // package support/ folder. The OS loader already searches the module's
+            // own directory for siblings, but probe explicitly via the module path
+            // so it works regardless of how the host loaded us.
+            ossia::get_module_folder() + "/onnxruntime.dll",
+            ossia::get_module_folder() + "/../support/onnxruntime.dll",
             "./_deps/onnxruntime-src/lib/onnxruntime.dll",
             "../_deps/onnxruntime-src/lib/onnxruntime.dll",
             ossia::get_exe_folder() + "/onnxruntime.dll",

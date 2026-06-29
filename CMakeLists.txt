@@ -19,6 +19,23 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# Windows-wide preprocessor defines for the whole addon, before any target, so
+# every object and helper TU is covered (a score build sets these globally; a
+# standalone avnd-addon build does not). No effect off Windows.
+#  - NOMINMAX: <windows.h> (pulled in by onnxruntime, ctx.h and our dylib_loader)
+#    otherwise defines min()/max() as macros, mangling every std::min / std::max /
+#    std::numeric_limits<T>::max() in the onnx C++ objects ("C2589: '(' illegal
+#    token on right side of '::'").
+#  - _USE_MATH_DEFINES: MSVC's <cmath>/<math.h> only define M_PI etc. when this is
+#    set before they are included; ROI.hpp / Trt.hpp / PoseDetector_tracking.cpp
+#    use M_PI ("C2065: 'M_PI': undeclared identifier"). (ctx_overlay sets it on its
+#    own C target too; this covers the C++ objects.)
+if(WIN32)
+  add_compile_definitions(NOMINMAX _USE_MATH_DEFINES)
+endif()
+
+set(AVND_USES_EXCEPTIONS ON CACHE BOOL "" FORCE)
+
 # Use the Avendish the host (ossia score) provides; otherwise fetch it.
 find_package(Avendish QUIET)
 if(NOT Avendish_FOUND)
@@ -26,7 +43,10 @@ if(NOT Avendish_FOUND)
   FetchContent_Declare(
     Avendish
     GIT_REPOSITORY "https://github.com/celtera/avendish"
-    GIT_TAG 525b3f7a9a4499c0a665b08ed8ea62f3822eabcf)
+    # avendish master: provides avnd_addon_package + avnd_create_{max_addon,
+    # touchdesigner,godot}_package used below to bundle libonnxruntime into the
+    # standalone packages.
+    GIT_TAG 6660f3d25924c304e8bf42cae76ab766d23f7dda)
   FetchContent_Populate(Avendish)
   list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
   find_package(Avendish REQUIRED)
@@ -39,28 +59,27 @@ endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rapidlib.cmake")
 
-# onnxruntime-extensions (tokenizers) are only needed by the LLM/VLM objects
-# (QwenLLM, FastVLM). Building it requires the onnxruntime-extensions submodule and
-# its own onnxruntime headers, and its CMake fails to configure outside a full score
-# tree (it errors "required internal CMake variable not set" right after "Tokenizer
-# needed." on the standalone/portability lanes). The bulk of the addon (YOLO*, Pose*,
-# Depth*, Resnet, ENet, GAN, rapidlib regressor/classifier) only needs plain
-# onnxruntime, so gate the extensions subbuild -- and the two objects that depend on
-# it -- behind SCORE_ONNX_ENABLE_EXTENSIONS. It defaults ON in a score build (which
-# keeps CUDA + extensions) and OFF standalone, where only plain-onnxruntime objects
-# are introspected/built. AVND_ADDON_SCORE is set by Avendish's AvendishAddon.cmake.
+# onnxruntime-extensions provides the BPE tokenizer the LLM/VLM objects (QwenLLM,
+# FastVLM) need to turn text into token ids; nothing else in the addon touches it. The
+# token_api_only preset wired below points the subbuild at the prebuilt onnxruntime
+# package via ONNXRUNTIME_PKG_DIR (set from onnxruntime_SOURCE_DIR by
+# cmake/onnxruntime.cmake), so it configures and builds standalone exactly as it does
+# inside a score tree -- verified to produce the fastvlm/qwenllm objects on the
+# standalone lanes. Default it ON so those two objects build everywhere the tokenizer
+# compiles; the rest of the addon (YOLO*, Pose*, Depth*, Resnet, ENet, GAN, rapidlib
+# regressor/classifier) only needs plain onnxruntime and is unaffected by this switch.
+#
+# Windows was previously force-disabled: the upstream extensions did not compile with
+# clang + libc++ (the ossia Windows toolchain), as base/file_sys.h built a std::ifstream
+# from a std::wstring -- an MSVC-STL-only overload (issue #985, now #1071). The submodule
+# now tracks the ossia fork carrying the one-line libc++ fix (filed upstream as
+# microsoft/onnxruntime-extensions#1084), so the Windows guard is gone and the tokenizer
+# objects build on every non-wasm back-end.
 option(SCORE_ONNX_ENABLE_EXTENSIONS
   "Build onnxruntime-extensions (tokenizers) and the LLM/VLM objects that need them"
-  ${AVND_ADDON_SCORE})
-
-# onnxruntime-extensions does not build on Windows here (issue #985); never enable it
-# there even in a score build.
-if(WIN32)
-  set(SCORE_ONNX_ENABLE_EXTENSIONS 0)
-endif()
+  ON)
 
 if(SCORE_ONNX_ENABLE_EXTENSIONS)
-  # disabled due to https://github.com/microsoft/onnxruntime-extensions/issues/985
   set(ENABLE_TESTS 0)
   set(ENABLE_PYTHON 0)
   set(ENABLE_JAVA 0)
@@ -88,6 +107,39 @@ endif()
 
 avnd_addon_init(NAME score_addon_onnx_models)
 
+# C++ standard. Avendish sets cxx_std_23 on its per-object targets, but its
+# standalone base target (avnd_addon_init) gets none -- so it falls to the
+# compiler default (C++17 on the CI gcc-13/14 / Apple Clang lanes). The base
+# compiles the shared helper TUs (GAN.cpp -> Images.hpp/Utilities.hpp), which use
+# std::span, abbreviated-template auto params and range-for-with-init -- all C++20+
+# -- and failed with "'span' is not a member of 'std'" (<span> is empty pre-C++20).
+# Require it explicitly here, PUBLIC so the objects + back-ends stay consistent. A
+# score build is unaffected (it already builds at >= C++23).
+target_compile_features(score_addon_onnx_models PUBLIC cxx_std_23)
+
+# Boost.Container: the decoupled helpers (Images/OnnxBase/Yolo/...) store tensor
+# input in boost::container::vector for its default_init no-zero-fill resize.
+# Avendish already pulls Boost in (find_dependency), but only links Boost::boost
+# onto its per-object targets; the base target compiles the shared helper TUs
+# (GAN.cpp -> Images.hpp -> <boost/container/vector.hpp>) directly, so it needs
+# Boost on its own include path. A score build supplies Boost globally; standalone
+# does not. PUBLIC so it reaches the objects + back-ends, mirroring Eigen below.
+#
+# Do NOT call find_package(Boost) here: the standalone CI forces
+# Boost_NO_BOOST_CMAKE=ON, which routes find_package(Boost) through the removed
+# FindBoost module (CMP0167) and fails to locate Boost >= 1.89 even with BOOST_ROOT
+# set ("Could NOT find Boost: missing Boost_INCLUDE_DIR"). Reuse whatever Avendish /
+# the host already resolved instead.
+if(TARGET Boost::boost)
+  target_link_libraries(score_addon_onnx_models PUBLIC Boost::boost)
+elseif(TARGET Boost::headers)
+  target_link_libraries(score_addon_onnx_models PUBLIC Boost::headers)
+elseif(Boost_INCLUDE_DIRS)
+  target_include_directories(score_addon_onnx_models PUBLIC ${Boost_INCLUDE_DIRS})
+elseif(DEFINED BOOST_ROOT)
+  target_include_directories(score_addon_onnx_models PUBLIC "${BOOST_ROOT}/include")
+endif()
+
 # Eigen: PoseTracker.hpp (the pose_detector object) includes <Eigen/Dense>. A
 # score build provides it globally; standalone resolves it here (header-only).
 # Attached PUBLIC so it propagates through the base to the objects + back-ends.
@@ -110,11 +162,21 @@ else()
   target_include_directories(score_addon_onnx_models PUBLIC "${eigen3onnx_SOURCE_DIR}")
 endif()
 
+# Explicit per-object back-ends (mirroring score-addon-cv). The image objects take
+# a texture input, which has no meaning in Pd -- avendish's Pd binding then fails to
+# compile ("fixed_texture_input has no member 'value'") -- so they target the
+# texture-capable back-ends only. The pure value/control objects (the RapidLib
+# regressor/classifier, the QwenLLM text model) keep Pd. `dump` (the SDK-free target
+# the portability smoke builds) and `ossia` are in both. Ignored in a score build.
+set(ONNX_TEXTURE_BACKENDS dump ossia max touchdesigner:TOP godot:TEXTURE python)        # texture I/O
+set(ONNX_DATA_BACKENDS    dump ossia pd max touchdesigner:CHOP_MESSAGE godot:NODE python) # value I/O
+
 avnd_addon_object(
   BASE score_addon_onnx_models
   C_NAME yolo_blob
   CLASS YOLO7BlobDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/YOLO-blob.hpp
     OnnxModels/YOLO-blob.cpp)
@@ -124,6 +186,7 @@ avnd_addon_object(
   C_NAME yolo_segmentation
   CLASS YOLO8Segmentation
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/YOLO-segmentation.hpp
     OnnxModels/YOLO-segmentation.cpp)
@@ -133,6 +196,7 @@ avnd_addon_object(
   C_NAME resnet
   CLASS ResnetDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/Resnet.hpp
     OnnxModels/Resnet.cpp)
@@ -142,6 +206,7 @@ avnd_addon_object(
   C_NAME enet
   CLASS EmotionNetDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/ENet.hpp
     OnnxModels/ENet.cpp)
@@ -151,6 +216,7 @@ avnd_addon_object(
   C_NAME yolo_pose
   CLASS PoseDetector
   NAMESPACE OnnxModels::Yolo
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/YOLO-pose.hpp
     OnnxModels/YOLO-pose.cpp)
@@ -160,6 +226,7 @@ avnd_addon_object(
   C_NAME blazepose
   CLASS BlazePoseDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/BlazePose.hpp
     OnnxModels/BlazePose.cpp)
@@ -169,6 +236,7 @@ avnd_addon_object(
   C_NAME trtpose
   CLASS TRTPoseDetector
   NAMESPACE OnnxModels::TRTPose
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/TRTPose.hpp
     OnnxModels/TRTPose.cpp)
@@ -178,6 +246,7 @@ avnd_addon_object(
   C_NAME pose_detector
   CLASS PoseDetector
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/PoseDetector.hpp
     OnnxModels/PoseDetector_internal.hpp
@@ -192,6 +261,7 @@ avnd_addon_object(
   C_NAME depthanything2
   CLASS DepthAnythingV2
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/DepthAnything2.hpp
     OnnxModels/DepthAnything2.cpp)
@@ -201,6 +271,7 @@ avnd_addon_object(
   C_NAME regressor
   CLASS Regressor
   NAMESPACE RapidlibModels
+  BACKENDS ${ONNX_DATA_BACKENDS}
   SOURCES
     RapidlibModels/Regressor.hpp
     RapidlibModels/Regressor.cpp)
@@ -210,21 +281,23 @@ avnd_addon_object(
   C_NAME classifier
   CLASS Classifier
   NAMESPACE RapidlibModels
+  BACKENDS ${ONNX_DATA_BACKENDS}
   SOURCES
     RapidlibModels/Classifier.hpp
     RapidlibModels/Classifier.cpp)
 
 
 # FastVLM and QwenLLM are the only objects that #include the onnxruntime-extensions
-# tokenizer headers (Onnx/helpers/TokenIO.hpp etc.), so they can only be built when the
-# extensions subbuild above ran. Standalone/portability builds skip both the subbuild
-# and these objects; the remaining objects compile against plain onnxruntime.
+# tokenizer headers (Onnx/helpers/TokenIO.hpp etc.), so they are built only when the
+# extensions subbuild above ran -- now every non-wasm back-end, score and standalone
+# alike. The remaining objects compile against plain onnxruntime regardless.
 if(SCORE_ONNX_ENABLE_EXTENSIONS)
 avnd_addon_object(
   BASE score_addon_onnx_models
   C_NAME fastvlm
   CLASS FastVLMNode
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/FastVLM.hpp
     OnnxModels/FastVLM.cpp
@@ -236,6 +309,7 @@ avnd_addon_object(
   C_NAME qwenllm
   CLASS QwenLLMNode
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_DATA_BACKENDS}
   SOURCES
     OnnxModels/QwenLLM.hpp
     OnnxModels/QwenLLM.cpp
@@ -248,6 +322,7 @@ avnd_addon_object(
   C_NAME generative_image_gan
   CLASS GenerativeImageGAN
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/GenerativeImageGAN.hpp
     OnnxModels/GenerativeImageGAN.cpp)
@@ -257,6 +332,7 @@ avnd_addon_object(
   C_NAME image_to_image_gan
   CLASS ImageToImageGAN
   NAMESPACE OnnxModels
+  BACKENDS ${ONNX_TEXTURE_BACKENDS}
   SOURCES
     OnnxModels/ImageToImageGAN.hpp
     OnnxModels/ImageToImageGAN.cpp)
@@ -333,6 +409,21 @@ if(WIN32 AND NOT MINGW)
     ${CMAKE_CURRENT_SOURCE_DIR}/Onnx/helpers/msvc-compat)
   # MSVC's <math.h> only defines M_PI etc. when this is set before it is included.
   target_compile_definitions(score_onnx_ctx_overlay PRIVATE _USE_MATH_DEFINES)
+  # Two ctx.h GCC-isms MSVC can't parse are behind #ifndef-guarded config knobs,
+  # so force the portable branches instead of patching the vendored header:
+  #   CTX_FORCE_INLINES (default 1) -> CTX_INLINE = inline __attribute__((always_inline))
+  #   SQUOZE_USE_BUILTIN_CLZ (default 1) -> __builtin_clz()
+  # =0 picks plain `inline` and the manual bit-scan loop. MSVC still inlines at
+  # /O2, and the clz fallback is only on the cold squoze text path -- no rasterizer
+  # perf impact. (CTX_BRANCH_HINTS already defaults to 0, so __builtin_expect is
+  # not compiled; the cpuid asm is behind CTX_X86_64, which is never defined.)
+  target_compile_definitions(score_onnx_ctx_overlay PRIVATE
+    CTX_FORCE_INLINES=0
+    SQUOZE_USE_BUILTIN_CLZ=0)
+  # ctx.h uses GCC's __restrict__ spelling (24 sites, the rasterizer composite
+  # hot path); MSVC spells it __restrict. Map one to the other so the qualifier
+  # (and its alias-optimization hint) survives rather than dropping it.
+  target_compile_definitions(score_onnx_ctx_overlay PRIVATE __restrict__=__restrict)
 endif()
 set_target_properties(score_onnx_ctx_overlay PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
@@ -388,6 +479,9 @@ set(SCORE_ONNX_IMAGEOPS_SRC
     Onnx/helpers/TensorToTexture.cpp)
 add_library(score_onnx_imageops STATIC ${SCORE_ONNX_IMAGEOPS_SRC})
 target_include_directories(score_onnx_imageops PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# Own static lib, so it needs the C++ standard set independently of the base (same
+# C++20+ helper headers, same C++17-default trap on the CI lanes).
+target_compile_features(score_onnx_imageops PRIVATE cxx_std_23)
 set_target_properties(score_onnx_imageops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
   target_compile_options(score_onnx_imageops PRIVATE -O3)
@@ -432,4 +526,21 @@ if(SCORE_ONNX_PROFILE)
   # both TUs.
   target_compile_definitions(score_addon_onnx_models PRIVATE ONNX_PROFILE)
   target_compile_definitions(score_onnx_imageops PRIVATE ONNX_PROFILE)
+endif()
+
+# Standalone distributable packages. Bundle the prebuilt libonnxruntime into the
+# Max / TouchDesigner / Godot packages so every object can dlopen it from beside
+# its own plugin module at runtime (Max support/, TD Plugins/, Godot
+# bin/<os>-<arch>/ -- see Onnx/helpers/compat/dylib_loader.hpp get_module_folder()).
+# avnd_addon_package reads the per-backend externals avnd_make_* registered and
+# assembles one package per backend under <build>/package/<name>/, ready for CI to
+# zip + upload. Ignored in a score build (the host bundles onnxruntime itself) and
+# when building against an Avendish without the packaging helpers.
+if(NOT AVND_ADDON_SCORE AND COMMAND avnd_addon_package)
+  avnd_addon_package(
+    NAME score-addon-onnx
+    SOURCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}"
+    PACKAGE_ROOT "${CMAKE_BINARY_DIR}/package"
+    BACKENDS max touchdesigner godot
+    SUPPORT ${ONNXRUNTIME_SUPPORT_FILES})
 endif()
