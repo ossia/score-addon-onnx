@@ -43,9 +43,10 @@ if(NOT Avendish_FOUND)
   FetchContent_Declare(
     Avendish
     GIT_REPOSITORY "https://github.com/celtera/avendish"
-    # TEMP: validate celtera/avendish#124 (TouchDesigner file/folder/soundfile
-    # control ports). Revert to avendish master once that PR is merged.
-    GIT_TAG 76b9e8d0a61193eeb9fb01ac410c33de689f2ae5)
+    # avendish main @ celtera/avendish#124 merge: TouchDesigner file/folder/
+    # soundfile control ports, the TD RGBA/BGRA input fix, and the Max attribute
+    # default / enum-by-name / enum-inspector fixes.
+    GIT_TAG 4685d4b3bb1e143fd4bc368261316a6d58371d8d)
   FetchContent_Populate(Avendish)
   list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
   find_package(Avendish REQUIRED)
