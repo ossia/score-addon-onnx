@@ -1,8 +1,21 @@
 #pragma once
-// Vendored, self-contained copy of ossia::dylib_loader (from libossia,
-// ossia/detail/dylib_loader.hpp). Used only for standalone builds, where
-// libossia is not on the include path; the score build picks the real header
-// via __has_include in Utils.hpp. Keep API-compatible with ossia.
+// Vendored, self-contained copy of ossia::dylib_loader / ossia::get_exe_folder
+// (from libossia, ossia/detail/dylib_loader.hpp + ossia/detail/thread.hpp).
+//
+// When libossia is on the include path (the score build) we MUST use the real
+// headers: ossia's get_exe_folder() has external linkage (OSSIA_EXPORT, defined
+// in thread.cpp), so redefining it here -- even inline -- yields a
+// "duplicate symbol: ossia::get_exe_folder()" at link time. The vendored copies
+// below are only for standalone back-ends where ossia is unavailable.
+#if __has_include(<ossia/detail/dylib_loader.hpp>)
+#define OSSIA_ONNX_HAS_REAL_OSSIA 1
+#include <ossia/detail/dylib_loader.hpp>
+#include <ossia/detail/thread.hpp>
+#else
+#define OSSIA_ONNX_HAS_REAL_OSSIA 0
+#endif
+
+#if !OSSIA_ONNX_HAS_REAL_OSSIA
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -128,6 +141,8 @@ inline std::string get_exe_folder()
     path.resize(pos);
   return path;
 }
+} // namespace ossia
+#endif // !OSSIA_ONNX_HAS_REAL_OSSIA
 
 // ossia::get_module_folder() — the directory of the shared library / plugin that
 // contains THIS code, as opposed to the host executable. When loaded as a Max /
@@ -137,6 +152,11 @@ inline std::string get_exe_folder()
 // dladdr / GetModuleHandleEx resolve the address of a function back to the module
 // file it lives in. Falls back to get_exe_folder() if resolution fails (e.g. a
 // fully static link, where this code is in the main executable anyway).
+//
+// ossia has no equivalent, so this addon-only helper is defined unconditionally
+// (it never collides with libossia).
+namespace ossia
+{
 inline std::string get_module_folder()
 {
   std::string path;
