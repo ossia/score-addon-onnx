@@ -51,7 +51,7 @@ if(NOT Avendish_FOUND)
     # avendish master: provides avnd_addon_package + avnd_create_{max_addon,
     # touchdesigner,godot}_package used below to bundle libonnxruntime into the
     # standalone packages.
-    GIT_TAG 6660f3d25924c304e8bf42cae76ab766d23f7dda)
+    GIT_TAG 558744dcd18657163a1d6955ed9992188e00e8ad)
   FetchContent_Populate(Avendish)
   list(APPEND CMAKE_PREFIX_PATH "${avendish_SOURCE_DIR}")
   find_package(Avendish REQUIRED)
