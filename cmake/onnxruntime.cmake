@@ -18,6 +18,11 @@ if(OSSIA_USE_SYSTEM_LIBRARIES)
   add_library(onnxruntime INTERFACE)
   add_library(onnxruntime::onnxruntime ALIAS onnxruntime)
 
+  # Even in the distro case we still dlopen
+  # as for instance some distors like debian don't export all the symbols
+  # so at least we can fail gracefully
+  target_compile_definitions(onnxruntime INTERFACE ORT_API_MANUAL_INIT=1)
+
   target_link_libraries(onnxruntime
     INTERFACE
        "${ONNXRUNTIME_LIBRARY}"
