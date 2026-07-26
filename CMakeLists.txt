@@ -1,9 +1,5 @@
 cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 
-if(EMSCRIPTEN)
-  return()
-endif()
-
 # C is needed for the ctx_overlay.c helper static library (see below). A score
 # build enables C via the top-level score project, but a standalone avnd-addon
 # build has no such parent, so enabling it here is required -- otherwise CMake's
@@ -40,6 +36,15 @@ if(WIN32)
 endif()
 
 set(AVND_USES_EXCEPTIONS ON CACHE BOOL "" FORCE)
+
+# Emscripten's toolchain file sets CMAKE_FIND_ROOT_PATH_MODE_PACKAGE to ONLY,
+# which confines find_package to the emscripten sysroot -- so neither the
+# Avendish the host already has nor the FetchContent copy below can ever be
+# found, and the REQUIRED call errors out. Cross-compiling does not change where
+# these CMake packages live; re-allow the normal search for this directory.
+if(CMAKE_CROSSCOMPILING)
+  set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+endif()
 
 # Use the Avendish the host (ossia score) provides; otherwise fetch it.
 find_package(Avendish QUIET)
@@ -83,6 +88,14 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rapidlib.cmake")
 option(SCORE_ONNX_ENABLE_EXTENSIONS
   "Build onnxruntime-extensions (tokenizers) and the LLM/VLM objects that need them"
   ON)
+
+# The extensions subbuild expects a prebuilt onnxruntime package laid out as a
+# shared library plus headers (ONNXRUNTIME_PKG_DIR); the wasm package is a static
+# archive only, and the LLM/VLM objects it enables are the two objects a browser
+# tab has the least business running anyway.
+if(EMSCRIPTEN)
+  set(SCORE_ONNX_ENABLE_EXTENSIONS 0)
+endif()
 
 if(SCORE_ONNX_ENABLE_EXTENSIONS)
   set(ENABLE_TESTS 0)
@@ -500,7 +513,10 @@ target_link_libraries(score_addon_onnx_models ${SCORE_ONNX_HELPER_LINK} score_on
 # (COMPILE_ONLY) -- avoids a second copy on the link line. Standalone, each back-end
 # executable must actually link libonnxruntime, so attach it as a normal PUBLIC dep
 # that propagates through the base to the per-object back-ends.
-if(AVND_ADDON_SCORE)
+#
+# Emscripten is the exception: there is no shared library, the archive is the
+# only copy of onnxruntime in the build, so it has to be linked for real.
+if(AVND_ADDON_SCORE AND NOT EMSCRIPTEN)
   target_link_libraries(score_addon_onnx_models
       PUBLIC
         $<COMPILE_ONLY:onnxruntime::onnxruntime>

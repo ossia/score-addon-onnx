@@ -103,8 +103,14 @@
 	#define LANCIR_NEON
 	#define LANCIR_ALIGN 16
 
-#elif defined( __SSE2__ ) || defined( _M_AMD64 ) || \
-	( defined( _M_IX86_FP ) && _M_IX86_FP == 2 )
+// __wasm_simd128__ is checked first: emscripten builds that ask for the SSE
+// emulation layer (-msse2, as score's wasm configuration does) define __SSE2__
+// too, which would select the SSE2 branch below -- but that branch needs
+// _MM_GET_ROUNDING_MODE / _MM_SET_ROUNDING_MODE, and emscripten does not provide
+// them (wasm has no FP rounding-mode register). The native LANCIR_WASM path
+// below has no such requirement and skips the emulation layer entirely.
+#elif ( defined( __SSE2__ ) || defined( _M_AMD64 ) || \
+	( defined( _M_IX86_FP ) && _M_IX86_FP == 2 )) && !defined( __wasm_simd128__ )
 
 	#if defined( _MSC_VER )
 		#include <intrin.h>
