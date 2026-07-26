@@ -52,7 +52,22 @@ if(AVND_ADDON_SCORE)
 else()
   set(_ort_gpu 0)
 endif()
-if(WIN32)
+# Emscripten. Microsoft publishes no wasm release asset at all: every asset on
+# every onnxruntime release is a native package (win/osx/linux), and the npm
+# onnxruntime-web payload is a finished emscripten MODULE (MODULARIZE=1,
+# EXPORT_NAME=ortWasmThreaded, --no-entry), not an archive another emcc link can
+# consume. The supported way to get onnxruntime into someone else's wasm binary
+# is onnxruntime's own `--build_wasm_static_lib`, which bundles every dependency
+# (protobuf-lite, onnx, re2, mlas, ...) into a single libonnxruntime.a; see
+# https://onnxruntime.ai/docs/build/web.html. Building that from source needs a
+# host protoc and 20-60 min, so take the packaged output of exactly that build
+# from csukuangfj/onnxruntime-libs -- the same prebuilt sherpa-onnx links for its
+# own wasm targets. It is a `-pthread` (+atomics) simd128 build, matching score's
+# wasm configuration.
+if(EMSCRIPTEN)
+  set(ONNXRUNTIME_VERSION "1.24.4")
+  set(ONNXRUNTIME_URL "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-wasm-static_lib-simd-${ONNXRUNTIME_VERSION}.zip")
+elseif(WIN32)
   if(_ort_gpu)
     set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-win-x64-gpu_cuda13-${ONNXRUNTIME_VERSION}.zip")
   else()
@@ -84,10 +99,15 @@ FetchContent_Declare(onnxruntime
 FetchContent_MakeAvailable(onnxruntime)
 
 # Find the .so & header files and put them in CMake variables
+# NO_CMAKE_FIND_ROOT_PATH: a cross-compiling toolchain (emscripten) sets
+# CMAKE_FIND_ROOT_PATH_MODE_LIBRARY/INCLUDE to ONLY, which would re-root these
+# explicit paths into the target sysroot and never find the package we just
+# downloaded. It is a no-op on a native build, where no root path is set.
 find_library(onnxruntime_LIBRARY
     NAMES onnxruntime
     PATHS "${onnxruntime_SOURCE_DIR}/lib"
     NO_DEFAULT_PATH
+    NO_CMAKE_FIND_ROOT_PATH
 )
 
 if(NOT onnxruntime_LIBRARY)
@@ -111,7 +131,9 @@ endif()
 # Max/TouchDesigner/Godot packages (avnd_addon_package SUPPORT). The objects
 # dlopen these at startup and find them relative to their own module (see
 # Onnx/helpers/compat/dylib_loader.hpp get_module_folder()).
-if(APPLE)
+if(EMSCRIPTEN)
+  set(ONNXRUNTIME_SUPPORT_FILES "")
+elseif(APPLE)
   file(GLOB ONNXRUNTIME_SUPPORT_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dylib")
 elseif(WIN32)
   file(GLOB ONNXRUNTIME_SUPPORT_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dll")
@@ -123,6 +145,7 @@ find_path(onnxruntime_INCLUDE_DIRS
     NAMES onnxruntime_cxx_api.h
     PATHS "${onnxruntime_SOURCE_DIR}/include"
     NO_DEFAULT_PATH
+    NO_CMAKE_FIND_ROOT_PATH
 )
 if(NOT onnxruntime_INCLUDE_DIRS)
   if(OSSIA_SDK AND LINUX)
@@ -134,7 +157,11 @@ endif()
 
 # Create an onnxruntime CMake target which will propagate these variables to the targets
 # this target is linked to
-add_library(onnxruntime SHARED IMPORTED)
+if(EMSCRIPTEN)
+  add_library(onnxruntime STATIC IMPORTED)
+else()
+  add_library(onnxruntime SHARED IMPORTED)
+endif()
 
 # Windows needs special handling because here linking to a library requires two files:
 # The .lib and the .dll
@@ -156,7 +183,14 @@ else()
   endforeach()
 endif()
 
-target_compile_definitions(onnxruntime INTERFACE ORT_API_MANUAL_INIT=1)
+# ORT_API_MANUAL_INIT makes the objects reach the C API through a dlopen of the
+# prebuilt shared library (OnnxModels/Utils.hpp libonnxruntime). Emscripten links
+# the static archive straight into the binary and has nothing to dlopen, so leave
+# the definition off there and let initOnnxRuntime() take its "already there"
+# path.
+if(NOT EMSCRIPTEN)
+  target_compile_definitions(onnxruntime INTERFACE ORT_API_MANUAL_INIT=1)
+endif()
 target_include_directories(onnxruntime INTERFACE "${onnxruntime_INCLUDE_DIRS}")
 
 # Good practice: using an alias with :: in the name ensure that
