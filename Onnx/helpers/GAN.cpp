@@ -12,7 +12,7 @@ namespace Onnx
 
 // StyleGAN Model Implementation
 StyleGANModel::StyleGANModel(const GANConfig& config)
-    : env_(ORT_LOGGING_LEVEL_WARNING, "stylegan_model")
+    : env_(Onnx::make_env("stylegan_model"))
     , config_(config)
     , rng_(std::random_device{}())
 {
@@ -163,7 +163,7 @@ Onnx::ImageData StyleGANModel::tensorToImage(
 
 // Single Network GAN Implementation
 SingleNetworkGAN::SingleNetworkGAN(const GANConfig& config)
-    : env_(ORT_LOGGING_LEVEL_WARNING, "single_gan_model")
+    : env_(Onnx::make_env("single_gan_model"))
     , config_(config)
     , rng_(std::random_device{}())
 {
@@ -639,7 +639,7 @@ GANConfig GANFactory::getDeblurGANv2Config(
 
 // Image Translation GAN Implementation (AnimeGANv3)
 ImageTranslationGAN::ImageTranslationGAN(const GANConfig& config)
-    : env_(ORT_LOGGING_LEVEL_WARNING, "image_translation_model")
+    : env_(Onnx::make_env("image_translation_model"))
     , config_(config)
 {
   Onnx::Options oopts;

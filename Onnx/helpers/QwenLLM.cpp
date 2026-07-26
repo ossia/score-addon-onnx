@@ -16,7 +16,7 @@ namespace Onnx
 QwenLLMInference::QwenLLMInference(
     std::string_view modelPath,
     std::string_view tokenizerModelPath)
-    : env(ORT_LOGGING_LEVEL_WARNING, "QwenLLM")
+    : env(Onnx::make_env("QwenLLM"))
 {
   Onnx::Options oopts;
   sessionOptions = Onnx::create_session_options(oopts);

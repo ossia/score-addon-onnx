@@ -79,7 +79,7 @@ FastVLMInference::FastVLMInference(
     std::string_view embedTokensPath,
     std::string_view decoderPath,
     std::string_view tokenizerModelPath)
-    : env(ORT_LOGGING_LEVEL_WARNING, "FastVLMInference")
+    : env(Onnx::make_env("FastVLMInference"))
     , tokenizer(nullptr)
 {
   Onnx::Options oopts;
