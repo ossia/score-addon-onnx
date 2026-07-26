@@ -261,7 +261,7 @@ struct OnnxRunContext
 
   // bytes is not the filename, it is the raw model binary data
   explicit OnnxRunContext(std::string_view bytes)
-      : env(ORT_LOGGING_LEVEL_WARNING, "ossia")
+      : env(make_env("ossia"))
       , session_options(create_session_options(opts))
       , session(env, bytes.data(), bytes.size(), session_options)
   {
