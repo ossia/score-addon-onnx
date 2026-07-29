@@ -46,7 +46,7 @@ endif()
 # the multi-hundred-MB gpu_cuda13 archive is pure overhead -- so they take the prebuilt
 # CPU package, exactly like the celtera ml template. AVND_ADDON_SCORE is set by
 # Avendish's AvendishAddon.cmake (1 when building in/against ossia score, 0 standalone).
-set(ONNXRUNTIME_VERSION "1.24.1")
+set(ONNXRUNTIME_VERSION "1.27.1")
 if(AVND_ADDON_SCORE)
   set(_ort_gpu 1)
 else()
@@ -65,7 +65,7 @@ endif()
 # own wasm targets. It is a `-pthread` (+atomics) simd128 build, matching score's
 # wasm configuration.
 if(EMSCRIPTEN)
-  set(ONNXRUNTIME_VERSION "1.24.4")
+  set(ONNXRUNTIME_VERSION "1.27.1")
   set(ONNXRUNTIME_URL "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-wasm-static_lib-simd-${ONNXRUNTIME_VERSION}.zip")
 elseif(WIN32)
   if(_ort_gpu)
@@ -220,10 +220,33 @@ if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES AND NOT SCORE_NO_IN
   if(APPLE)
     set(SCORE_BUNDLEUTILITIES_DIRS_LIST "${SCORE_BUNDLEUTILITIES_DIRS_LIST};${onnxruntime_SOURCE_DIR}/lib/" CACHE INTERNAL "")
 
+    set(_ort_real "libonnxruntime.${ONNXRUNTIME_VERSION}.dylib")
+    set(_ort_aliases "")
+    set(_ort_install "")
+    foreach(_f IN LISTS ONNXRUNTIME_FILES)
+      get_filename_component(_n "${_f}" NAME)
+      if(_n STREQUAL "${_ort_real}")
+        list(APPEND _ort_install "${_f}")
+      elseif(_n MATCHES "^libonnxruntime(\\.1)?\\.dylib$")
+        list(APPEND _ort_aliases "${_n}")
+      else()
+        list(APPEND _ort_install "${_f}")
+      endif()
+    endforeach()
+
     install(
-      FILES ${ONNXRUNTIME_FILES}
+      FILES ${_ort_install}
       DESTINATION "ossia score.app/Contents/Frameworks"
       COMPONENT OssiaScore)
+
+    foreach(_alias IN LISTS _ort_aliases)
+      install(CODE "
+        set(_dir \"\${CMAKE_INSTALL_PREFIX}/ossia score.app/Contents/Frameworks\")
+        file(REMOVE \"\${_dir}/${_alias}\")
+        execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
+                        \"${_ort_real}\" \"\${_dir}/${_alias}\")
+      " COMPONENT OssiaScore)
+    endforeach()
   elseif(WIN32)
     install(
       FILES ${ONNXRUNTIME_FILES}
