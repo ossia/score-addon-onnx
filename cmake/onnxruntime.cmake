@@ -62,10 +62,22 @@ endif()
 # https://onnxruntime.ai/docs/build/web.html. Building that from source needs a
 # host protoc and 20-60 min, so take the packaged output of exactly that build
 # from csukuangfj/onnxruntime-libs -- the same prebuilt sherpa-onnx links for its
-# own wasm targets. It is a `-pthread` (+atomics) simd128 build, matching score's
-# wasm configuration.
+# own wasm targets. It must be a `-pthread` (+atomics) simd128 build, matching
+# score's wasm configuration.
+#
+# The wasm version is pinned SEPARATELY from the native one, and does not track
+# it: those assets are hand-published, and whether a given one was configured
+# with --enable_wasm_threads varies release to release. v1.27.1 in particular is
+# a NON-threaded build (no object in its libonnxruntime.a carries the `atomics`
+# target feature), so linking it into score's `-pthread` binary fails with
+#   wasm-ld: error: --shared-memory is disallowed by arena.cc.o because it was
+#            not compiled with 'atomics' or 'bulk-memory' features.
+# v1.27.0 is the newest threaded one. Verify any bump before making it: unzip the
+# asset and check that `atomics` appears in lib/libonnxruntime.a -- the guard
+# below does the same at configure time, so a bad bump degrades to "no onnx in
+# the browser" instead of a broken wasm build, but it is still worth checking.
 if(EMSCRIPTEN)
-  set(ONNXRUNTIME_VERSION "1.27.1")
+  set(ONNXRUNTIME_VERSION "1.27.0")
   set(ONNXRUNTIME_URL "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-wasm-static_lib-simd-${ONNXRUNTIME_VERSION}.zip")
 elseif(WIN32)
   if(_ort_gpu)
@@ -115,6 +127,36 @@ if(NOT onnxruntime_LIBRARY)
     set(onnxruntime_LIBRARY "${onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so")
   else()
     message(FATAL_ERROR "Could not find onnxruntime library")
+  endif()
+endif()
+
+# score's wasm binary is linked with -pthread, which implies --shared-memory, and
+# wasm-ld refuses shared memory as soon as ONE input object lacks the `atomics`
+# target feature. The prebuilt archives are hand-published and have shipped both
+# threaded and non-threaded (see the version note above), and a non-threaded one
+# only surfaces at the very end of the build, as a link error in the final
+# executable -- an hour in, with nothing to show for it. Detect it here instead
+# and disable the addon: the browser build loses the onnx objects, everything
+# else still links.
+#
+# The check reads the archive the way strings(1) would: each entry of a wasm
+# object's `target_features` section is a length-prefixed name whose length byte
+# (0x07 for "atomics") is non-printable, so every feature name lands in a run of
+# its own, and matching it exactly cannot collide with a mangled symbol.
+if(EMSCRIPTEN)
+  file(STRINGS "${onnxruntime_LIBRARY}" _ort_wasm_atomics
+    REGEX "^atomics$"
+    LENGTH_MINIMUM 7
+    LENGTH_MAXIMUM 7
+    LIMIT_COUNT 1)
+
+  if(NOT _ort_wasm_atomics)
+    message(WARNING
+      "onnxruntime ${ONNXRUNTIME_VERSION} for wasm was built WITHOUT threads "
+      "(no 'atomics' target feature in ${onnxruntime_LIBRARY}); it cannot be "
+      "linked into score's -pthread build. Disabling score-addon-onnx. Pin "
+      "ONNXRUNTIME_VERSION in cmake/onnxruntime.cmake to a threaded release.")
+    return()
   endif()
 endif()
 
