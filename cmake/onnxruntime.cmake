@@ -61,24 +61,24 @@ endif()
 # (protobuf-lite, onnx, re2, mlas, ...) into a single libonnxruntime.a; see
 # https://onnxruntime.ai/docs/build/web.html. Building that from source needs a
 # host protoc and 20-60 min, so take the packaged output of exactly that build
-# from csukuangfj/onnxruntime-libs -- the same prebuilt sherpa-onnx links for its
-# own wasm targets. It must be a `-pthread` (+atomics) simd128 build, matching
-# score's wasm configuration.
+# from ossia/sdk, which produces one per release with the same emscripten the
+# rest of the wasm build uses.
 #
-# The wasm version is pinned SEPARATELY from the native one, and does not track
-# it: those assets are hand-published, and whether a given one was configured
-# with --enable_wasm_threads varies release to release. v1.27.1 in particular is
-# a NON-threaded build (no object in its libonnxruntime.a carries the `atomics`
-# target feature), so linking it into score's `-pthread` binary fails with
-#   wasm-ld: error: --shared-memory is disallowed by arena.cc.o because it was
-#            not compiled with 'atomics' or 'bulk-memory' features.
-# v1.27.0 is the newest threaded one. Verify any bump before making it: unzip the
-# asset and check that `atomics` appears in lib/libonnxruntime.a -- the guard
-# below does the same at configure time, so a bad bump degrades to "no onnx in
-# the browser" instead of a broken wasm build, but it is still worth checking.
+# The hand-published csukuangfj assets used before cannot serve here: they are
+# legacy-EH, so they leave __resumeException undefined against score's
+# -fwasm-exceptions/-sJSPI link, and whether a given one was configured with
+# --enable_wasm_threads varies release to release (v1.27.1 is NON-threaded,
+# which the guard below still checks for).
+#
+# The wasm version is pinned SEPARATELY from the native one. Every plugin that
+# needs onnxruntime for wasm fetches this same archive under the same
+# FetchContent name, so whichever is configured first provides it for the rest
+# and they have to agree on the version: keep this in sync with
+# sat-mtl/sherpa-plugins.
 if(EMSCRIPTEN)
   set(ONNXRUNTIME_VERSION "1.27.0")
-  set(ONNXRUNTIME_URL "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-wasm-static_lib-simd-${ONNXRUNTIME_VERSION}.zip")
+  set(OSSIA_SDK_RELEASE "sdk38" CACHE STRING "ossia/sdk release carrying the wasm onnxruntime")
+  set(ONNXRUNTIME_URL "https://github.com/ossia/sdk/releases/download/${OSSIA_SDK_RELEASE}/onnxruntime-${ONNXRUNTIME_VERSION}-wasm.tar.xz")
 elseif(WIN32)
   if(_ort_gpu)
     set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-win-x64-gpu_cuda13-${ONNXRUNTIME_VERSION}.zip")
