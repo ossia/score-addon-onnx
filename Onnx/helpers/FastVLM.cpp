@@ -19,7 +19,6 @@
 #include <array>
 #include <cstring>
 #include <filesystem>
-#include <iostream>
 #include <numeric>
 #include <random>
 #include <span>
@@ -34,20 +33,10 @@ struct FastVLMTokenizerConstants
   static constexpr int EOS_TOKEN_ID = 151645;
   static constexpr int IMAGE_TOKEN_INDEX
       = 151646; // <image> token from tokenizer config
-  static constexpr int IGNORE_INDEX
-      = -100; // For labels to ignore during training
-  static constexpr int IM_START_TOKEN_ID = 151644;
-  static constexpr int IM_END_TOKEN_ID = 151645;
   static constexpr int MAX_LENGTH = 8192;
-  static constexpr int VOCAB_SIZE = 151646;
-  static constexpr int HIDDEN_SIZE = 896;
-  static constexpr int MM_HIDDEN_SIZE = 3072;
 
   // String tokens
   static inline const std::string DEFAULT_IMAGE_TOKEN = "<image>";
-  static inline const std::string DEFAULT_IM_START_TOKEN = "<im_start>";
-  static inline const std::string DEFAULT_IM_END_TOKEN = "<im_end>";
-  static inline const std::string IMAGE_PLACEHOLDER = "<image-placeholder>";
 };
 
 static Onnx::FloatTensor preprocessImageForFastVLM(
@@ -72,6 +61,51 @@ static Onnx::FloatTensor preprocessImageForFastVLM(
       tensorValues,
       mean,
       std);
+}
+
+static std::size_t tensorElementSize(ONNXTensorElementDataType t)
+{
+  switch (t)
+  {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      return 2;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      return 4;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      return 8;
+    default:
+      throw std::runtime_error(
+          fmt::format("FastVLM: unsupported tensor element type {}", (int)t));
+  }
+}
+
+// Read a float or float16 tensor into a flat fp32 vector.
+static std::vector<float> tensorToFloats(const Ort::Value& v)
+{
+  auto info = v.GetTensorTypeAndShapeInfo();
+  const std::size_t n = info.GetElementCount();
+  std::vector<float> out(n);
+  switch (info.GetElementType())
+  {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: {
+      const auto* d = v.GetTensorData<Ort::Float16_t>();
+      for (std::size_t i = 0; i < n; ++i)
+        out[i] = d[i].ToFloat();
+      break;
+    }
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: {
+      const auto* d = v.GetTensorData<float>();
+      std::copy_n(d, n, out.begin());
+      break;
+    }
+    default:
+      throw std::runtime_error(
+          fmt::format(
+              "FastVLM: unsupported output element type {}",
+              (int)info.GetElementType()));
+  }
+  return out;
 }
 
 FastVLMInference::FastVLMInference(
@@ -113,12 +147,12 @@ FastVLMInference::FastVLMInference(
     auto model2_str = decoderPath;
 #endif
     // Load separate ONNX models from onnx/ directory
-    visionEncoderSession = std::make_unique<Ort::Session>(
-        env, model0_str.data(), sessionOptions);
-    embedTokensSession = std::make_unique<Ort::Session>(
-        env, model1_str.data(), sessionOptions);
-    decoderSession = std::make_unique<Ort::Session>(
-        env, model2_str.data(), sessionOptions);
+    visionEncoderSession
+        = create_session_with_fallback(env, model0_str, sessionOptions);
+    embedTokensSession
+        = create_session_with_fallback(env, model1_str, sessionOptions);
+    decoderSession
+        = create_session_with_fallback(env, model2_str, sessionOptions);
 
     if (tokenizerModelPath.ends_with("tokenizer.json"))
       tokenizerModelPath = tokenizerModelPath.substr(
@@ -153,6 +187,59 @@ FastVLMInference::FastVLMInference(
           decoderSession->GetOutputNameAllocated(i, allocator).get());
       decoderOutputNamePtrs.push_back(decoderOutputNames.back().c_str());
     }
+
+    // Discover the decoder graph properties this export variant was built
+    // with. Inputs are inputs_embeds, attention_mask, position_ids, then
+    // (past_key_values.N.key, past_key_values.N.value) per layer.
+    const std::size_t nIn = decoderSession->GetInputCount();
+    numLayers = nIn >= 3 ? int((nIn - 3) / 2) : 0;
+    if (numLayers <= 0)
+      throw std::runtime_error(
+          fmt::format(
+              "Unexpected decoder input count: {} (not a merged FastVLM "
+              "decoder?)",
+              nIn));
+    keyCache.assign(numLayers, {});
+    valueCache.assign(numLayers, {});
+    cacheShapes.assign(numLayers, {});
+
+    for (std::size_t i = 0; i < nIn; ++i)
+    {
+      // Keep the TypeInfo alive: GetTensorTypeAndShapeInfo() is a view on it.
+      const auto typeInfo = decoderSession->GetInputTypeInfo(i);
+      const auto info = typeInfo.GetTensorTypeAndShapeInfo();
+      if (decoderInputNames[i] == "inputs_embeds")
+      {
+        embedsType = info.GetElementType();
+        if (const auto sh = info.GetShape(); sh.size() == 3 && sh[2] > 0)
+          hiddenSize = sh[2];
+      }
+      else if (decoderInputNames[i] == "past_key_values.0.key")
+      {
+        // Shape is [batch, kv_heads, past_seq_len, head_dim]; batch and
+        // past_seq_len are symbolic (-1), the others are concrete.
+        kvType = info.GetElementType();
+        if (const auto sh = info.GetShape(); sh.size() == 4)
+        {
+          if (sh[1] > 0)
+            kvHeads = sh[1];
+          if (sh[3] > 0)
+            headDim = sh[3];
+        }
+      }
+    }
+
+    {
+      const auto visionTypeInfo = visionEncoderSession->GetInputTypeInfo(0);
+      visionInputType
+          = visionTypeInfo.GetTensorTypeAndShapeInfo().GetElementType();
+
+      const auto embedTypeInfo = embedTokensSession->GetOutputTypeInfo(0);
+      if (const auto sh
+          = embedTypeInfo.GetTensorTypeAndShapeInfo().GetShape();
+          sh.size() == 3 && sh[2] > 0)
+        hiddenSize = sh[2];
+    }
   }
   catch (const Ort::Exception& e)
   {
@@ -172,7 +259,8 @@ FastVLMInference::~FastVLMInference()
 std::string FastVLMInference::generateResponse(
     const Onnx::ImageData& image,
     const std::string& prompt,
-    float temperature)
+    float temperature,
+    int maxTokens)
 {
   try
   {
@@ -197,9 +285,11 @@ std::string FastVLMInference::generateResponse(
     auto multimodalEmbeddings
         = createMultimodalEmbeddings(tokenIds, imageFeatures);
 
+    maxTokens = std::clamp(maxTokens, 1, FastVLMTokenizerConstants::MAX_LENGTH);
+
     // Generate tokens using our working ONNX decoder with temperature sampling
     auto generatedTokens
-        = generateWithONNXDecoder(multimodalEmbeddings, 500, temperature);
+        = generateWithONNXDecoder(multimodalEmbeddings, maxTokens, temperature);
 
     // Step 6: Decode the generated tokens
     std::string response = decodeTokens(generatedTokens);
@@ -224,7 +314,7 @@ std::string FastVLMInference::generateResponse(
   catch (const std::exception& e)
   {
     throw std::runtime_error(
-        fmt::format("Manual multimodal inference failed: {}", e.what()));
+        fmt::format("Multimodal inference failed: {}", e.what()));
   }
 }
 
@@ -237,12 +327,29 @@ FastVLMInference::runVisionEncoder(std::span<float> imageData, int w, int h)
         = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
     std::vector<int64_t> inputShape = {1, 3, h, w};
-    auto inputTensor = Ort::Value::CreateTensor<float>(
-        memoryInfo,
-        const_cast<float*>(imageData.data()),
-        imageData.size(),
-        inputShape.data(),
-        inputShape.size());
+
+    Ort::Value inputTensor{nullptr};
+    if (visionInputType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+    {
+      reusableF16Scratch.resize(imageData.size());
+      for (std::size_t i = 0; i < imageData.size(); ++i)
+        reusableF16Scratch[i] = Ort::Float16_t(imageData[i]);
+      inputTensor = Ort::Value::CreateTensor<Ort::Float16_t>(
+          memoryInfo,
+          reusableF16Scratch.data(),
+          reusableF16Scratch.size(),
+          inputShape.data(),
+          inputShape.size());
+    }
+    else
+    {
+      inputTensor = Ort::Value::CreateTensor<float>(
+          memoryInfo,
+          const_cast<float*>(imageData.data()),
+          imageData.size(),
+          inputShape.data(),
+          inputShape.size());
+    }
 
     auto inputName = visionEncoderSession->GetInputNameAllocated(0, allocator);
     auto outputName
@@ -254,15 +361,7 @@ FastVLMInference::runVisionEncoder(std::span<float> imageData, int w, int h)
     auto outputs = visionEncoderSession->Run(
         Ort::RunOptions{nullptr}, inputNames, &inputTensor, 1, outputNames, 1);
 
-    auto outputTensor = outputs[0].GetTensorMutableData<float>();
-    auto outputShape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
-    size_t outputSize = std::accumulate(
-        outputShape.begin(),
-        outputShape.end(),
-        1ULL,
-        std::multiplies<size_t>());
-
-    return std::vector<float>(outputTensor, outputTensor + outputSize);
+    return tensorToFloats(outputs[0]);
   }
   catch (const Ort::Exception& e)
   {
@@ -297,15 +396,7 @@ FastVLMInference::runEmbedTokens(std::span<int64_t> tokenIds)
     auto outputs = embedTokensSession->Run(
         Ort::RunOptions{nullptr}, inputNames, &inputTensor, 1, outputNames, 1);
 
-    auto outputTensor = outputs[0].GetTensorMutableData<float>();
-    auto outputShape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
-    size_t outputSize = std::accumulate(
-        outputShape.begin(),
-        outputShape.end(),
-        1ULL,
-        std::multiplies<size_t>());
-
-    return std::vector<float>(outputTensor, outputTensor + outputSize);
+    return tensorToFloats(outputs[0]);
   }
   catch (const Ort::Exception& e)
   {
@@ -470,18 +561,30 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
 {
   try
   {
-    const size_t hiddenSize = FastVLMTokenizerConstants::HIDDEN_SIZE; // 896
-    const size_t imagePatchCount = 256; // Vision encoder outputs [1, 256, 896]
-
     std::vector<float> multimodalEmbeddings;
     multimodalEmbeddings.reserve(
-        (tokenIds.size() - 1 + imagePatchCount) * hiddenSize);
+        tokenIds.size() * hiddenSize + imageFeatures.size());
 
-    for (size_t i = 0; i < tokenIds.size(); ++i)
+    // Embed the text in contiguous segments (one embed_tokens run per
+    // segment instead of one per token), splicing the image features in
+    // place of each image token.
+    std::vector<int64_t> segment;
+    segment.reserve(tokenIds.size());
+    auto flushSegment = [&]
     {
-      if (tokenIds[i] == FastVLMTokenizerConstants::IMAGE_TOKEN_INDEX)
+      if (segment.empty())
+        return;
+      auto emb = runEmbedTokens(segment);
+      multimodalEmbeddings.insert(
+          multimodalEmbeddings.end(), emb.begin(), emb.end());
+      segment.clear();
+    };
+
+    for (int64_t id : tokenIds)
+    {
+      if (id == FastVLMTokenizerConstants::IMAGE_TOKEN_INDEX)
       {
-        // Replace single image token with 256 patch embeddings
+        flushSegment();
         multimodalEmbeddings.insert(
             multimodalEmbeddings.end(),
             imageFeatures.begin(),
@@ -489,17 +592,10 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
       }
       else
       {
-        // Process individual text token through embedding
-        std::vector<int64_t> singleToken = {tokenIds[i]};
-        auto tokenEmbedding = runEmbedTokens(singleToken);
-
-        // Add the token embedding (should be hiddenSize values)
-        multimodalEmbeddings.insert(
-            multimodalEmbeddings.end(),
-            tokenEmbedding.begin(),
-            tokenEmbedding.end());
+        segment.push_back(id);
       }
     }
+    flushSegment();
 
     return multimodalEmbeddings;
   }
@@ -517,19 +613,30 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
 {
   try
   {
-    const size_t hiddenSize = FastVLMTokenizerConstants::HIDDEN_SIZE; // 896
     const size_t seqLen = embeddings.size() / hiddenSize;
 
-    // Use CPU memory but optimize other aspects for RTX 3090 performance
     auto memoryInfo
         = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
+    // The decoder may want fp32 or fp16 inputs_embeds depending on the
+    // export; our pipeline-internal representation is fp32.
     auto createEmbedsTensor
-        = [&memoryInfo](
-              std::span<float> embeds, size_t seqLen, size_t hiddenSize)
+        = [&memoryInfo, this](std::span<float> embeds, size_t seqLen)
     {
-      std::vector<int64_t> shape = {
-          1, static_cast<int64_t>(seqLen), static_cast<int64_t>(hiddenSize)};
+      std::vector<int64_t> shape
+          = {1, static_cast<int64_t>(seqLen), hiddenSize};
+      if (embedsType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+      {
+        reusableF16Scratch.resize(embeds.size());
+        for (std::size_t i = 0; i < embeds.size(); ++i)
+          reusableF16Scratch[i] = Ort::Float16_t(embeds[i]);
+        return Ort::Value::CreateTensor<Ort::Float16_t>(
+            memoryInfo,
+            reusableF16Scratch.data(),
+            reusableF16Scratch.size(),
+            shape.data(),
+            shape.size());
+      }
       return Ort::Value::CreateTensor<float>(
           memoryInfo,
           const_cast<float*>(embeds.data()),
@@ -562,19 +669,23 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
           shape.size());
     };
 
-    auto createKVCacheTensor = [&memoryInfo](
-                                   const std::vector<Ort::Float16_t>& cache,
+    // KV cache tensors are created in the decoder's own dtype straight over
+    // the raw cache bytes.
+    auto createKVCacheTensor = [&memoryInfo, this](
+                                   std::vector<std::byte>& cache,
                                    const std::vector<int64_t>& shape)
     {
-      return Ort::Value::CreateTensor<Ort::Float16_t>(
+      return Ort::Value::CreateTensor(
           memoryInfo,
-          const_cast<Ort::Float16_t*>(cache.data()),
+          cache.data(),
           cache.size(),
           shape.data(),
-          shape.size());
+          shape.size(),
+          kvType);
     };
+
     // Create initial tensors using helper functions
-    auto embedsTensor = createEmbedsTensor(embeddings, seqLen, hiddenSize);
+    auto embedsTensor = createEmbedsTensor(embeddings, seqLen);
     auto attentionTensor = createAttentionTensor(seqLen);
 
     reusablePositionIds.resize(seqLen);
@@ -587,10 +698,10 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
     inputs.push_back(std::move(attentionTensor));
     inputs.push_back(std::move(positionTensor));
 
-    // Create empty KV cache tensors for all 24 layers (float16 as expected by decoder)
-    std::vector<Ort::Float16_t> emptyCache;
-    std::vector<int64_t> emptyCacheShape = {1, 2, 0, 64};
-    for (int layer = 0; layer < 24; ++layer)
+    // Create empty KV cache tensors for every layer
+    std::vector<std::byte> emptyCache;
+    std::vector<int64_t> emptyCacheShape = {1, kvHeads, 0, headDim};
+    for (int layer = 0; layer < numLayers; ++layer)
     {
       inputs.push_back(createKVCacheTensor(emptyCache, emptyCacheShape));
       inputs.push_back(createKVCacheTensor(emptyCache, emptyCacheShape));
@@ -614,15 +725,31 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
     static thread_local std::random_device rd;
     static thread_local std::mt19937 gen(rd());
 
-    // Temperature-based token sampling function
+    // Temperature-based token sampling function; logits may be fp32 or fp16.
+    std::vector<float> logitsRow;
     auto sampleToken
-        = [temperature](
+        = [temperature, &logitsRow](
               const Ort::Value& logitsTensor) -> std::pair<int64_t, float>
     {
-      auto logitsShape = logitsTensor.GetTensorTypeAndShapeInfo().GetShape();
-      auto* logitsData = logitsTensor.GetTensorData<float>();
+      auto info = logitsTensor.GetTensorTypeAndShapeInfo();
+      auto logitsShape = info.GetShape();
       size_t vocabSize = logitsShape[2];
       size_t lastPos = (logitsShape[1] - 1) * vocabSize;
+
+      const float* logitsData;
+      if (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+      {
+        const auto* d = logitsTensor.GetTensorData<Ort::Float16_t>();
+        logitsRow.resize(vocabSize);
+        for (size_t i = 0; i < vocabSize; ++i)
+          logitsRow[i] = d[lastPos + i].ToFloat();
+        logitsData = logitsRow.data();
+        lastPos = 0;
+      }
+      else
+      {
+        logitsData = logitsTensor.GetTensorData<float>();
+      }
 
       if (temperature <= 0.0f)
       {
@@ -671,6 +798,29 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
           logitsData[lastPos + sampledToken]};
     };
 
+    // Copy the present.* outputs into the byte-level KV cache.
+    const std::size_t kvElemSize = tensorElementSize(kvType);
+    auto storeKVCache = [this, kvElemSize](std::vector<Ort::Value>& outs)
+    {
+      for (int layer = 0; layer < numLayers; ++layer)
+      {
+        auto& keyTensor = outs[1 + layer * 2]; // present.{layer}.key
+        const auto keyInfo = keyTensor.GetTensorTypeAndShapeInfo();
+        const auto keyShape = keyInfo.GetShape();
+        const std::size_t bytes = keyInfo.GetElementCount() * kvElemSize;
+
+        const auto* keyData
+            = static_cast<const std::byte*>(keyTensor.GetTensorRawData());
+        keyCache[layer].assign(keyData, keyData + bytes);
+        cacheShapes[layer].assign(keyShape.begin(), keyShape.end());
+
+        auto& valueTensor = outs[1 + layer * 2 + 1]; // present.{layer}.value
+        const auto* valueData
+            = static_cast<const std::byte*>(valueTensor.GetTensorRawData());
+        valueCache[layer].assign(valueData, valueData + bytes);
+      }
+    };
+
     auto [bestToken, maxLogit] = sampleToken(outputs[0]);
 
     // Store the generated tokens
@@ -683,22 +833,7 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
     }
 
     // Store KV cache from first generation step
-    for (int layer = 0; layer < 24; ++layer)
-    {
-      // Extract key cache
-      auto& keyTensor = outputs[1 + layer * 2]; // present.{layer}.key
-      auto keyShape = keyTensor.GetTensorTypeAndShapeInfo().GetShape();
-      auto* keyData = keyTensor.GetTensorData<Ort::Float16_t>();
-      size_t keySize = keyShape[0] * keyShape[1] * keyShape[2] * keyShape[3];
-      keyCache[layer].assign(keyData, keyData + keySize);
-      cacheShapes[layer]
-          = {keyShape[0], keyShape[1], keyShape[2], keyShape[3]};
-
-      // Extract value cache
-      auto& valueTensor = outputs[1 + layer * 2 + 1]; // present.{layer}.value
-      auto* valueData = valueTensor.GetTensorData<Ort::Float16_t>();
-      valueCache[layer].assign(valueData, valueData + keySize);
-    }
+    storeKVCache(outputs);
 
     // Continue generation for remaining tokens
     for (int step = 1; step < maxTokens; ++step)
@@ -710,7 +845,7 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
       std::vector<Ort::Value>& nextInputs = inputs;
       nextInputs.clear();
 
-      nextInputs.push_back(createEmbedsTensor(tokenEmbedding, 1, hiddenSize));
+      nextInputs.push_back(createEmbedsTensor(tokenEmbedding, 1));
 
       size_t currentSeqLen = seqLen + step;
       nextInputs.push_back(createAttentionTensor(currentSeqLen));
@@ -720,7 +855,7 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
       nextInputs.push_back(createPositionTensor());
 
       // Add KV cache from previous step
-      for (int layer = 0; layer < 24; ++layer)
+      for (int layer = 0; layer < numLayers; ++layer)
       {
         nextInputs.push_back(
             createKVCacheTensor(keyCache[layer], cacheShapes[layer]));
@@ -750,32 +885,14 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
       }
 
       // Update KV cache for next iteration
-      for (int layer = 0; layer < 24; ++layer)
-      {
-        auto& keyTensor = nextOutputs[1 + layer * 2];
-        auto keyShape = keyTensor.GetTensorTypeAndShapeInfo().GetShape();
-        auto* keyData = keyTensor.GetTensorData<Ort::Float16_t>();
-        size_t keySize = keyShape[0] * keyShape[1] * keyShape[2] * keyShape[3];
-        keyCache[layer].assign(keyData, keyData + keySize);
-        cacheShapes[layer].assign(keyShape.data(), keyShape.data() + 4);
-
-        auto& valueTensor = nextOutputs[1 + layer * 2 + 1];
-        auto* valueData = valueTensor.GetTensorData<Ort::Float16_t>();
-        valueCache[layer].assign(valueData, valueData + keySize);
-      }
+      storeKVCache(nextOutputs);
     }
 
     return generatedTokens;
   }
   catch (const Ort::Exception& e)
   {
-    std::cout << fmt::format("ONNX decoder error: {}\n", e.what());
-    return {};
-  }
-  catch (const std::exception& e)
-  {
-    std::cout << fmt::format("Generation error: {}\n", e.what());
-    return {};
+    throw std::runtime_error(fmt::format("ONNX decoder error: {}", e.what()));
   }
 }
 }

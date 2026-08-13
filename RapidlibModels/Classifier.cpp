@@ -25,20 +25,42 @@ void Classifier::operator()()
 
   if (inputs.record)
   {
-    rapidLib::trainingExample ex;
-    ex.input = inputs.input.value;
-    ex.output.reserve(inputs.parameters_i.ports.size());
-    for (auto& port : inputs.parameters_i.ports)
+    // An example needs a non-empty feature vector, and every example must
+    // agree on input & output arity: rapidLib's train() throws otherwise.
+    auto& in = inputs.input.value;
+    const bool arity_ok
+        = !in.empty()
+          && (m_trainingSet.empty()
+              || (in.size() == m_trainingSet[0].input.size()
+                  && inputs.parameters_i.ports.size()
+                         == m_trainingSet[0].output.size()));
+    if (arity_ok)
     {
-      ex.output.push_back(port.value);
+      rapidLib::trainingExample ex;
+      ex.input = in;
+      ex.output.reserve(inputs.parameters_i.ports.size());
+      for (auto& port : inputs.parameters_i.ports)
+      {
+        ex.output.push_back(port.value);
+      }
+      m_trainingSet.push_back(std::move(ex));
     }
-    m_trainingSet.push_back(std::move(ex));
   }
 
-  if (inputs.train)
+  if (inputs.train && !m_trainingSet.empty())
   {
-    m_trained = m_model.train(m_trainingSet);
+    try
+    {
+      m_trained = m_model.train(m_trainingSet);
+      m_numInputs = m_trainingSet[0].input.size();
+    }
+    catch (...)
+    {
+      m_trained = false;
+    }
   }
+
+  outputs.examples.value = m_trainingSet.size();
 
   if (inputs.mode == Mode::Test)
   {
@@ -50,7 +72,14 @@ void Classifier::operator()()
   }
   else
   {
-    if (m_trained)
+    // rapidLib::modelSet::run() throws on input arity mismatch, so only
+    // run the model on inputs shaped like the ones it was trained with;
+    // a transient arity mismatch keeps the last good classification.
+    if (!m_trained)
+    {
+      outputs.output.value.clear();
+    }
+    else if (inputs.input.value.size() == m_numInputs)
     {
       outputs.output.value = m_model.run(inputs.input.value);
       if (std::any_of(

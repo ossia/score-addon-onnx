@@ -4,6 +4,7 @@
 #include <ortx_tokenizer.h>
 #include <ortx_utils.h>
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <span>
@@ -12,6 +13,17 @@
 
 namespace Onnx
 {
+// Runs a decoder-only chat model exported by transformers.js / optimum
+// (onnx-community/*-ONNX) or onnxruntime-genai: inputs are input_ids,
+// attention_mask, optionally position_ids, and one (key, value) pair per
+// layer. The graph geometry (layer count, KV heads, head dimension) and the
+// KV cache dtype (fp16 or fp32, which varies per model *and* per
+// quantization variant) are read from the model at load time; the chat
+// template comes from the tokenizer directory (tokenizer_config.json /
+// chat_template.jinja, applied through onnxruntime-extensions' Jinja
+// engine) and the stop tokens from generation_config.json / config.json,
+// falling back to Qwen's ChatML conventions when absent. Generation is
+// KV-cached: the prompt is prefilled once, then one token per step.
 class QwenLLMInference
 {
 public:
@@ -40,18 +52,21 @@ private:
   std::vector<int64_t> tokenize(const std::string& text) const;
   std::string decodeToken(int64_t tokenId) const;
   std::string decodeTokens(std::span<int64_t> tokens) const;
-  
+
   int64_t sampleToken(
       std::span<float> logits,
       float temperature,
       float topP,
       int topK);
 
-  std::vector<float> runModel(
-      std::span<int64_t> inputIds,
-      std::span<int64_t> attentionMask,
-      std::span<std::vector<Ort::Float16_t>> pastKeyValues,
-      std::vector<std::vector<Ort::Float16_t>>& newKeyValues);
+  // Runs the shared generation loop; onToken returns false to stop early.
+  void generateLoop(
+      const std::string& prompt,
+      int maxTokens,
+      float temperature,
+      float topP,
+      int topK,
+      std::function<bool(int64_t)> onToken);
 
   void applyTemperature(std::span<float> logits, float temperature);
   void applyTopK(std::span<float> logits, int k);
@@ -61,30 +76,39 @@ private:
   Ort::Env env;
   Ort::SessionOptions sessionOptions;
   Ort::AllocatorWithDefaultOptions allocator;
-  
+
   std::unique_ptr<Ort::Session> modelSession;
   OrtxTokenizer* tokenizer{};
 
-  // Model configuration from JSON spec
-  static constexpr const int vocabSize = 151936;
-  static constexpr const int hiddenSize = 1536;
-  static constexpr const int numLayers = 28;         // num_hidden_layers
-  static constexpr const int numKeyValueHeads = 2;   // num_key_value_heads
-  static constexpr const int numAttentionHeads = 12; // num_attention_heads
-  static constexpr const int headDim = 128;          // head_size
-  static constexpr const int maxPositionEmbeddings = 131072; // context_length
+  // Applies the model's own chat template to a single user message;
+  // falls back to Qwen-style ChatML when the model does not ship one.
+  std::string applyChatTemplate(const std::string& userPrompt) const;
 
-  // Special tokens
-  static constexpr const int64_t eosTokenId = 151643;
-  static constexpr const int64_t padTokenId = 151643;
+  // Token ids that end the reply, from generation_config.json /
+  // config.json; defaults to Qwen's <|endoftext|> + <|im_end|>.
+  std::vector<int64_t> stopTokenIds{151643, 151645};
+
+  // Graph geometry discovered at load time.
+  int numLayers{};
+  int64_t kvHeads{};
+  int64_t headDim{};
+  ONNXTensorElementDataType kvType{ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT};
+  bool hasPositionIds{};
 
   // Input/output names
   std::vector<std::string> inputNames;
   std::vector<std::string> outputNames;
   std::vector<const char*> inputNamePtrs;
   std::vector<const char*> outputNamePtrs;
-  
-  // KV cache for efficient generation
-  std::vector<std::vector<Ort::Float16_t>> pastKeyValues;
+
+  // Per-layer KV cache, stored as raw bytes in the model's own dtype: it
+  // only ever round-trips from the outputs to the inputs of the next step,
+  // so it never needs converting.
+  std::vector<std::vector<std::byte>> keyCache;
+  std::vector<std::vector<std::byte>> valueCache;
+  std::vector<std::vector<int64_t>> cacheShapes;
+
+  std::vector<int64_t> reusableAttentionMask;
+  std::vector<int64_t> reusablePositionIds;
 };
 }

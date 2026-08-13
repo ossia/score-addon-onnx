@@ -7,9 +7,14 @@
 #include <halp/texture.hpp>
 
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
-#include <queue>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace OnnxModels
 {
@@ -17,14 +22,31 @@ namespace OnnxModels
 struct QwenLLMNode : OnnxObject
 {
 public:
-  halp_meta(name, "Qwen LLM");
+  halp_meta(name, "Language Model");
   halp_meta(c_name, "qwen_llm");
   halp_meta(category, "AI/Language Model");
   halp_meta(author, "Qwen Team, Onnxruntime");
   halp_meta(
       description,
-      "Real-time inference of Qwen language models for text generation.");
+      "Real-time inference of local chat language models (Qwen, Llama, "
+      "Gemma, Phi, DeepSeek, ... in transformers.js / onnxruntime-genai "
+      "ONNX exports) for text generation.");
   halp_meta(uuid, "f8d7e6c5-4b3a-2c1e-9f8d-7e6c5b4a3f2e");
+
+  // Tokens streamed from the worker thread's generation loop, drained on the
+  // processing thread every tick.
+  struct TokenStream
+  {
+    std::mutex mutex;
+    std::vector<std::string> pending;
+  };
+
+  enum PartialMode
+  {
+    Sentence,
+    Word,
+    Token
+  };
 
   struct
   {
@@ -64,13 +86,32 @@ public:
     {
       void update(QwenLLMNode& g) { g.must_infer = true; }
     } topK;
+
+    // Appended after the original ports so existing presets keep their
+    // inlet ids. In manual mode nothing runs until Trigger is banged.
+    halp::toggle<"Manual mode"> manual;
+    halp::val_port<"Trigger", std::optional<halp::impulse>> trigger;
+
+    // Granularity of the Partial output during generation.
+    struct : halp::enum_t<PartialMode, "Partial mode">
+    {
+      enum widget
+      {
+        combobox
+      };
+    } partialMode;
   } inputs;
 
   struct
   {
+    // The full reply, sent once when the generation finishes.
     halp::val_port<"Response", std::string> response;
     halp::val_port<"Tokens/sec", float> tokensPerSecond;
     halp::toggle<"Generating"> isGenerating;
+    // Streamed increments during generation, segmented according to the
+    // "Partial mode" input: finished sentences, words, or raw per-tick
+    // token text. One message per tick at most.
+    halp::val_port<"Partial", std::optional<std::string>> partial;
   } outputs;
 
   QwenLLMNode() noexcept;
@@ -86,8 +127,8 @@ public:
         float,
         int,
         int,
-        bool,
-        std::shared_ptr<Onnx::QwenLLMInference>)>
+        std::shared_ptr<Onnx::QwenLLMInference>,
+        std::shared_ptr<TokenStream>)>
         request;
 
     static std::function<void(QwenLLMNode&)> work(
@@ -96,8 +137,8 @@ public:
         float topP,
         int topK,
         int maxTokens,
-        bool stream,
-        std::shared_ptr<Onnx::QwenLLMInference> llm);
+        std::shared_ptr<Onnx::QwenLLMInference> llm,
+        std::shared_ptr<TokenStream> stream);
   } worker;
 
 private:
@@ -110,7 +151,12 @@ private:
   std::string last_tokenizer_path;
   std::string last_processed_prompt;
 
-  std::queue<std::string> token_queue;
+  void segmentPartials(std::string_view delta);
+
+  std::shared_ptr<TokenStream> token_stream;
+  std::string accumulated_response;
+  std::string partial_buffer;
+  std::deque<std::string> ready_partials;
   std::chrono::steady_clock::time_point generation_start_time;
   int total_tokens_generated = 0;
   bool must_infer = false;

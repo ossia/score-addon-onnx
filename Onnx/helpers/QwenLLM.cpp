@@ -4,14 +4,65 @@
 #include <cmath>
 #include <cstdio>
 #include <ext_status.h>
+#include <ortx_utils.h>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 
 namespace Onnx
 {
+
+// Reads eos_token_id (a number or a list of numbers) from a HF-style JSON
+// config next to the tokenizer; returns an empty vector when absent.
+static std::vector<int64_t> readStopTokens(const std::filesystem::path& file)
+{
+  std::ifstream in(file);
+  if (!in)
+    return {};
+  std::stringstream buf;
+  buf << in.rdbuf();
+
+  const auto json
+      = nlohmann::json::parse(buf.str(), nullptr, /*allow_exceptions=*/false);
+  if (json.is_discarded() || !json.is_object())
+    return {};
+
+  const auto it = json.find("eos_token_id");
+  if (it == json.end())
+    return {};
+
+  std::vector<int64_t> ids;
+  if (it->is_number_integer())
+    ids.push_back(it->get<int64_t>());
+  else if (it->is_array())
+    for (const auto& v : *it)
+      if (v.is_number_integer())
+        ids.push_back(v.get<int64_t>());
+  return ids;
+}
+
+static std::size_t qwenKvElementSize(ONNXTensorElementDataType t)
+{
+  switch (t)
+  {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      return 2;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      return 4;
+    default:
+      throw std::runtime_error(
+          "QwenLLM: unsupported KV cache element type "
+          + std::to_string((int)t));
+  }
+}
 
 QwenLLMInference::QwenLLMInference(
     std::string_view modelPath,
@@ -20,15 +71,6 @@ QwenLLMInference::QwenLLMInference(
 {
   Onnx::Options oopts;
   sessionOptions = Onnx::create_session_options(oopts);
-
-  // Configure Qwen-specific attention attributes (following onnxruntime-genai DecoderOnly_Model pattern)
-  // Set q_norm and k_norm to enable query-key normalization for better attention stability
-  sessionOptions.AddConfigEntry("attention.q_norm", "1");
-  sessionOptions.AddConfigEntry("attention.k_norm", "1");
-
-  // Additional Qwen model optimizations following onnxruntime-genai DecoderOnly_Model pattern
-  sessionOptions.AddConfigEntry("model.type", "decoder_only");
-  sessionOptions.AddConfigEntry("model.architecture", "qwen");
 
   // Load the model. ORT's path-based Session ctor takes const ORTCHAR_T*, which
   // is wchar_t on Windows -- pass a const char* there and it fails to compile.
@@ -43,8 +85,7 @@ QwenLLMInference::QwenLLMInference(
 #else
   auto modelPath_str = modelPath;
 #endif
-  modelSession = std::make_unique<Ort::Session>(
-      env, modelPath_str.data(), sessionOptions);
+  modelSession = create_session_with_fallback(env, modelPath_str, sessionOptions);
 
   if (tokenizerModelPath.ends_with("tokenizer.json"))
     tokenizerModelPath = tokenizerModelPath.substr(
@@ -56,6 +97,18 @@ QwenLLMInference::QwenLLMInference(
   {
     const char* msg = OrtxGetLastErrorMessage();
     throw std::runtime_error(std::string("Failed to create tokenizer: ") + msg);
+  }
+
+  // The reply's stop tokens live next to the tokenizer, in
+  // generation_config.json (preferred; may list several ids) or config.json.
+  // Without either, keep the Qwen ChatML defaults the member initializes to.
+  {
+    const std::filesystem::path tokDir{std::string(tokenizerModelPath)};
+    auto ids = readStopTokens(tokDir / "generation_config.json");
+    if (ids.empty())
+      ids = readStopTokens(tokDir / "config.json");
+    if (!ids.empty())
+      stopTokenIds = std::move(ids);
   }
 
   // Get input/output names and inspect shapes
@@ -79,13 +132,53 @@ QwenLLMInference::QwenLLMInference(
 
   inputNamePtrs.reserve(inputNames.size());
   outputNamePtrs.reserve(outputNames.size());
-  
+
   for (const auto& name : inputNames)
     inputNamePtrs.push_back(name.c_str());
   for (const auto& name : outputNames)
     outputNamePtrs.push_back(name.c_str());
 
-  pastKeyValues.resize(numLayers * 2);
+  // Discover the graph geometry of this export: layer count from the number
+  // of past_key_values inputs, KV dtype / heads / head-dim from the first
+  // one. The dtype really does vary per model *and* per variant (the Qwen3
+  // fp16 export uses an fp16 cache, the Qwen2.5 fp16 export an fp32 one), so
+  // it cannot be assumed.
+  int pastInputs = 0;
+  for (size_t i = 0; i < inputNames.size(); ++i)
+  {
+    if (inputNames[i].starts_with("past_key_values."))
+    {
+      ++pastInputs;
+      if (inputNames[i] == "past_key_values.0.key")
+      {
+        // Keep the TypeInfo alive: GetTensorTypeAndShapeInfo() is a view.
+        const auto typeInfo = modelSession->GetInputTypeInfo(i);
+        const auto info = typeInfo.GetTensorTypeAndShapeInfo();
+        kvType = info.GetElementType();
+        // Shape is [batch, kv_heads, past_seq_len, head_dim]
+        if (const auto sh = info.GetShape(); sh.size() == 4)
+        {
+          if (sh[1] > 0)
+            kvHeads = sh[1];
+          if (sh[3] > 0)
+            headDim = sh[3];
+        }
+      }
+    }
+    else if (inputNames[i] == "position_ids")
+    {
+      hasPositionIds = true;
+    }
+  }
+  numLayers = pastInputs / 2;
+  if (numLayers <= 0 || kvHeads <= 0 || headDim <= 0)
+    throw std::runtime_error(
+        "QwenLLM: could not derive the KV cache geometry from the model "
+        "(not a transformers.js-style decoder export?)");
+
+  keyCache.assign(numLayers, {});
+  valueCache.assign(numLayers, {});
+  cacheShapes.assign(numLayers, {});
 }
 
 QwenLLMInference::~QwenLLMInference()
@@ -100,7 +193,7 @@ std::vector<int64_t> QwenLLMInference::tokenize(const std::string& text) const
 {
   const char* inputs[] = {text.c_str()};
   OrtxTokenId2DArray* tokenIds = nullptr;
-  
+
   extError_t result = OrtxTokenize(tokenizer, inputs, 1, &tokenIds);
   if (result != kOrtxOK)
   {
@@ -122,7 +215,7 @@ std::string QwenLLMInference::decodeToken(int64_t tokenId) const
 {
   OrtxStringArray* texts = nullptr;
   const extTokenId_t id = static_cast<extTokenId_t>(tokenId);
-  
+
   extError_t result = OrtxDetokenize1D(tokenizer, &id, 1, &texts);
   if (result != kOrtxOK)
     return "";
@@ -142,7 +235,7 @@ std::string QwenLLMInference::decodeTokens(std::span<int64_t> tokens) const
 
   std::vector<extTokenId_t> ids(tokens.begin(), tokens.end());
   OrtxStringArray* texts = nullptr;
-  
+
   extError_t result = OrtxDetokenize1D(tokenizer, ids.data(), ids.size(), &texts);
   if (result != kOrtxOK)
     return "";
@@ -169,7 +262,7 @@ void QwenLLMInference::applyTemperature(std::span<float> logits, float temperatu
 void QwenLLMInference::softmax(std::span<float> logits)
 {
   float maxLogit = *std::max_element(logits.begin(), logits.end());
-  
+
   float sum = 0.0f;
   for (float& logit : logits)
   {
@@ -190,7 +283,7 @@ void QwenLLMInference::applyTopK(std::span<float> logits, int k)
 
   std::vector<std::pair<float, int>> indexed;
   indexed.reserve(logits.size());
-  
+
   for (int i = 0; i < logits.size(); ++i)
   {
     indexed.emplace_back(logits[i], i);
@@ -214,14 +307,14 @@ void QwenLLMInference::applyTopP(std::span<float> logits, float p)
   // Convert logits to probabilities for top-p calculation
   std::vector<float> probs(logits.size());
   float maxLogit = *std::max_element(logits.begin(), logits.end());
-  
+
   float sum = 0.0f;
   for (size_t i = 0; i < logits.size(); ++i)
   {
     probs[i] = std::exp(logits[i] - maxLogit);
     sum += probs[i];
   }
-  
+
   for (size_t i = 0; i < logits.size(); ++i)
   {
     probs[i] /= sum;
@@ -230,7 +323,7 @@ void QwenLLMInference::applyTopP(std::span<float> logits, float p)
   // Sort by probability for top-p filtering
   std::vector<std::pair<float, int>> indexed;
   indexed.reserve(logits.size());
-  
+
   for (int i = 0; i < logits.size(); ++i)
   {
     indexed.emplace_back(probs[i], i);
@@ -241,7 +334,7 @@ void QwenLLMInference::applyTopP(std::span<float> logits, float p)
 
   float cumSum = 0.0f;
   int cutoff = 0;
-  
+
   for (int i = 0; i < indexed.size(); ++i)
   {
     cumSum += indexed[i].first;
@@ -265,15 +358,14 @@ int64_t QwenLLMInference::sampleToken(
     float topP,
     int topK)
 {
-  // For very low temperature or garbage output debugging, use greedy sampling
+  // For very low temperature, use greedy sampling
   if (temperature < 0.01f)
   {
     auto maxIt = std::max_element(logits.begin(), logits.end());
     int64_t greedyToken = std::distance(logits.begin(), maxIt);
-    // qDebug() << "Greedy sampling: token" << greedyToken << "with logit" << *maxIt;
     return greedyToken;
   }
-  
+
   // Apply sampling transformations in correct order
   applyTemperature(logits, temperature);
   applyTopK(logits, topK);
@@ -288,196 +380,201 @@ int64_t QwenLLMInference::sampleToken(
   return sampled;
 }
 
-std::vector<float> QwenLLMInference::runModel(
-    std::span<int64_t> inputIds,
-    std::span<int64_t> attentionMask,
-    std::span<std::vector<Ort::Float16_t>> pastKeyValues,
-    std::vector<std::vector<Ort::Float16_t>>& newKeyValues)
+std::string
+QwenLLMInference::applyChatTemplate(const std::string& userPrompt) const
 {
-  std::vector<Ort::Value> inputTensors;
-  
-  // Create memory info for CPU tensors
-  Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(
-      OrtArenaAllocator, OrtMemTypeDefault);
-  
-  // Create input tensors
-  std::vector<int64_t> inputShape = {1, static_cast<int64_t>(inputIds.size())};
-  inputTensors.push_back(
-      Ort::Value::CreateTensor<int64_t>(
-          memoryInfo,
-          const_cast<int64_t*>(inputIds.data()),
-          inputIds.size(),
-          inputShape.data(),
-          inputShape.size()));
+  // Only a user message: templates insert their model's own default system
+  // prompt when they want one, and some (e.g. Gemma) reject a system role.
+  const std::string messages
+      = nlohmann::json::array({{{"role", "user"}, {"content", userPrompt}}})
+            .dump();
 
-  inputTensors.push_back(
-      Ort::Value::CreateTensor<int64_t>(
-          memoryInfo,
-          const_cast<int64_t*>(attentionMask.data()),
-          attentionMask.size(),
-          inputShape.data(),
-          inputShape.size()));
+  OrtxTensorResult* result{};
+  if (OrtxApplyChatTemplate(
+          tokenizer, nullptr, messages.c_str(), nullptr, &result,
+          /*add_generation_prompt=*/true, /*tokenize=*/false)
+      == kOrtxOK)
+  {
+    std::string text;
+    OrtxTensor* tensor{};
+    if (OrtxTensorResultGetAt(result, 0, &tensor) == kOrtxOK)
+    {
+      const char* data{};
+      if (OrtxGetTensorData(
+              tensor, reinterpret_cast<const void**>(&data), nullptr, nullptr)
+              == kOrtxOK
+          && data)
+        text = data;
+    }
+    OrtxDispose((OrtxObject**)&result);
+    if (!text.empty())
+      return text;
+  }
 
-  // Add past key values - must provide all expected KV tensors
-  // For first inference, provide empty tensors with shape [1, num_heads, 0, head_dim]
-  bool isFirstInference = true;
-  for (const auto& kv : pastKeyValues)
+  // No usable template shipped with the model: Qwen-style ChatML.
+  return "<|im_start|>system\nYou are a chatbot<|im_end|>\n"
+         "<|im_start|>user\n" + userPrompt + "<|im_end|>\n"
+         "<|im_start|>assistant\n";
+}
+
+void QwenLLMInference::generateLoop(
+    const std::string& prompt,
+    int maxTokens,
+    float temperature,
+    float topP,
+    int topK,
+    std::function<bool(int64_t)> onToken)
+{
+  auto inputIds = tokenize(applyChatTemplate(prompt));
+  if (inputIds.empty())
+    return;
+  const size_t promptLen = inputIds.size();
+
+  Ort::MemoryInfo memoryInfo
+      = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+  const std::size_t kvElemSize = qwenKvElementSize(kvType);
+
+  auto createIdsTensor = [&memoryInfo](std::span<int64_t> ids)
   {
-    if (!kv.empty())
+    std::vector<int64_t> shape = {1, static_cast<int64_t>(ids.size())};
+    return Ort::Value::CreateTensor<int64_t>(
+        memoryInfo, ids.data(), ids.size(), shape.data(), shape.size());
+  };
+
+  // KV cache tensors are created in the model's own dtype straight over the
+  // raw cache bytes.
+  auto createKVCacheTensor = [&memoryInfo, this](
+                                 std::vector<std::byte>& cache,
+                                 const std::vector<int64_t>& shape)
+  {
+    return Ort::Value::CreateTensor(
+        memoryInfo,
+        cache.data(),
+        cache.size(),
+        shape.data(),
+        shape.size(),
+        kvType);
+  };
+
+  auto storeKVCache = [this, kvElemSize](std::vector<Ort::Value>& outs)
+  {
+    for (int layer = 0; layer < numLayers; ++layer)
     {
-      isFirstInference = false;
-      break;
+      auto& keyTensor = outs[1 + layer * 2]; // present.{layer}.key
+      const auto keyInfo = keyTensor.GetTensorTypeAndShapeInfo();
+      const auto keyShape = keyInfo.GetShape();
+      const std::size_t bytes = keyInfo.GetElementCount() * kvElemSize;
+
+      const auto* keyData
+          = static_cast<const std::byte*>(keyTensor.GetTensorRawData());
+      keyCache[layer].assign(keyData, keyData + bytes);
+      cacheShapes[layer].assign(keyShape.begin(), keyShape.end());
+
+      auto& valueTensor = outs[1 + layer * 2 + 1]; // present.{layer}.value
+      const auto* valueData
+          = static_cast<const std::byte*>(valueTensor.GetTensorRawData());
+      valueCache[layer].assign(valueData, valueData + bytes);
     }
-  }
-  
-  if (isFirstInference)
+  };
+
+  // Extract the last token's logits as fp32.
+  std::vector<float> logits;
+  auto readLastLogits = [&logits](const Ort::Value& logitsTensor)
   {
-    // For initial inference, create empty KV tensors
-    std::vector<int64_t> emptyKvShape = {1, numKeyValueHeads, 0, headDim};
-    for (int i = 0; i < numLayers * 2; ++i)
+    const auto info = logitsTensor.GetTensorTypeAndShapeInfo();
+    const auto shape = info.GetShape();
+    const size_t vocab = shape.back();
+    const size_t lastPos = info.GetElementCount() - vocab;
+    logits.resize(vocab);
+
+    if (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
     {
-      inputTensors.push_back(Ort::Value::CreateTensor<Ort::Float16_t>(
-          memoryInfo, nullptr, 0,
-          emptyKvShape.data(), emptyKvShape.size()));
+      const auto* d = logitsTensor.GetTensorData<Ort::Float16_t>();
+      for (size_t i = 0; i < vocab; ++i)
+        logits[i] = d[lastPos + i].ToFloat();
     }
-  }
-  else
-  {
-    // Use existing KV cache
-    for (size_t i = 0; i < pastKeyValues.size(); ++i)
+    else
     {
-      const auto& kv = pastKeyValues[i];
-      if (!kv.empty())
+      const auto* d = logitsTensor.GetTensorData<float>();
+      std::copy_n(d + lastPos, vocab, logits.begin());
+    }
+  };
+
+  // Reset the cache from any previous generation.
+  for (auto& c : keyCache)
+    c.clear();
+  for (auto& c : valueCache)
+    c.clear();
+  std::vector<int64_t> emptyCacheShape = {1, kvHeads, 0, headDim};
+  for (auto& s : cacheShapes)
+    s = emptyCacheShape;
+
+  int64_t nextToken = -1;
+  std::vector<int64_t> stepIds;
+
+  for (int step = 0; step < maxTokens; ++step)
+  {
+    std::vector<Ort::Value> inputs;
+    inputs.reserve(3 + 2 * numLayers);
+
+    const size_t totalLen = promptLen + step;
+    if (step == 0)
+    {
+      // Prefill: the whole prompt in one pass.
+      inputs.push_back(createIdsTensor(inputIds));
+      reusableAttentionMask.assign(promptLen, 1);
+      inputs.push_back(createIdsTensor(reusableAttentionMask));
+      if (hasPositionIds)
       {
-        // Shape: [batch_size, num_kv_heads, seq_len, head_dim]
-        int64_t seqLen = static_cast<int64_t>(kv.size()) / (numKeyValueHeads * headDim);
-        std::vector<int64_t> kvShape = {1, numKeyValueHeads, seqLen, headDim};
-
-        inputTensors.push_back(
-            Ort::Value::CreateTensor<Ort::Float16_t>(
-                memoryInfo,
-                const_cast<Ort::Float16_t*>(kv.data()),
-                kv.size(),
-                kvShape.data(),
-                kvShape.size()));
-      } else {
-        std::fprintf(stderr, "QwenLLM: WARNING - KV cache %d is empty\n", (int)i);
+        reusablePositionIds.resize(promptLen);
+        std::iota(reusablePositionIds.begin(), reusablePositionIds.end(), 0);
+        inputs.push_back(createIdsTensor(reusablePositionIds));
       }
     }
-  }
+    else
+    {
+      // One new token against the cached past.
+      stepIds.assign(1, nextToken);
+      inputs.push_back(createIdsTensor(stepIds));
+      reusableAttentionMask.assign(totalLen, 1);
+      inputs.push_back(createIdsTensor(reusableAttentionMask));
+      if (hasPositionIds)
+      {
+        reusablePositionIds.assign(1, static_cast<int64_t>(totalLen - 1));
+        inputs.push_back(createIdsTensor(reusablePositionIds));
+      }
+    }
 
-  // Run inference
+    for (int layer = 0; layer < numLayers; ++layer)
+    {
+      inputs.push_back(createKVCacheTensor(keyCache[layer], cacheShapes[layer]));
+      inputs.push_back(
+          createKVCacheTensor(valueCache[layer], cacheShapes[layer]));
+    }
 
-  try
-  {
     auto outputs = modelSession->Run(
         Ort::RunOptions{nullptr},
         inputNamePtrs.data(),
-        inputTensors.data(),
-        inputTensors.size(),
+        inputs.data(),
+        std::min(inputs.size(), inputNamePtrs.size()),
         outputNamePtrs.data(),
         outputNamePtrs.size());
 
-    if (outputs.empty()) {
+    if (outputs.empty())
       throw std::runtime_error("No outputs from model");
-    }
 
-    auto& logitsTensor = outputs[0];
-    if (!logitsTensor.IsTensor()) {
-      throw std::runtime_error("First output is not a tensor");
-    }
-    
-    auto typeInfo = logitsTensor.GetTensorTypeAndShapeInfo();
-    auto dataType = typeInfo.GetElementType();
+    readLastLogits(outputs[0]);
+    storeKVCache(outputs);
 
-    if (dataType != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-        && dataType != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
-    {
-      throw std::runtime_error("Logits tensor is neither float nor float16 type");
-    }
+    nextToken = sampleToken(logits, temperature, topP, topK);
 
-    auto logitsShape = typeInfo.GetShape();
-    size_t logitsSize = typeInfo.GetElementCount();
+    if (std::find(stopTokenIds.begin(), stopTokenIds.end(), nextToken)
+        != stopTokenIds.end())
+      break;
 
-    // Check if the logits tensor has the expected vocab size in the last dimension
-    if (logitsShape.empty()) {
-      throw std::runtime_error("Logits tensor has no dimensions");
-    }
-    
-    int64_t lastDim = logitsShape.back();
-    if (lastDim != vocabSize) {
-      std::fprintf(stderr, "WARNING: Last dimension %lld doesn't match vocab size %lld\n", (long long)lastDim, (long long)vocabSize);
-    }
-    
-    // For safety, only take the logits for the last token (most recent position)
-    // Expected shape: [batch_size, seq_len, vocab_size] or [batch_size, vocab_size]
-    size_t logitsPerToken = static_cast<size_t>(lastDim);
-    size_t numTokens = logitsSize / logitsPerToken;
-    if (numTokens == 0 || logitsPerToken == 0)
-    {
-      throw std::runtime_error("Invalid logits dimensions");
-    }
-
-    // Get logits for the last token only
-    size_t lastTokenOffset = (numTokens - 1) * logitsPerToken;
-    std::vector<float> logits(logitsPerToken);
-    
-    // Handle different data types
-    if (dataType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-      float* logitsData = logitsTensor.GetTensorMutableData<float>();
-      if (!logitsData || logitsSize == 0) {
-        throw std::runtime_error("Invalid float logits data");
-      }
-
-      // Use manual copy with bounds checking
-      for (size_t i = 0; i < logitsPerToken; ++i) {
-        if (lastTokenOffset + i >= logitsSize) {
-          throw std::runtime_error("Logits index out of bounds");
-        }
-        logits[i] = logitsData[lastTokenOffset + i];
-      }
-    } else if (dataType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
-      Ort::Float16_t* logitsData = logitsTensor.GetTensorMutableData<Ort::Float16_t>();
-      if (!logitsData || logitsSize == 0) {
-        throw std::runtime_error("Invalid float16 logits data");
-      }
-
-      for (size_t i = 0; i < logitsPerToken; ++i) {
-        if (lastTokenOffset + i >= logitsSize) {
-          throw std::runtime_error("Logits index out of bounds");
-        }
-
-        logits[i] = logitsData[lastTokenOffset + i].ToFloat();
-      }
-    }
-
-    // Update key values cache - model outputs are already properly concatenated
-    newKeyValues.clear();
-
-    for (size_t i = 1; i < outputs.size(); ++i)
-    {
-      auto& output = outputs[i];
-      auto typeInfo = output.GetTensorTypeAndShapeInfo();
-      auto shape = typeInfo.GetShape();
-      auto dataType = typeInfo.GetElementType();
-      size_t kvSize = typeInfo.GetElementCount();
-
-      if (dataType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
-      {
-        Ort::Float16_t* kvData = output.GetTensorMutableData<Ort::Float16_t>();
-        newKeyValues.emplace_back(kvData, kvData + kvSize);
-      }
-      else
-      {
-        std::fprintf(stderr, "QwenLLM: WARNING - KV output %d is not float16, skipping\n", (int)i);
-      }
-    }
-
-    return logits;
-  }
-  catch (const Ort::Exception& e) {
-    std::fprintf(stderr, "ORT Exception in runModel: %s\n", e.what());
-    throw;
+    if (!onToken(nextToken))
+      break;
   }
 }
 
@@ -488,58 +585,14 @@ std::string QwenLLMInference::generate(
     float topP,
     int topK)
 {
-  // Format prompt using Qwen chat template (from jinja template)
-  std::string formattedPrompt = "<|im_start|>system\nYou are a chatbot<|im_end|>\n"
-                               "<|im_start|>user\n" + prompt + "<|im_end|>\n"
-                               "<|im_start|>assistant\n";
-
-  auto inputIds = tokenize(formattedPrompt);
-
-  std::vector<int64_t> generatedIds = inputIds;
-  std::vector<int64_t> currentInputIds = inputIds;
-  std::vector<int64_t> attentionMask(inputIds.size(), 1);
-  
-  pastKeyValues.clear();
-  pastKeyValues.resize(numLayers * 2);
-
-  for (int i = 0; i < maxTokens; ++i)
-  {
-    // Fallback to non-cached generation: always use the full sequence
-    // This is slower but works correctly with models that don't support KV caching
-    std::vector<int64_t> inferenceInputIds = currentInputIds;
-    std::vector<int64_t> inferenceAttentionMask = attentionMask;
-    // Run without KV cache - pass empty cache to force full recomputation
-    std::vector<std::vector<Ort::Float16_t>> emptyKeyValues(numLayers * 2);
-    std::vector<std::vector<Ort::Float16_t>> newKeyValues;
-    auto logits = runModel(
-        inferenceInputIds,
-        inferenceAttentionMask,
-        emptyKeyValues,
-        newKeyValues);
-    // Don't store KV cache in non-cached mode
-
-    // The logits are already from the last token only
-    std::span<float> lastLogits(logits.data(), logits.size());
-
-    int64_t nextToken = sampleToken(lastLogits, temperature, topP, topK);
-
-    // Check for EOS tokens: <|endoftext|> (151643) or <|im_end|> (151645)
-    if (nextToken == eosTokenId || nextToken == 151645)
-      break;
-
-    generatedIds.push_back(nextToken);
-    currentInputIds.push_back(nextToken);
-    attentionMask.push_back(1);
-  }
-
-  size_t originalPromptSize = inputIds.size();
-  if (generatedIds.size() <= originalPromptSize) {
-    return "";
-  }
-
-  std::span<int64_t> generated(
-      generatedIds.data() + originalPromptSize,
-      generatedIds.size() - originalPromptSize);
+  std::vector<int64_t> generated;
+  generateLoop(
+      prompt, maxTokens, temperature, topP, topK,
+      [&generated](int64_t token)
+      {
+        generated.push_back(token);
+        return true;
+      });
 
   return decodeTokens(generated);
 }
@@ -552,59 +605,23 @@ void QwenLLMInference::generateStreaming(
     float topP,
     int topK)
 {
-  // Format prompt using Qwen chat template (from jinja template)
-  std::string formattedPrompt = "<|im_start|>system\nYou are a poet<|im_end|>\n"
-                               "<|im_start|>user\n" + prompt + "<|im_end|>\n"
-                               "<|im_start|>assistant\n";
-
-  auto inputIds = tokenize(formattedPrompt);
-
-  std::vector<int64_t> currentInputIds = inputIds;
-  std::vector<int64_t> attentionMask(inputIds.size(), 1);
-  
-  pastKeyValues.clear();
-  pastKeyValues.resize(numLayers * 2);
-
-  bool shouldContinue = true;
-  int step = 0;
-  
-  while (shouldContinue && step < maxTokens)
-  {
-    // Fallback to non-cached generation: always use the full sequence
-    std::vector<int64_t> inferenceInputIds = currentInputIds;
-    std::vector<int64_t> inferenceAttentionMask = attentionMask;
-    // Run without KV cache - pass empty cache to force full recomputation
-    std::vector<std::vector<Ort::Float16_t>> emptyKeyValues(numLayers * 2);
-    std::vector<std::vector<Ort::Float16_t>> newKeyValues;
-    auto logits = runModel(inferenceInputIds, inferenceAttentionMask, emptyKeyValues, newKeyValues);
-    // Don't store KV cache in non-cached mode
-
-    // The logits are already from the last token only
-    std::span<float> lastLogits(logits.data(), logits.size());
-
-    // Debug: show top 5 tokens before sampling
-    std::vector<std::pair<float, int64_t>> topTokens;
-    topTokens.reserve(lastLogits.size());
-    for (size_t i = 0; i < lastLogits.size(); ++i) {
-      topTokens.emplace_back(lastLogits[i], static_cast<int64_t>(i));
-    }
-
-    int64_t nextToken = sampleToken(lastLogits, temperature, topP, topK);
-
-    // Check for EOS tokens: <|endoftext|> (151643) or <|im_end|> (151645)
-    if (nextToken == eosTokenId || nextToken == 151645)
-      break;
-
-    std::string tokenText = decodeToken(nextToken);
-    shouldContinue = tokenCallback(tokenText);
-
-    if (!shouldContinue)
-      break;
-
-    currentInputIds.push_back(nextToken);
-    attentionMask.push_back(1);
-    step++;
-  }
+  // Decoding tokens one at a time splits multi-byte UTF-8 sequences (byte
+  // level BPE): re-decode the whole reply each step and emit the increment.
+  std::vector<int64_t> ids;
+  std::string lastText;
+  generateLoop(
+      prompt, maxTokens, temperature, topP, topK,
+      [&, this](int64_t token)
+      {
+        ids.push_back(token);
+        std::string full = decodeTokens(ids);
+        std::string delta
+            = full.starts_with(lastText) ? full.substr(lastText.size()) : full;
+        lastText = std::move(full);
+        if (delta.empty())
+          return true; // wait for the rest of a multi-byte sequence
+        return tokenCallback(delta);
+      });
 }
 
 }

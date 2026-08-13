@@ -359,6 +359,7 @@ avnd_addon_finalize(NAME score_addon_onnx_models UUID 24a98f5b-700f-401c-ab89-8c
 
 target_sources(score_addon_onnx_models
   PRIVATE
+    OnnxModels/TextSegmentation.hpp
     Onnx/helpers/GAN.hpp
     Onnx/helpers/GAN.cpp
     Onnx/helpers/Utilities.hpp
@@ -535,6 +536,86 @@ if(SCORE_ONNX_ENABLE_EXTENSIONS)
       ocos_operators
       onnxruntime_extensions
   )
+endif()
+
+# Unit tests (mirroring score-addon-cv). They only cover the RapidLib
+# objects for now, so they need neither onnxruntime nor a GPU: the test
+# executable compiles the object sources directly against rapidlib + the
+# avendish headers provided through score_plugin_avnd.
+option(SCORE_ADDON_ONNX_TESTS "Build score-addon-onnx unit tests" OFF)
+if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_avnd)
+  if(NOT TARGET Catch2::Catch2WithMain)
+    include(FetchContent)
+    FetchContent_Declare(
+      Catch2onnx
+      GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+      GIT_TAG v3.15.3
+      GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(Catch2onnx)
+  endif()
+  add_executable(score_addon_onnx_tests
+    tests/test_rapidlib_models.cpp
+    tests/test_text_segmentation.cpp
+    # real object sources under test:
+    RapidlibModels/Classifier.cpp
+    RapidlibModels/Regressor.cpp
+  )
+  target_include_directories(score_addon_onnx_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  target_link_libraries(score_addon_onnx_tests PRIVATE
+    Catch2::Catch2WithMain
+    rapidlib
+    score_plugin_avnd
+  )
+  add_test(NAME score_addon_onnx_tests COMMAND score_addon_onnx_tests)
+
+  # Manual smoke harness for the FastVLM pipeline: needs real model files on
+  # disk (pass a FastVLM-*-ONNX snapshot directory), so it is built with the
+  # tests but not registered with ctest. Compiles the helper on its own, so it
+  # needs the tokenizer library like the fastvlm object does.
+  if(SCORE_ONNX_ENABLE_EXTENSIONS)
+    add_executable(score_addon_onnx_fastvlm_smoke
+      tests/fastvlm_smoke.cpp
+      Onnx/helpers/FastVLM.cpp)
+    target_include_directories(score_addon_onnx_fastvlm_smoke PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    target_compile_features(score_addon_onnx_fastvlm_smoke PRIVATE cxx_std_23)
+    target_link_libraries(score_addon_onnx_fastvlm_smoke PRIVATE
+      onnxruntime::onnxruntime
+      ocos_operators
+      onnxruntime_extensions
+      score_onnx_imageops
+    )
+    if(TARGET Boost::boost)
+      target_link_libraries(score_addon_onnx_fastvlm_smoke PRIVATE Boost::boost)
+    endif()
+    if(TARGET fmt::fmt)
+      target_link_libraries(score_addon_onnx_fastvlm_smoke PRIVATE fmt::fmt)
+    endif()
+
+    # Same idea for the Qwen LLM pipeline (single decoder model + tokenizer).
+    add_executable(score_addon_onnx_qwenllm_smoke
+      tests/qwenllm_smoke.cpp
+      Onnx/helpers/QwenLLM.cpp)
+    target_include_directories(score_addon_onnx_qwenllm_smoke PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    target_compile_features(score_addon_onnx_qwenllm_smoke PRIVATE cxx_std_23)
+    target_link_libraries(score_addon_onnx_qwenllm_smoke PRIVATE
+      onnxruntime::onnxruntime
+      ocos_operators
+      onnxruntime_extensions
+    )
+    if(TARGET Boost::boost)
+      target_link_libraries(score_addon_onnx_qwenllm_smoke PRIVATE Boost::boost)
+    endif()
+    if(TARGET fmt::fmt)
+      target_link_libraries(score_addon_onnx_qwenllm_smoke PRIVATE fmt::fmt)
+    endif()
+  endif()
 endif()
 
 # Per-frame pose pipeline profiler (readspec/warp/resize/tensorbuild/infer

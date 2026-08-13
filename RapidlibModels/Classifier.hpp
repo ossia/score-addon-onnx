@@ -5,6 +5,7 @@
 #include <halp/dynamic_port.hpp>
 #include <halp/meta.hpp>
 
+#include <cstddef>
 #include <functional>
 #include <vector>
 
@@ -18,7 +19,11 @@ public:
   halp_meta(c_name, "classifier");
   halp_meta(category, "AI/Data processing");
   halp_meta(author, "RapidLib authors");
-  halp_meta(description, "Linear regression across a set of parameters.");
+  halp_meta(
+      description,
+      "k-nearest-neighbour classifier: record examples of the input for each "
+      "class, train, then recognize the class of new inputs "
+      "(Wekinator-style interactive machine learning).");
   halp_meta(uuid, "039763f8-ea15-4900-9400-8c7f6a1c56cd");
   halp_meta(
       manual_url,
@@ -46,12 +51,17 @@ public:
         { object.inputs.parameters_i.request_port_resize(value); };
       }
     } controller;
-    halp::dynamic_port<halp::knob_f32<"Param. {}">> parameters_i;
+    // The recorded value of each port is a class label; rapidLib's kNN
+    // rounds labels to the nearest integer, so these are int spinboxes
+    // (a 0..1 float knob could only ever express classes 0 and 1).
+    halp::dynamic_port<halp::spinbox_i32<"Class {}", halp::range{0, 1000, 0}>>
+        parameters_i;
   } inputs;
 
   struct
   {
     halp::val_port<"Output", std::vector<double>> output;
+    halp::val_port<"Examples", int> examples;
   } outputs;
 
   Classifier() noexcept;
@@ -63,6 +73,7 @@ private:
   std::vector<rapidLib::trainingExample> m_trainingSet;
 
   rapidLib::classification m_model;
+  std::size_t m_numInputs{};
   bool m_trained{};
 };
 }

@@ -74,7 +74,9 @@ void FastVLMNode::requestInference()
   inferenceInProgress = true;
 
   // Start worker thread computation
-  worker.request(image, inputs.prompt.value, inputs.temperature.value, vlm);
+  worker.request(
+      image, inputs.prompt.value, inputs.temperature.value,
+      inputs.maxTokens.value, vlm);
 }
 
 void FastVLMNode::operator()()
@@ -89,9 +91,9 @@ try
     return;
   if (inputs.embedTokens.current_model_invalid)
     return;
-  if (inputs.embedTokens.current_model_invalid)
-    return;
   if (inputs.decoder.current_model_invalid)
+    return;
+  if (inputs.tokenizer.current_model_invalid)
     return;
 
   if (needsReinitialization())
@@ -106,9 +108,16 @@ try
     return;
   }
 
-  // The actual processing happens in the worker thread
-  // This operator() just handles initialization and model management
-  if (!inferenceInProgress)
+  // The actual processing happens in the worker thread; this operator()
+  // handles initialization, model management and (re)triggering. Outside
+  // manual mode the node re-runs continuously as soon as it is idle; in
+  // manual mode only a bang on Trigger starts an inference.
+  if (inputs.manual)
+  {
+    if (inputs.trigger.value && !inferenceInProgress)
+      requestInference();
+  }
+  else if (!inferenceInProgress)
   {
     requestInference();
   }
@@ -129,6 +138,7 @@ std::function<void(FastVLMNode&)> FastVLMNode::worker::work(
     Onnx::ImageData image,
     std::string prompt,
     float temperature,
+    int maxTokens,
     std::shared_ptr<Onnx::FastVLMInference> vlm)
 {
   if (!vlm || image.empty() || prompt.empty())
@@ -143,7 +153,8 @@ std::function<void(FastVLMNode&)> FastVLMNode::worker::work(
   try
   {
     // Perform the inference in the worker thread
-    std::string response = vlm->generateResponse(image, prompt, temperature);
+    std::string response
+        = vlm->generateResponse(image, prompt, temperature, maxTokens);
 
     // Return a function that will be executed in the main thread
     return [response = std::move(response)](FastVLMNode& node) mutable

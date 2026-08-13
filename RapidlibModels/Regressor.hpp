@@ -5,7 +5,9 @@
 #include <halp/dynamic_port.hpp>
 #include <halp/meta.hpp>
 
+#include <cstddef>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace RapidlibModels
@@ -18,7 +20,11 @@ public:
   halp_meta(c_name, "regressor");
   halp_meta(category, "AI/Data processing");
   halp_meta(author, "RapidLib authors");
-  halp_meta(description, "Linear regression across a set of parameters.");
+  halp_meta(
+      description,
+      "Neural-network regression: record example mappings from the input to "
+      "the parameters, train, then generate interpolated parameters from new "
+      "inputs (Wekinator-style interactive machine learning).");
   halp_meta(uuid, "c9613fba-6318-463c-91b0-cab4c6c7ab2b");
   halp_meta(
       manual_url,
@@ -52,7 +58,23 @@ public:
   struct
   {
     halp::val_port<"Output", std::vector<double>> output;
+    halp::val_port<"Examples", int> examples;
   } outputs;
+
+  // Training a multilayer perceptron (500 epochs over the whole training set,
+  // one thread per output parameter) is far too slow for the processing
+  // thread; run it in the host's worker thread pool and swap the finished
+  // model in on the processing thread. Inference keeps using the previous
+  // model (if any) until then.
+  struct worker
+  {
+    std::function<void(std::vector<rapidLib::trainingExample>)> request;
+
+    // Called in a worker thread; the returned function is then invoked in
+    // this object's processing thread.
+    static std::function<void(Regressor&)>
+    work(std::vector<rapidLib::trainingExample> trainingSet);
+  } worker;
 
   Regressor() noexcept;
   ~Regressor();
@@ -62,7 +84,8 @@ public:
 private:
   std::vector<rapidLib::trainingExample> m_trainingSet;
 
-  rapidLib::regression m_model;
+  std::shared_ptr<rapidLib::regression> m_model;
+  std::size_t m_numInputs{};
   bool m_trained{};
 };
 }

@@ -10,6 +10,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace OnnxModels
 {
@@ -17,14 +18,14 @@ namespace OnnxModels
 struct FastVLMNode : OnnxObject
 {
 public:
-  halp_meta(name, "Fast VLM");
+  halp_meta(name, "Vision Language Model");
   halp_meta(c_name, "fastvlm");
   halp_meta(category, "AI/Vision Language Model");
   halp_meta(author, "Fast VLM authors, Onnxruntime");
   halp_meta(
       description,
-      "Vision Language Model for image captioning and visual question "
-      "answering.");
+      "Vision Language Model (FastVLM) for image captioning and visual "
+      "question answering.");
   halp_meta(uuid, "3a3b4824-2b39-4cc0-9b6c-6c030de40dc4");
 
   struct
@@ -34,7 +35,7 @@ public:
       // Request computation when image changes
       void update(FastVLMNode& g)
       {
-        if (g.available && g.vlm)
+        if (g.available && g.vlm && !g.inputs.manual)
         {
           g.requestInference();
         }
@@ -60,7 +61,7 @@ public:
       // Request computation when prompt changes
       void update(FastVLMNode& g)
       {
-        if (g.available && g.vlm)
+        if (g.available && g.vlm && !g.inputs.manual)
         {
           g.requestInference();
         }
@@ -69,6 +70,12 @@ public:
 
     halp::knob_f32<"Temperature", halp::range{0.f, 2.f, 1.f}> temperature;
     halp::spinbox_i32<"Max tokens", halp::range{1, 2048, 500}> maxTokens;
+
+    // Appended after the original ports so existing presets keep their
+    // inlet ids. Outside manual mode the node re-runs continuously; in
+    // manual mode inference only happens when Trigger is banged.
+    halp::toggle<"Manual mode"> manual;
+    halp::val_port<"Trigger", std::optional<halp::impulse>> trigger;
   } inputs;
 
   struct
@@ -88,6 +95,7 @@ public:
         Onnx::ImageData,
         std::string,
         float,
+        int,
         std::shared_ptr<Onnx::FastVLMInference>)>
         request;
 
@@ -97,6 +105,7 @@ public:
         Onnx::ImageData image,
         std::string prompt,
         float temperature,
+        int maxTokens,
         std::shared_ptr<Onnx::FastVLMInference> vlm);
   } worker;
 

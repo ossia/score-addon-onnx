@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -222,10 +223,40 @@ catch (const std::exception& e)
   std::fprintf(stderr, "Onnxruntime: falling back to CPU: %s\n", e.what());
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
 }
+
 catch (...)
 {
   std::fprintf(stderr, "OnnxRuntime: falling back to CPU: unknown error\n");
   return create_session_options(Options{.provider = "cpu", .device_id = 0});
+}
+
+// Session creation with a fallback: some fp16 exports (e.g. the FastVLM-0.5B
+// vision_encoder_fp16) crash ORT's extended-level graph fusions during
+// session initialization ("Tensor type mismatch. T != MLFloat16" from
+// tensor.h:210, a float-only fusion kernel touching an fp16 tensor). Basic
+// optimizations initialize and run those models fine, so retry with them.
+template <typename PathString>
+inline std::unique_ptr<Ort::Session> create_session_with_fallback(
+    Ort::Env& env,
+    const PathString& path,
+    const Ort::SessionOptions& sessionOptions)
+{
+  try
+  {
+    return std::make_unique<Ort::Session>(env, path.data(), sessionOptions);
+  }
+  catch (const Ort::Exception& e)
+  {
+    std::fprintf(
+        stderr,
+        "Onnxruntime: session init failed (%s); retrying with basic graph "
+        "optimizations\n",
+        e.what());
+    auto fallback = create_session_options(Options{});
+    fallback.SetGraphOptimizationLevel(
+        GraphOptimizationLevel::ORT_ENABLE_BASIC);
+    return std::make_unique<Ort::Session>(env, path.data(), fallback);
+  }
 }
 
 inline TensorElemType fromOrtElementType(ONNXTensorElementDataType t) noexcept
