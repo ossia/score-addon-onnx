@@ -756,11 +756,59 @@ void PoseDetector::appendGeometry(
     std::vector<float>& out, const DetectedPose& pose, PoseWorkflow workflow)
 {
   const auto& kps = pose.keypoints;
-  if(kps.empty())
-    return;
-
   const float min_conf = inputs.min_confidence;
   const auto format = inputs.data_format.value;
+
+  // The legacy per-instance record: metadata header + every keypoint, unfiltered
+  // and zero-padded by the caller. Handled before the box branch because it must
+  // still emit its header for a keypoint-less detection.
+  if(format == KeypointOutputFormat::Flattened)
+  {
+    out.reserve(out.size() + 6 + kps.size() * 4);
+    out.push_back(static_cast<float>(pose.track_id));
+    out.push_back(static_cast<float>(pose.class_id));
+    out.push_back(pose.box.x);
+    out.push_back(pose.box.y);
+    out.push_back(pose.box.w);
+    out.push_back(pose.box.h);
+    for(const auto& kp : kps)
+    {
+      out.push_back(kp.x);
+      out.push_back(kp.y);
+      out.push_back(kp.z);
+      out.push_back(kp.confidence);
+    }
+    return;
+  }
+
+  // Boxes come next, and cover two cases: an explicit box format, and a
+  // keypoint-less detection (Box Detection) in ANY format — there the box is the
+  // only geometry the instance has, so emitting it beats emitting nothing.
+  // Either way this must run before the empty-keypoints early-out below.
+  if(isBoxFormat(format) || kps.empty())
+  {
+    const auto& b = pose.box;
+    // A degenerate or non-finite box would poison a GPU vertex buffer; the
+    // detection is simply not emitted (the caller's buffer stays as-is).
+    if(!(b.w > 0.f && b.h > 0.f) || !finitef(b.x) || !finitef(b.y)
+       || !finitef(b.w) || !finitef(b.h))
+      return;
+
+    out.reserve(out.size() + 4);
+    out.push_back(b.x);
+    out.push_back(b.y);
+    if(format == KeypointOutputFormat::BoxX1Y1X2Y2)
+    {
+      out.push_back(b.x + b.w);
+      out.push_back(b.y + b.h);
+    }
+    else // BoxXYWH, and the keypoint-less fallback of every other format
+    {
+      out.push_back(b.w);
+      out.push_back(b.h);
+    }
+    return;
+  }
 
   switch (format)
   {
@@ -950,7 +998,8 @@ void PoseDetector::appendGeometry(
         }
 
         case PoseWorkflow::BoxDetection:
-          // Box-only: no skeleton; the box is carried in poses_geometry.
+          // Unreachable: a box-only detection has no keypoints, so it took the
+          // box branch above. A box detector WITH keypoints has no bone table.
           break;
 
         case PoseWorkflow::Auto:
@@ -961,6 +1010,11 @@ void PoseDetector::appendGeometry(
       }
     }
     break;
+
+    case KeypointOutputFormat::BoxXYWH:
+    case KeypointOutputFormat::BoxX1Y1X2Y2:
+    case KeypointOutputFormat::Flattened:
+      break; // handled above, before the keypoint early-out
   }
 }
 

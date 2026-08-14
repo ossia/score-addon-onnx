@@ -546,6 +546,8 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
   if(primary >= 0)
   {
     outputs.detection.value = m_instances[primary];
+    // Geometry is the primary instance only, in every Data Format (box formats
+    // included) — Poses Geometry is the per-instance outlet.
     generateGeometryOutput(m_instances[primary], draw); // fills outputs.geometry
   }
   else
@@ -554,11 +556,12 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
     outputs.geometry.value.clear();
   }
 
-  // Fixed-stride multi geometry: max_inst slots of
-  //   [track_id, class_id, box_x, box_y, box_w, box_h, (x,y,z,conf)*K],
-  // zero-padded. Constant layout regardless of Data Format (GPU-friendly).
-  // K is 0 for box-only detections (header carries the box).
-  constexpr int HEADER = 6;
+  // Fixed-stride multi geometry: max_inst slots, each holding ONLY that
+  // instance's geometric payload in the current Data Format — exactly the
+  // floats the Geometry outlet emits for one pose (keypoint array, bone lines,
+  // or box). Zero-padded to a constant per-frame stride so slot i always starts
+  // at i * stride (GPU-friendly). No id/class header: the metadata lives on the
+  // Poses outlet, and Count gives the number of live slots.
   const int max_inst = std::clamp(
       static_cast<int>(inputs.max_instances.value),
       1, 16);
@@ -566,35 +569,39 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
   pg.clear();
   if(!m_instances.empty())
   {
-    // Stride from the MAX keypoint count across instances so a mixed-K frame
-    // (e.g. body + hand) never truncates the richer instances; shorter ones
-    // zero-pad. (Today all instances share K, but don't bake that in.)
-    int nkpt = 0;
-    for(const auto& p : m_instances)
-      nkpt = std::max(nkpt, static_cast<int>(p.keypoints.size()));
-    const int stride = HEADER + nkpt * 4;
-    pg.assign(static_cast<size_t>(max_inst) * stride, 0.f);
-    int slot = 0;
+    // Build every live instance's payload back-to-back into scratch, recording
+    // where each ends; the stride is then the LONGEST payload, so a mixed frame
+    // (body + hand, or an instance with a joint dropped by the confidence
+    // filter) never truncates the richer instances — shorter ones zero-pad.
+    m_geom_scratch.clear();
+    m_geom_ends.clear();
     for(const auto& pose : m_instances)
     {
-      if(slot >= max_inst)
+      if(static_cast<int>(m_geom_ends.size()) >= max_inst)
         break;
-      float* s = pg.data() + static_cast<size_t>(slot) * stride;
-      s[0] = static_cast<float>(pose.track_id);
-      s[1] = static_cast<float>(pose.class_id);
-      s[2] = pose.box.x;
-      s[3] = pose.box.y;
-      s[4] = pose.box.w;
-      s[5] = pose.box.h;
-      const int K = std::min(nkpt, static_cast<int>(pose.keypoints.size()));
-      for(int k = 0; k < K; ++k)
+      appendGeometry(m_geom_scratch, pose, draw);
+      m_geom_ends.push_back(static_cast<int>(m_geom_scratch.size()));
+    }
+
+    int stride = 0, begin = 0;
+    for(const int end : m_geom_ends)
+    {
+      stride = std::max(stride, end - begin);
+      begin = end;
+    }
+
+    if(stride > 0)
+    {
+      pg.assign(static_cast<size_t>(max_inst) * stride, 0.f);
+      begin = 0;
+      for(size_t slot = 0; slot < m_geom_ends.size(); ++slot)
       {
-        s[HEADER + k * 4 + 0] = pose.keypoints[k].x;
-        s[HEADER + k * 4 + 1] = pose.keypoints[k].y;
-        s[HEADER + k * 4 + 2] = pose.keypoints[k].z;
-        s[HEADER + k * 4 + 3] = pose.keypoints[k].confidence;
+        const int end = m_geom_ends[slot];
+        std::copy(
+            m_geom_scratch.begin() + begin, m_geom_scratch.begin() + end,
+            pg.begin() + slot * stride);
+        begin = end;
       }
-      ++slot;
     }
   }
   outputs.count.value = static_cast<int>(m_instances.size());

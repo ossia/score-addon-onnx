@@ -119,7 +119,27 @@ enum class KeypointOutputFormat
   WorldXYZArray, // Flat world-space xyz (meters, hip-origin) from models with a
                  // world-3D output (BlazePose family); falls back to the screen
                  // xyz when the model has none.
+  // Bounding-box formats: normalized [0,1] image coordinates, 4 floats per
+  // detection — the primary one on Geometry, every live one on Poses Geometry,
+  // exactly like the keypoint formats. Note that a keypoint-less detection (Box
+  // Detection workflow) falls back to the XYWH box in the keypoint formats too —
+  // the box is then the only geometry the instance has.
+  BoxXYWH,     // x, y, w, h    (top-left corner + size)
+  BoxX1Y1X2Y2, // x1, y1, x2, y2 (top-left + bottom-right corners)
+  // Full per-instance record: [track_id, class_id, box_x, box_y, box_w, box_h,
+  // (x, y, z, confidence) * K]. Metadata included, no confidence filtering, and
+  // the 6-float header alone for a keypoint-less (box-only) detection. This is
+  // the layout Poses Geometry always had before the outlet became Data
+  // Format-driven, so selecting it there reproduces that buffer exactly.
+  Flattened,
 };
+
+// True for the formats whose Geometry payload is a bounding box, not keypoints.
+inline constexpr bool isBoxFormat(KeypointOutputFormat f) noexcept
+{
+  return f == KeypointOutputFormat::BoxXYWH
+         || f == KeypointOutputFormat::BoxX1Y1X2Y2;
+}
 
 struct PoseDetector : OnnxObject
 {
@@ -168,7 +188,13 @@ public:
 
     struct : halp::enum_t<KeypointOutputFormat, "Data Format">
     {
-      halp_meta(description, "Output data format for GPU rendering");
+      halp_meta(
+          description,
+          "Layout of the Geometry outlets, for GPU rendering: flat keypoint "
+          "arrays, bone lines, the detection bounding box (XYWH / X1Y1X2Y2, "
+          "normalized [0,1]), or Flattened — the full per-instance record "
+          "(ids + box + keypoints). Geometry carries the primary detection, "
+          "Poses Geometry one slot per tracked instance.");
     } data_format;
 
 
@@ -394,8 +420,13 @@ public:
     struct
     {
       halp_meta(name, "Poses Geometry");
-      // Fixed-stride, zero-padded: Max Instances slots, each = [track_id, then
-      // the same layout as Geometry]. count gives the number of live slots.
+      // Fixed-stride, zero-padded: Max Instances slots, each holding one
+      // instance's geometry in the current Data Format — the same payload the
+      // Geometry outlet emits for a single pose. Purely geometric (track ids and
+      // classes live on the Poses outlet) EXCEPT in the Flattened format, which
+      // is the legacy [track_id, class_id, box, keypoints] record. The stride is
+      // the longest payload of the frame, so slot i always starts at
+      // i * (size / Max Instances), and count gives the number of live slots.
       std::vector<float> value;
     } poses_geometry;
 
@@ -689,6 +720,8 @@ private:
   std::vector<Onnx::Detection::Detection> m_dets; // detector output (top-K)
   std::vector<std::pair<float, int>> m_box_sel;   // (score,idx) top-K box select
   std::vector<Onnx::ROI::Rect> m_rois;            // ROIs to landmark this frame
+  std::vector<float> m_geom_scratch;  // packed per-instance geometry payloads
+  std::vector<int> m_geom_ends;       // end offset of each payload in the above
   boost::container::vector<float> m_batch_storage; // packed [N,C,H,W] input
   std::vector<int64_t> m_bbox;                     // batched SimCC [N,2] bbox
   int m_frames_since_detect{0};                   // detector-cadence counter
