@@ -1,10 +1,21 @@
 #pragma once
-#include <cmath>
+#include <Onnx/helpers/compat/tracking_math.hpp>
+
 #include <vector>
 
 // One-Euro filter — velocity-adaptive low-pass smoothing for landmarks.
 // Smooths jitter when the point is still, stays responsive when it moves fast.
 // (Casiez, Roussel, Vogel 2012; the filter MediaPipe uses on its landmarks.)
+//
+// Since the shared filter library landed these are thin wrappers over
+// ossia::one_euro_filter. BEHAVIOUR NOTE for anyone diffing against the old
+// standalone implementation: the derivative is now taken against the previous
+// *raw* input, as in the Casiez reference implementation, where the old code
+// differentiated against the previous *filtered* value. The old form smoothed
+// the derivative estimate slightly more, so with the same beta the filter now
+// reacts marginally faster during speed changes; at the shipped defaults the
+// difference is far below the landmark noise floor. dt <= 0 now returns the
+// previous output instead of dividing by zero.
 namespace Onnx
 {
 struct OneEuroFilter
@@ -13,37 +24,19 @@ struct OneEuroFilter
   float beta = 0.3f;       // higher = more responsive to speed
   float dcutoff = 1.0f;
 
-  bool initialized = false;
-  float x_prev = 0.0f;
-  float dx_prev = 0.0f;
-
-  static float alpha(float cutoff, float dt)
-  {
-    const float r = 2.0f * 3.14159265358979f * cutoff * dt;
-    return r / (r + 1.0f);
-  }
+  ossia::one_euro_filter<float> impl{};
 
   float filter(float x, float dt)
   {
-    if(!initialized)
-    {
-      initialized = true;
-      x_prev = x;
-      dx_prev = 0.0f;
-      return x;
-    }
-    const float dx = (x - x_prev) / dt;
-    const float a_d = alpha(dcutoff, dt);
-    const float dx_hat = a_d * dx + (1.0f - a_d) * dx_prev;
-    const float cutoff = min_cutoff + beta * std::fabs(dx_hat);
-    const float a = alpha(cutoff, dt);
-    const float x_hat = a * x + (1.0f - a) * x_prev;
-    x_prev = x_hat;
-    dx_prev = dx_hat;
-    return x_hat;
+    // The tunables are public fields written directly by the smoothers below,
+    // so sync them into the shared filter on every call (three float moves).
+    impl.min_cutoff = min_cutoff;
+    impl.beta = beta;
+    impl.d_cutoff = dcutoff;
+    return impl(x, dt);
   }
 
-  void reset() { initialized = false; }
+  void reset() { impl.reset(); }
 };
 
 // One filter per scalar component (e.g. x,y,z per keypoint). Reallocating when
@@ -96,10 +89,7 @@ struct RectSmoother
   void smooth(float* v, float dt = 1.0f)
   {
     // unwrap angle relative to previous so it never jumps by ~2pi
-    float a = v[4];
-    while(a - prev_angle > 3.14159265f) a -= 2.0f * 3.14159265f;
-    while(a - prev_angle < -3.14159265f) a += 2.0f * 3.14159265f;
-    v[4] = a;
+    v[4] = ossia::unwrap_angle(v[4], prev_angle);
     for(int i = 0; i < 5; ++i)
       v[i] = f[i].filter(v[i], dt);
     prev_angle = v[4];
@@ -107,7 +97,8 @@ struct RectSmoother
   }
   void reset()
   {
-    for(auto& x : f) x.reset();
+    for(auto& x : f)
+      x.reset();
     initialized = false;
   }
 };
