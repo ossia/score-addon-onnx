@@ -1,5 +1,7 @@
 #include "PoseDetector_internal.hpp"
 
+#include <cstdlib>
+
 namespace OnnxModels
 {
 
