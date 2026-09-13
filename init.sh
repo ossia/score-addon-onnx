@@ -70,10 +70,8 @@ $SED -i "s/my-process/$ADDON_LC_DASHES/g" **/*.{hpp,cpp,txt} release.sh
 echo -e "# $ADDON\nA new and wonderful [ossia score](https://ossia.io) add-on" > README.md
 
 
-# One uuid for the whole add-on. score matches localaddon.json's "key" against
-# the PLUGIN_UUID compiled into the plug-in, and rejects the add-on outright if
-# they differ -- so every file has to carry the same one. Running uuidgen inside
-# find -exec minted a fresh uuid per file instead.
+# One uuid for the whole add-on: score matches localaddon.json's "key" against the
+# PLUGIN_UUID compiled into the plug-in, and rejects the add-on if they differ.
 ADDON_UUID=$(uuidgen)
 find . \( -name '*.hpp' -o -name '*.cpp' -o -name '*.json' -o -name '*.txt' \) \
   -exec $PERL -pi -e "s|00000000-0000-0000-0000-000000000000|$ADDON_UUID|gi" {} \;
