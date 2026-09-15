@@ -114,6 +114,11 @@ if(SCORE_ONNX_ENABLE_EXTENSIONS)
   set(ONNXRUNTIME_PKG_DIR "${onnxruntime_SOURCE_DIR}")
   block()
     set(CMAKE_UNITY_BUILD 0)
+    # Clang emits weak copies of standard-exception RTTI under -fno-rtti.
+    # Static libc++ provides strong copies, and lld rejects that COMDAT mix.
+    if(CMAKE_CXX_FLAGS MATCHES "(^| )-stdlib=libc\\+\\+($| )")
+      set(OCOS_ENABLE_CPP_RTTI ON)
+    endif()
     add_subdirectory(3rdparty/onnxruntime-extensions)
   endblock()
 endif()
