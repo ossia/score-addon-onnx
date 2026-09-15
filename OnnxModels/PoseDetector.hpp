@@ -17,6 +17,7 @@
 #include <halp/texture.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <vector>
@@ -675,6 +676,12 @@ private:
 
   // Multi-instance persistent-ID tracker (ByteTrack-style; opt-in via Track IDs).
   Onnx::Track::PoseTracker m_tracker;
+  // Wall-clock timestamp of the previous tracker step: camera frames arrive in
+  // real time, so the measured spacing is the honest dt for the Kalman filter
+  // (cameras drop and jitter frames; the old dt=1 assumption did not survive
+  // that). See trackerDt().
+  std::chrono::steady_clock::time_point m_last_track_time{};
+  float trackerDt();
 
   // Tracking-loop state (two-stage path)
   bool m_tracking{false};               // valid ROI carried from prev frame?

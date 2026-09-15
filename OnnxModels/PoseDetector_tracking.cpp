@@ -10,10 +10,25 @@ namespace OnnxModels
 // time_since_update, so the death sweep (max_age) fires and a track surviving a
 // brief dropout keeps its id on re-acquisition instead of being matched as a
 // fresh detection -> new id. Without this the tracker is frozen, not aged.
+// Real elapsed seconds between tracker steps, from the wall clock: camera
+// frames arrive in real time, so this is the honest dt for the Kalman motion
+// model even when the camera stutters or drops frames. Returns <= 0 (meaning
+// "one nominal frame") on the first call or after an implausible pause.
+float PoseDetector::trackerDt()
+{
+  using clk = std::chrono::steady_clock;
+  const auto now = clk::now();
+  float dt = -1.f;
+  if(m_last_track_time.time_since_epoch().count() != 0)
+    dt = std::chrono::duration<float>(now - m_last_track_time).count();
+  m_last_track_time = now;
+  return (dt > 0.f && dt <= 2.f) ? dt : -1.f;
+}
+
 void PoseDetector::ageTracker()
 {
   m_track_in.clear();
-  m_tracker.update(m_track_in);
+  m_tracker.update(m_track_in, trackerDt());
 }
 
 // Rebuild m_instances from the still-live, recently-seen tracker tracks (their
@@ -493,7 +508,7 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
     if(cfg.use_reid)
       embedInstances(); // crop + Re-ID -> m_track_in[i].embedding
 
-    const auto& ids = m_tracker.update(m_track_in);
+    const auto& ids = m_tracker.update(m_track_in, trackerDt());
     for(size_t i = 0; i < m_instances.size(); ++i)
     {
       const int id = (i < ids.size()) ? ids[i] : -1;
