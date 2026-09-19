@@ -139,16 +139,51 @@ endif()
 # and disable the addon: the browser build loses the onnx objects, everything
 # else still links.
 #
-# The check reads the archive the way strings(1) would: each entry of a wasm
-# object's `target_features` section is a length-prefixed name whose length byte
-# (0x07 for "atomics") is non-printable, so every feature name lands in a run of
-# its own, and matching it exactly cannot collide with a mangled symbol.
+# An archive of wasm objects says so directly: each entry of a `target_features`
+# section is a length-prefixed name whose length byte (0x07 for "atomics") is
+# non-printable, so every feature name lands in a run of its own and matching it
+# exactly cannot collide with a mangled symbol.
+#
+# An archive built with LTO holds bitcode instead, where the features are a
+# function attribute and no `target_features` section exists yet -- it is
+# emitted at codegen. Nothing can be read out of it with strings(1): the
+# attribute lives in the bit-packed string table. Ask the compiler instead.
 if(EMSCRIPTEN)
   file(STRINGS "${onnxruntime_LIBRARY}" _ort_wasm_atomics
     REGEX "^atomics$"
     LENGTH_MINIMUM 7
     LENGTH_MAXIMUM 7
     LIMIT_COUNT 1)
+
+  if(NOT _ort_wasm_atomics)
+    set(_ort_probe "${CMAKE_CURRENT_BINARY_DIR}/onnxruntime-atomics-probe")
+    file(REMOVE_RECURSE "${_ort_probe}")
+    file(MAKE_DIRECTORY "${_ort_probe}")
+
+    execute_process(
+      COMMAND "${CMAKE_AR}" t "${onnxruntime_LIBRARY}"
+      OUTPUT_VARIABLE _ort_members
+      ERROR_QUIET)
+    string(REGEX MATCH "[^\r\n]+" _ort_member "${_ort_members}")
+
+    if(_ort_member)
+      execute_process(
+        COMMAND "${CMAKE_AR}" x "${onnxruntime_LIBRARY}" "${_ort_member}"
+        WORKING_DIRECTORY "${_ort_probe}"
+        ERROR_QUIET)
+      get_filename_component(_ort_member_file "${_ort_member}" NAME)
+      execute_process(
+        COMMAND "${CMAKE_CXX_COMPILER}" -x ir -S -emit-llvm
+                -o - "${_ort_probe}/${_ort_member_file}"
+        OUTPUT_VARIABLE _ort_ir
+        ERROR_QUIET)
+      if(_ort_ir MATCHES "\"target-features\"=\"[^\"]*\\+atomics")
+        set(_ort_wasm_atomics ON)
+      endif()
+    endif()
+
+    file(REMOVE_RECURSE "${_ort_probe}")
+  endif()
 
   if(NOT _ort_wasm_atomics)
     message(WARNING
