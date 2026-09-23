@@ -285,6 +285,14 @@ if(NOT AVND_ADDON_SCORE)
 endif()
 
 
+# The TensorRT execution provider in onnxruntime's GPU package links a specific
+# TensorRT major (libnvinfer.so.10 / nvinfer_10.dll for 1.27.1). score ships no
+# TensorRT, so installing it yields a library that can never load, and onnxruntime
+# advertises TensorrtExecutionProvider because the file is present -- selecting it then
+# falls back to CPU. Enable only alongside a matching TensorRT runtime.
+option(SCORE_ONNX_INSTALL_TENSORRT_PROVIDER
+       "Install onnxruntime's TensorRT execution provider" OFF)
+
 if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES AND NOT SCORE_NO_INSTALL_ONNXRUNTIME)
     if(APPLE)
         file(GLOB ONNXRUNTIME_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dylib")
@@ -292,6 +300,10 @@ if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES AND NOT SCORE_NO_IN
         file(GLOB ONNXRUNTIME_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dll")
     else()
         file(GLOB ONNXRUNTIME_FILES "${onnxruntime_SOURCE_DIR}/lib/*.so*")
+    endif()
+
+    if(NOT SCORE_ONNX_INSTALL_TENSORRT_PROVIDER)
+      list(FILTER ONNXRUNTIME_FILES EXCLUDE REGEX "onnxruntime_providers_tensorrt")
     endif()
 
   if(APPLE)
