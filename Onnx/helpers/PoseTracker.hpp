@@ -1,18 +1,24 @@
 #pragma once
 #include <Onnx/helpers/OneEuro.hpp>
+#include <Onnx/helpers/SkeletonFormats.hpp>
 
-#include <Eigen/Dense>
+#include <Onnx/helpers/compat/tracking_math.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <string_view>
 #include <vector>
 
 // Multi-instance pose tracker — assigns a persistent track_id to each detected
 // person/hand/face across frames, ByteTrack-style:
-//   * per-track constant-velocity Kalman (the ByteTrack 8-dim xyah filter),
+//   * per-track constant-velocity Kalman (the ByteTrack xyah filter, rebuilt on
+//     the shared per-axis filters of ossia/math/tracking.hpp and integrating
+//     over REAL elapsed time — velocities are in units/second, so an irregular
+//     source no longer corrupts the motion model),
 //   * two-stage association (high-score IoU+OKS, then low-score IoU recovery),
 //   * OKS pose-similarity cue (disambiguates crossings where box-IoU is
 //     degenerate; works for box-less / bottom-up models too),
@@ -21,9 +27,18 @@
 //   * One-Euro smoothing owned PER TRACK (no cross-identity bleed on crossings).
 //
 // Validated standalone in libreonnx/posetrack_example.cpp before integration.
-// ossia-free; depends only on Eigen + OneEuro.hpp. Operates in whatever
-// coordinate space the caller uses consistently (PoseDetector feeds normalized
-// [0,1] image coordinates).
+// Free of ossia::value / networking; depends only on the header-only math of
+// ossia/math (no more Eigen: the xyah filter is block-diagonal per axis, so the
+// full 8x8 form decouples exactly into 4 scalar position-velocity filters).
+// Operates in whatever coordinate space the caller uses consistently
+// (PoseDetector feeds normalized [0,1] image coordinates).
+//
+// Time: update() takes the elapsed seconds since the previous call; when the
+// caller cannot know (or a legacy call site passes nothing) it falls back to
+// one nominal frame (1 / Config::nominal_rate). Frame-counted knobs (max_age,
+// min_hits) keep their historical frame semantics; every noise term is scaled
+// so that at the nominal rate the filter is numerically identical to the
+// historical dt=1 implementation.
 namespace Onnx
 {
 namespace Track
@@ -39,6 +54,75 @@ inline float keypointSigma(int idx, int n)
   if(n == 17 && idx >= 0 && idx < 17)
     return coco17[idx];
   return 0.05f;
+}
+
+// Resolve the stable torso-anchor joints (neck/thorax/pelvis, shoulders,
+// hips) of a keypoint layout, identified by its keypoint count. Resolution
+// goes through the SkeletonFormats tables instead of hardcoded indices:
+//  - 33 keypoints = BlazePose native: the anchor indices are read out of the
+//    blaze33->coco17 mapping (shoulder/hip rows are direct() entries),
+//  - other counts are matched to a target layout of that size and its joints
+//    found BY NAME (shoulder/hip/neck/thorax/pelvis) in namesFor().
+// Layouts without a torso (hands, faces) resolve to 0 anchors -> the caller
+// falls back to the instance centroid. Returns the number of anchors (<= 6).
+inline int anchorJointsFor(int n_kpts, std::array<int, 6>& out)
+{
+  namespace S = Onnx::Skel;
+  if(n_kpts == 33)
+  {
+    // BlazePose native: pull the source indices of the COCO shoulder/hip rows.
+    const auto map = S::mappingFor(
+        S::SourceSkeleton::BlazePose33, S::TargetSkeleton::Coco17);
+    if(map.size() < 13)
+      return 0;
+    int n = 0;
+    for(int coco : {5, 6, 11, 12}) // L/R shoulder, L/R hip
+      if(map[coco].n == 1)
+        out[n++] = map[coco].idx[0];
+    return n;
+  }
+
+  S::TargetSkeleton layout;
+  switch(n_kpts)
+  {
+    // 17 is ambiguous (COCO-17 / H36M-17 / AP-10K): prefer COCO, the same
+    // precedent keypointSigma() sets.
+    case 17: layout = S::TargetSkeleton::Coco17; break;
+    case 18: layout = S::TargetSkeleton::OpenPoseCoco18; break;
+    case 25: layout = S::TargetSkeleton::OpenPoseBody25; break;
+    case 26: layout = S::TargetSkeleton::Halpe26; break;
+    case 16: layout = S::TargetSkeleton::Mpii16; break;
+    default: return 0;
+  }
+  const auto names = S::namesFor(layout);
+  const auto contains_ci = [](std::string_view hay, std::string_view needle) {
+    if(needle.size() > hay.size())
+      return false;
+    for(std::size_t i = 0; i + needle.size() <= hay.size(); i++)
+    {
+      std::size_t j = 0;
+      for(; j < needle.size(); j++)
+      {
+        const char a = hay[i + j], b = needle[j];
+        const char al = (a >= 'A' && a <= 'Z') ? char(a - 'A' + 'a') : a;
+        if(al != b)
+          break;
+      }
+      if(j == needle.size())
+        return true;
+    }
+    return false;
+  };
+  int n = 0;
+  for(std::size_t i = 0; i < names.size() && n < 6; i++)
+  {
+    const std::string_view name = names[i];
+    if(contains_ci(name, "shoulder") || contains_ci(name, "hip")
+       || contains_ci(name, "neck") || contains_ci(name, "thorax")
+       || contains_ci(name, "pelvis"))
+      out[n++] = int(i);
+  }
+  return n;
 }
 
 struct Box
@@ -70,6 +154,10 @@ enum class MotionGate : std::uint8_t
 
 struct Config
 {
+  // Reference frame rate: the rate at which the frame-counted knobs (max_age,
+  // min_hits, snapshot_interval...) and the historical noise tuning were
+  // calibrated. update() without an explicit dt assumes one such frame.
+  float nominal_rate = 30.f;
   float track_high = 0.5f;  // >= : stage-1 (high-score) detections
   float track_low = 0.1f;   // [low,high): stage-2 recovery detections
   float new_track = 0.6f;   // birth a track only above this score
@@ -81,7 +169,30 @@ struct Config
   int min_hits = 3;         // tentative -> confirmed
   int max_age = 30;         // frames a lost track is kept alive (~ fps)
   bool use_oks = true;
-  bool use_dir = true;      // OC-SORT OCM term
+  bool use_dir = true;      // OC-SORT OCM term (multi-dt, see cost())
+  // Hybrid-SORT TCM (arXiv:2308.00783): add |predicted track confidence -
+  // detection confidence| to the association cost. Confidence sinks smoothly
+  // as an occluder approaches and recovers on exit, so its trend tells
+  // crossing tracks apart exactly when their boxes are entangled (+4 HOTA in
+  // their ablation; generalises to ByteTrack/SORT/DeepSORT). The prediction is
+  // Kalman-filtered in the high-score stage but two-point LINEAR in the
+  // low-score stage: confidence changes abruptly at occlusion onset/exit and
+  // the Kalman lags those transitions (their Table IV Kalman/Linear split).
+  bool use_tcm = true;
+  float w_conf = 1.0f;      // TCM weight (paper sweeps 1.0-1.5)
+  // Anchor-keypoint direction (Hybrid-SORT ROCM spirit): evaluate the OCM
+  // direction term on a stable torso-anchor subset (neck/shoulders/hips)
+  // averaged, instead of the box center alone. Distal keypoints (wrists,
+  // ankles) are deliberately excluded: Hybrid-SORT measured width-modulated
+  // costs at -5 HOTA vs height-modulated because limb motion makes width
+  // irregular, and the same irregularity poisons distal velocity. Below
+  // dir_anchor_min_area (box w*h, normalized coords) the term falls back to
+  // the instance centroid: CAMELTrack Exp. 5 shows the keypoint cue CHANGES
+  // SIGN with subject scale (helps close-up DanceTrack, degrades far-viewpoint
+  // SportsMOT). NOTE: the sign-flip is published; gating it on box area is our
+  // synthesis, not a published remedy - hence a conservative tunable.
+  bool dir_anchors = true;
+  float dir_anchor_min_area = 0.01f; // ~0.1 x 0.1 of the frame
   bool smooth = true;
   float smooth_min_cutoff = 1.0f;
   float smooth_beta = 0.3f;
@@ -145,93 +256,78 @@ struct Config
   bool strict_confirm = false;
 };
 
-// ByteTrack 8-dim Kalman filter (state [x,y,a,h, vx,vy,va,vh], a = w/h).
+// ByteTrack xyah Kalman filter (state [x,y,a,h] + velocities, a = w/h), built
+// on 4 independent scalar position-velocity filters. All the historical F/Q/R
+// matrices were (block-)diagonal per axis, so this is the exact same filter -
+// except that it now integrates over real elapsed time: velocities are in
+// units/second and the process noise grows with dt. At dt == 1/nominal_rate the
+// numbers reproduce the historical dt=1 tuning bit-for-bit (modulo the velocity
+// unit change).
 class KalmanFilter
 {
 public:
-  using State = Eigen::Matrix<float, 8, 1>;
-  using Cov = Eigen::Matrix<float, 8, 8>;
-  using Meas = Eigen::Vector4f;
+  using Meas = std::array<float, 4>;
+  // One position-velocity filter per component of [x, y, a, h].
+  using State = std::array<ossia::kalman_pv_filter, 4>;
 
-  KalmanFilter()
+  void initiate(const Meas& m, State& s, float rate) const
   {
-    _F.setIdentity();
+    const float h = m[3];
+    const Meas sp{2 * _spw * h, 2 * _spw * h, 1e-2f, 2 * _spw * h};
+    // Historical velocity stds are per-frame; velocities are now per-second.
+    const Meas sv{10 * _svw * h * rate, 10 * _svw * h * rate, 1e-5f * rate,
+                  10 * _svw * h * rate};
     for(int i = 0; i < 4; ++i)
-      _F(i, i + 4) = 1.f; // dt = 1
-    _H.setZero();
+      s[i].initiate(m[i], sp[i] * sp[i], sv[i] * sv[i]);
+  }
+
+  void predict(State& s, float dt, float rate) const
+  {
+    const float h = std::max(1e-3f, s[3].p); // floor: a 0/neg/NaN height would
+                                             // make R/Q singular
+    const float ratio = std::max(dt * rate, 1e-6f); // frames' worth of noise
+    const Meas sp{_spw * h, _spw * h, 1e-2f, _spw * h};
+    const Meas sv{_svw * h * rate, _svw * h * rate, 1e-5f * rate, _svw * h * rate};
     for(int i = 0; i < 4; ++i)
-      _H(i, i) = 1.f;
+      s[i].predict(dt, ossia::kalman_pv_filter::diagonal(sp[i], sv[i], ratio));
   }
 
-  void initiate(const Meas& m, State& mean, Cov& cov) const
+  void update(State& s, const Meas& m) const
   {
-    mean.setZero();
-    mean.head<4>() = m;
-    const float h = m(3);
-    State s;
-    s << 2 * _spw * h, 2 * _spw * h, 1e-2f, 2 * _spw * h, 10 * _svw * h,
-        10 * _svw * h, 1e-5f, 10 * _svw * h;
-    cov = (s.array() * s.array()).matrix().asDiagonal();
-  }
-
-  void predict(State& mean, Cov& cov) const
-  {
-    const float h = std::max(1e-3f, mean(3)); // floor: a 0/neg/NaN height would
-                                              // make R/Q singular -> inverse NaN
-    State s;
-    s << _spw * h, _spw * h, 1e-2f, _spw * h, _svw * h, _svw * h, 1e-5f,
-        _svw * h;
-    const Cov Q = (s.array() * s.array()).matrix().asDiagonal();
-    mean = _F * mean;
-    cov = _F * cov * _F.transpose() + Q;
-  }
-
-  void update(State& mean, Cov& cov, const Meas& m) const
-  {
-    const float h = std::max(1e-3f, mean(3)); // floor: a 0/neg/NaN height would
-                                              // make R/Q singular -> inverse NaN
-    Meas s;
-    s << _spw * h, _spw * h, 1e-1f, _spw * h;
-    const Eigen::Matrix4f R = (s.array() * s.array()).matrix().asDiagonal();
-    const Meas pm = _H * mean;
-    const Eigen::Matrix4f pc = _H * cov * _H.transpose() + R;
-    const Eigen::Matrix<float, 8, 4> K
-        = cov * _H.transpose() * pc.inverse();
-    mean = mean + K * (m - pm);
-    cov = (Cov::Identity() - K * _H) * cov;
+    const float h = std::max(1e-3f, s[3].p);
+    const Meas sr{_spw * h, _spw * h, 1e-1f, _spw * h};
+    for(int i = 0; i < 4; ++i)
+      s[i].update(m[i], sr[i] * sr[i]);
   }
 
   // Squared Mahalanobis distance of measurement m from the predicted state, in
-  // measurement space (4-DOF xyah). Pass the POST-predict mean/cov (as held by a
+  // measurement space (4-DOF xyah). Pass the POST-predict state (as held by a
   // track during association). Covariance growth over missed frames makes this
-  // gate naturally permit larger jumps after longer occlusions.
-  float gatingDistance(const State& mean, const Cov& cov, const Meas& m) const
+  // gate naturally permit larger jumps after longer occlusions. The historical
+  // covariance was block-diagonal per axis, so the sum of per-axis terms is the
+  // exact same quantity the old 4x4 inverse computed.
+  float gatingDistance(const State& s, const Meas& m) const
   {
-    const float h = std::max(1e-3f, mean(3)); // floor: a 0/neg/NaN height would
-                                              // make R/Q singular -> inverse NaN
-    Meas s;
-    s << _spw * h, _spw * h, 1e-1f, _spw * h;
-    const Eigen::Matrix4f R = (s.array() * s.array()).matrix().asDiagonal();
-    const Meas pm = _H * mean;
-    const Eigen::Matrix4f pc = _H * cov * _H.transpose() + R;
-    const Meas d = m - pm;
-    return (d.transpose() * pc.inverse() * d).value(); // 1x1 -> scalar
+    const float h = std::max(1e-3f, s[3].p);
+    const Meas sr{_spw * h, _spw * h, 1e-1f, _spw * h};
+    float d = 0.f;
+    for(int i = 0; i < 4; ++i)
+      d += s[i].gating_distance2(m[i], sr[i] * sr[i]);
+    return d;
   }
 
 private:
   float _spw = 1.f / 20.f;  // std_weight_position
   float _svw = 1.f / 160.f; // std_weight_velocity
-  Eigen::Matrix<float, 8, 8> _F;
-  Eigen::Matrix<float, 4, 8> _H;
 };
 
-inline Eigen::Vector4f boxToXyah(const Box& b)
+inline KalmanFilter::Meas boxToXyah(const Box& b)
 {
   return {b.cx, b.cy, (b.h > 0 ? b.w / b.h : 0.f), b.h};
 }
-inline Box xyahToBox(const Eigen::Vector4f& m)
+inline Box xyahToBox(const KalmanFilter::State& s)
 {
-  return {m(0), m(1), m(2) * m(3), m(3)};
+  return {s[0].p, s[1].p, s[2].p * s[3].p, s[3].p};
 }
 
 inline float iou(const Box& a, const Box& b)
@@ -285,8 +381,10 @@ inline float cosine(const std::vector<float>& a, const std::vector<float>& b)
 struct Tracklet
 {
   int id = -1;
-  KalmanFilter::State mean;
-  KalmanFilter::Cov cov;
+  KalmanFilter::State kstate{};
+  // Seconds since the last matched detection (the time-integral counterpart of
+  // time_since_update, which counts frames).
+  float lost_s = 0.f;
 
   std::vector<Keypoint> kpts;        // last observed, motion-compensated
   std::vector<Keypoint> kpts_smooth; // One-Euro output (owned by this id)
@@ -311,11 +409,29 @@ struct Tracklet
   // appearance stabilizes. Cleared once an id is gallery-confirmed.
   bool id_provisional = true;
 
-  // OC-SORT direction history
+  // OC-SORT direction history. prev_cx/prev_cy hold the pre-update predicted
+  // center (for the velocity re-seed); the rings below hold OBSERVED
+  // positions for the multi-dt direction term: index 0 is the most recent
+  // matched detection, index k is k detection-frames earlier.
   float prev_cx = 0, prev_cy = 0;
   bool have_dir = false;
+  std::array<std::array<float, 2>, 4> obs_hist{}; // observed box centers
+  std::uint8_t obs_count = 0;
+  // Anchor-keypoint history: observed positions of up to 6 torso anchors
+  // (resolved via anchorJointsFor). score <= 0 marks an invalid sample.
+  std::array<std::array<Keypoint, 6>, 4> anch_hist{};
+  std::array<int, 6> anch_idx{};
+  int anch_n = 0;       // number of resolved anchors
+  int anch_for_n = -1;  // keypoint count the anchors were resolved for
 
-  Box box() const { return xyahToBox(mean.head<4>()); }
+  // Hybrid-SORT TCM: Kalman state over the detection confidence
+  // (p = confidence, v = confidence rate per second), plus the confidence of
+  // the match before last (c[t-2], -1 while there is none) for the linear
+  // extrapolation of the low-score stage. `score` itself is c[t-1].
+  ossia::kalman_pv_filter conf_kf{};
+  float conf_prev = -1.f;
+
+  Box box() const { return xyahToBox(kstate); }
 };
 
 class PoseTracker
@@ -335,8 +451,17 @@ public:
   // the assigned track id (-1 if the detection started a still-tentative track
   // or was dropped). After this call, tracks() holds the live tracklets with
   // smoothed keypoints.
-  const std::vector<int>& update(const std::vector<Detection>& dets)
+  //
+  // dt: elapsed seconds since the previous update() call. Pass the real
+  // measured spacing for irregular sources; anything <= 0 falls back to one
+  // nominal frame (1 / Config::nominal_rate), reproducing the historical
+  // fixed-rate behaviour.
+  const std::vector<int>& update(const std::vector<Detection>& dets, float dt = -1.f)
   {
+    if(dt <= 0.f)
+      dt = 1.f / _cfg.nominal_rate;
+    dt = std::clamp(dt, 1e-4f, 10.f);
+
     // All per-frame scratch is held in reused members (cleared, never reallocated
     // once warm) — the hot path must not allocate. `out` is returned by const&;
     // callers consume it before the next update() overwrites it.
@@ -345,11 +470,13 @@ public:
 
     // 1) predict all tracks forward; motion-compensate their keypoints so OKS
     //    compares pose *shape*, not stale position (the key tuning lesson).
+    const auto conf_q = ossia::kalman_pv_filter::cwna(kConfSigmaA, dt);
     for(auto& t : _tracks)
     {
-      const float pcx = t.mean(0), pcy = t.mean(1);
-      _kf.predict(t.mean, t.cov);
-      const float dx = t.mean(0) - pcx, dy = t.mean(1) - pcy;
+      const float pcx = t.kstate[0].p, pcy = t.kstate[1].p;
+      _kf.predict(t.kstate, dt, _cfg.nominal_rate);
+      t.conf_kf.predict(dt, conf_q); // TCM confidence state coasts too
+      const float dx = t.kstate[0].p - pcx, dy = t.kstate[1].p - pcy;
       for(auto& k : t.kpts)
       {
         k.x += dx;
@@ -357,6 +484,7 @@ public:
       }
       ++t.age;
       ++t.time_since_update;
+      t.lost_s += dt;
     }
 
     // 2) split detections by score
@@ -502,12 +630,45 @@ private:
     return true;
   }
 
+  // One multi-dt direction term: angle between the observed track direction v
+  // and the track->candidate direction w, in [0,1]. No-op on degenerate spans.
+  static void angleTerm(
+      float vx, float vy, float wx, float wy, float& acc, int& terms)
+  {
+    const float nv = std::sqrt(vx * vx + vy * vy);
+    const float nw = std::sqrt(wx * wx + wy * wy);
+    if(nv <= 1e-4f || nw <= 1e-4f)
+      return;
+    float cosang = (vx * wx + vy * wy) / (nv * nw);
+    cosang = std::max(-1.f, std::min(1.f, cosang));
+    acc += std::acos(cosang) / 3.14159265f;
+    ++terms;
+  }
+
   float cost(const Tracklet& t, const Detection& d, bool full) const
   {
     const Box tb = t.box();
     const float i = iou(tb, d.box);
     if(!full)
-      return (i >= _cfg.gate_iou) ? (1.f - i) : kReject;
+    {
+      // ByteTrack low-score recovery stage: IoU gate, plus the TCM term with
+      // the two-point LINEAR confidence prediction. The Kalman estimate is
+      // deliberately not used here: confidence collapses abruptly at
+      // occlusion onset - exactly what routes a detection into this stage -
+      // and the Kalman lags the transition (Hybrid-SORT's ablated split;
+      // linear in the high-score stage is worse than nothing).
+      if(i < _cfg.gate_iou)
+        return kReject;
+      float c = 1.f - i;
+      if(_cfg.use_tcm)
+      {
+        float chat = (t.conf_prev >= 0.f) ? t.score + (t.score - t.conf_prev)
+                                          : t.score;
+        chat = std::clamp(chat, 0.f, 1.f);
+        c += _cfg.w_conf * std::abs(chat - d.score);
+      }
+      return c;
+    }
 
     float o = 0.f;
     const bool have_oks
@@ -536,14 +697,17 @@ private:
       {
         const float ddx = d.box.cx - tb.cx, ddy = d.box.cy - tb.cy;
         const float disp = std::sqrt(ddx * ddx + ddy * ddy);
+        // max_speed is in box-sizes per nominal frame; the budget covers the
+        // real elapsed time since the track was last seen (identical to the
+        // historical 1 + frames_lost at the nominal rate).
         const float budget = _cfg.max_speed * std::max(tb.w, tb.h)
-                             * float(1 + t.time_since_update);
+                             * (1.f + t.lost_s * _cfg.nominal_rate);
         if(disp > budget)
           return kReject;
       }
       else if(_cfg.motion_gate == MotionGate::Mahalanobis)
       {
-        if(_kf.gatingDistance(t.mean, t.cov, boxToXyah(d.box)) > _cfg.maha_thresh)
+        if(_kf.gatingDistance(t.kstate, boxToXyah(d.box)) > _cfg.maha_thresh)
           return kReject;
       }
       if(_cfg.gate_size)
@@ -563,21 +727,67 @@ private:
     if(have_emb)
       c += _cfg.w_emb * (1.f - emb_cos);
 
-    // OC-SORT velocity-direction consistency (cheap, helps non-linear motion)
-    if(_cfg.use_dir && t.have_dir)
+    // OC-SORT direction consistency over OBSERVED positions, multi-dt: the
+    // angle term is summed over temporal baselines of 1, 2 and 3 detection
+    // frames (OC-SORT Table 7: gains stop at dt=3 and decline at 5 - a
+    // one-frame direction is mostly detector noise, a longer baseline
+    // averages it out). With keypoints and a large-enough box the term is
+    // averaged over the stable torso anchors (Hybrid-SORT's ROCM averages
+    // over four box corners the same way); small or keypointless instances
+    // use the box center. Everything is averaged over the (anchor, dt) terms
+    // so the magnitude keeps the single-term [0,1] scale and w_dir default.
+    if(_cfg.use_dir && t.obs_count >= 2)
     {
-      const float vx = t.mean(0) - t.prev_cx, vy = t.mean(1) - t.prev_cy;
-      const float tx = d.box.cx - t.prev_cx, ty = d.box.cy - t.prev_cy;
-      const float nv = std::sqrt(vx * vx + vy * vy);
-      const float nt = std::sqrt(tx * tx + ty * ty);
-      if(nv > 1e-4f && nt > 1e-4f)
+      float acc = 0.f;
+      int terms = 0;
+      const int max_dt = std::min<int>(3, t.obs_count - 1);
+      const bool anchors_ok = _cfg.dir_anchors && t.anch_n > 0
+                              && t.anch_for_n == (int)d.keypoints.size()
+                              && tb.w * tb.h >= _cfg.dir_anchor_min_area;
+      if(anchors_ok)
       {
-        float cosang = (vx * tx + vy * ty) / (nv * nt);
-        cosang = std::max(-1.f, std::min(1.f, cosang));
-        const float ang = std::acos(cosang);        // [0,pi]
-        c += _cfg.w_dir * (ang / 3.14159265f);       // [0,1]
+        for(int a = 0; a < t.anch_n; ++a)
+        {
+          const auto& dk = d.keypoints[t.anch_idx[a]];
+          if(dk.score <= 0.1f)
+            continue;
+          for(int k = 1; k <= max_dt; ++k)
+          {
+            // v: this anchor's displacement over the last k observations;
+            // w: from its position k-1 observations back to the candidate's
+            //    anchor (the same k-frame span, shifted one frame on).
+            const auto& h0 = t.anch_hist[0][a];
+            const auto& hv = t.anch_hist[k][a];
+            const auto& hw = t.anch_hist[k - 1][a];
+            if(h0.score <= 0.1f || hv.score <= 0.1f || hw.score <= 0.1f)
+              continue;
+            angleTerm(
+                h0.x - hv.x, h0.y - hv.y, dk.x - hw.x, dk.y - hw.y, acc, terms);
+          }
+        }
       }
+      if(terms == 0) // centroid fallback (small box, no keypoints, occluded anchors)
+      {
+        for(int k = 1; k <= max_dt; ++k)
+        {
+          const auto& h0 = t.obs_hist[0];
+          const auto& hv = t.obs_hist[k];
+          const auto& hw = t.obs_hist[k - 1];
+          angleTerm(
+              h0[0] - hv[0], h0[1] - hv[1], d.box.cx - hw[0], d.box.cy - hw[1],
+              acc, terms);
+        }
+      }
+      if(terms > 0)
+        c += _cfg.w_dir * (acc / float(terms));
     }
+
+    // Hybrid-SORT TCM, high-score stage: Kalman-predicted track confidence
+    // vs the detection's. An occluded person's confidence trends down while
+    // the occluder's stays high, so this separates them while their boxes
+    // (and even poses) are entangled.
+    if(_cfg.use_tcm)
+      c += _cfg.w_conf * std::abs(std::clamp(t.conf_kf.p, 0.f, 1.f) - d.score);
     return c;
   }
 
@@ -620,33 +830,65 @@ private:
     // OC-SORT velocity re-seed (ORU spirit): if the track was lost for a gap,
     // trust the new observation's implied velocity over the drifted prediction.
     const int gap = t.time_since_update;
-    t.prev_cx = t.mean(0);
-    t.prev_cy = t.mean(1);
+    const float gap_s = std::max(t.lost_s, 1e-4f); // seconds since last match
+    t.prev_cx = t.kstate[0].p;
+    t.prev_cy = t.kstate[1].p;
 
-    _kf.update(t.mean, t.cov, boxToXyah(d.box));
+    _kf.update(t.kstate, boxToXyah(d.box));
 
     if(gap > 1)
     {
-      const float vx = (d.box.cx - t.prev_cx) / (float)gap;
-      const float vy = (d.box.cy - t.prev_cy) / (float)gap;
-      t.mean(4) = vx;
-      t.mean(5) = vy;
+      // Velocity implied by the observations across the gap, in units/second.
+      t.kstate[0].v = (d.box.cx - t.prev_cx) / gap_s;
+      t.kstate[1].v = (d.box.cy - t.prev_cy) / gap_s;
     }
     t.have_dir = true;
+
+    // TCM confidence state + history (t.score still holds c[t-1] here).
+    t.conf_prev = t.score;
+    t.conf_kf.update(d.score, kConfMeasStd * kConfMeasStd);
+
+    // Observed-position rings for the multi-dt direction term.
+    for(std::size_t k = t.obs_hist.size() - 1; k > 0; --k)
+      t.obs_hist[k] = t.obs_hist[k - 1];
+    t.obs_hist[0] = {d.box.cx, d.box.cy};
+    if(t.obs_count < t.obs_hist.size())
+      ++t.obs_count;
+    if((int)d.keypoints.size() != t.anch_for_n)
+    {
+      // Layout changed (or first keypoints): re-resolve anchors, drop stale
+      // history so directions never mix two layouts.
+      t.anch_for_n = (int)d.keypoints.size();
+      t.anch_n = anchorJointsFor(t.anch_for_n, t.anch_idx);
+      for(auto& h : t.anch_hist)
+        h.fill(Keypoint{0.f, 0.f, 0.f, 0.f});
+    }
+    if(t.anch_n > 0)
+    {
+      for(std::size_t k = t.anch_hist.size() - 1; k > 0; --k)
+        t.anch_hist[k] = t.anch_hist[k - 1];
+      for(int a = 0; a < t.anch_n; ++a)
+        t.anch_hist[0][a] = d.keypoints[t.anch_idx[a]];
+    }
 
     t.score = d.score;
     t.kpts = d.keypoints;
 
-    // per-track One-Euro on the observed keypoints
+    // per-track One-Euro on the observed keypoints. The filter's dt is in
+    // nominal-frame units so the historical min_cutoff/beta tuning keeps its
+    // feel at the nominal rate while still stretching over real gaps.
     if(_cfg.smooth && !d.keypoints.empty())
     {
+      const float smooth_dt = gap_s * _cfg.nominal_rate;
       t.smoother.configure(_cfg.smooth_min_cutoff, _cfg.smooth_beta);
       t.smoother.ensure(d.keypoints.size() * 2);
       t.kpts_smooth.resize(d.keypoints.size());
       for(size_t i = 0; i < d.keypoints.size(); ++i)
       {
-        t.kpts_smooth[i].x = t.smoother.f[2 * i + 0].filter(d.keypoints[i].x, 1.f);
-        t.kpts_smooth[i].y = t.smoother.f[2 * i + 1].filter(d.keypoints[i].y, 1.f);
+        t.kpts_smooth[i].x
+            = t.smoother.f[2 * i + 0].filter(d.keypoints[i].x, smooth_dt);
+        t.kpts_smooth[i].y
+            = t.smoother.f[2 * i + 1].filter(d.keypoints[i].y, smooth_dt);
         t.kpts_smooth[i].z = d.keypoints[i].z;
         t.kpts_smooth[i].score = d.keypoints[i].score;
       }
@@ -722,6 +964,7 @@ private:
 
     ++t.hits;
     t.time_since_update = 0;
+    t.lost_s = 0.f;
     if(t.hits >= _cfg.min_hits)
       t.confirmed = true;
   }
@@ -752,7 +995,18 @@ private:
           stderr, "[track] BIRTH id=%d (%s) score=%.2f reid=%s\n", t.id,
           reacquired >= 0 ? "RE-ACQUIRED" : "new", d.score,
           d.embedding.empty() ? "no" : "yes");
-    _kf.initiate(boxToXyah(d.box), t.mean, t.cov);
+    _kf.initiate(boxToXyah(d.box), t.kstate, _cfg.nominal_rate);
+    // TCM confidence filter: position at the detector's confidence jitter,
+    // rate wide open enough to latch onto an occlusion ramp quickly.
+    t.conf_kf.initiate(
+        d.score, kConfMeasStd * kConfMeasStd, kConfSigmaA * kConfSigmaA);
+    t.obs_hist[0] = {d.box.cx, d.box.cy};
+    t.obs_count = 1;
+    t.anch_for_n = (int)d.keypoints.size();
+    t.anch_n = anchorJointsFor(t.anch_for_n, t.anch_idx);
+    if(t.anch_n > 0)
+      for(int a = 0; a < t.anch_n; ++a)
+        t.anch_hist[0][a] = d.keypoints[t.anch_idx[a]];
     t.kpts = d.keypoints;
     t.kpts_smooth = d.keypoints;
     t.embedding = d.embedding;
@@ -883,6 +1137,11 @@ private:
   }
 
   static constexpr float kReject = std::numeric_limits<float>::max();
+  // TCM internals. Not exposed: w_conf is the tunable; these only shape how
+  // fast the per-track confidence estimate adapts. Confidence lives in [0,1]
+  // and detector jitter on it is typically a few percent.
+  static constexpr float kConfSigmaA = 2.f;    // confidence units / s^2
+  static constexpr float kConfMeasStd = 0.05f; // confidence jitter std
 
   Config _cfg;
   KalmanFilter _kf;
