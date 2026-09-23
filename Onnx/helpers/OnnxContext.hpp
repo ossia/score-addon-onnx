@@ -102,6 +102,8 @@ try
 #endif
     else if (contains(p, "webgpu"))
       requested_provider = "webgpu";
+    else if (contains(p, "webnn"))
+      requested_provider = "webnn";
     else if (contains(p, "cpu"))
       requested_provider = "cpu";
   }
