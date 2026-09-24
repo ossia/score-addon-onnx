@@ -1,5 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdio>
+#include <string>
+#include <string_view>
+
 #include <halp/file_port.hpp>
 #include <halp/meta.hpp>
 
@@ -139,11 +144,84 @@ inline bool initOnnxRuntime()
   return available;
 }
 
+// A node's failures. A model that cannot load is reported once and stays
+// disabled until another file is picked. A frame that fails to run is
+// reported once per distinct message and skipped: the node keeps running,
+// and while the same failure repeats, it retries on every 2nd, 4th, .. 64th
+// tick instead of every tick, so a model that cannot run the current input
+// neither floods the log nor burns a thread, and recovers by itself when the
+// input or a setting changes.
+struct FailureLog
+{
+  std::string last;
+  int consecutive = 0;
+  int wait = 0;
+
+  // False while backing off: skip this tick's inference.
+  bool ready() noexcept
+  {
+    if(wait > 0)
+    {
+      --wait;
+      return false;
+    }
+    return true;
+  }
+
+  void failed(std::string_view node, std::string_view model, std::string_view what)
+  {
+    if(what != last)
+    {
+      last = what;
+      consecutive = 0;
+      std::fprintf(
+          stderr, "%.*s: %.*s: %.*s\n", (int)node.size(), node.data(),
+          (int)model.size(), model.data(), (int)what.size(), what.data());
+    }
+    ++consecutive;
+    wait = (1 << std::min(consecutive - 1, 6)) - 1;
+  }
+
+  void succeeded() noexcept
+  {
+    last.clear();
+    consecutive = 0;
+    wait = 0;
+  }
+};
+
 struct OnnxObject
 {
 public:
   OnnxObject() noexcept { available = initOnnxRuntime(); }
   bool available{false};
+  FailureLog failures;
+
+  // Runs `reload` for a new model file: a failure is printed once and marks
+  // the port invalid (sticky until another file is picked). Returns whether
+  // the model is usable.
+  template <typename F, typename Port>
+  bool loadModel(F&& reload, Port& port, std::string_view node)
+  {
+    try
+    {
+      reload();
+    }
+    catch(const std::exception& e)
+    {
+      failures.failed(node, port.file.filename, std::string("cannot load the model: ") + e.what());
+      port.current_model_invalid = true;
+      return false;
+    }
+    catch(...)
+    {
+      failures.failed(node, port.file.filename, "cannot load the model");
+      port.current_model_invalid = true;
+      return false;
+    }
+    failures.succeeded();
+    return !port.current_model_invalid;
+  }
 };
 
 template <halp::static_string lit>

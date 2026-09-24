@@ -250,9 +250,10 @@ inline std::unique_ptr<Ort::Session> create_session_with_fallback(
 {
   try
   {
-    auto quiet = sessionOptions.Clone();
-    quiet.SetLogSeverityLevel(ORT_LOGGING_LEVEL_FATAL);
-    return std::make_unique<Ort::Session>(env, path.data(), quiet);
+    // Muted only for this attempt: the session keeps its normal log level,
+    // so its warnings and run errors are still printed afterwards.
+    QuietOrtLog quiet;
+    return std::make_unique<Ort::Session>(env, path.data(), sessionOptions);
   }
   catch (const Ort::Exception& e)
   {
@@ -399,6 +400,8 @@ private:
   }
 
   ModelSpec m_spec; // built once in the ctor; returned by readModelSpec()
+  std::mutex m_error_mutex;
+  std::string m_last_error;
 
 public:
   void infer(
@@ -407,29 +410,19 @@ public:
       std::span<Ort::Value> output_values)
   {
     ONNX_PROF_SCOPE(Infer);
-    try
-    {
-      // Counts MUST come from the caller-provided spans, not the model's full
-      // declared name lists: callers pass fixed-size stack arrays sized to the
-      // outputs they actually read. Using the full declared count would make ORT
-      // write/read past those arrays for a model with more I/O than expected.
-      session.Run(
-          Ort::RunOptions{nullptr},
-          spec.input_names_char.data(),
-          input_tensors.data(),
-          input_tensors.size(),
-          spec.output_names_char.data(),
-          output_values.data(),
-          output_values.size());
-    }
-    catch (const Ort::Exception& exception)
-    {
-      // Per-frame failure (bad/odd output shape on a frame, ORT hiccup): log and
-      // rethrow so the node's operator() catch skips this frame. NEVER exit() —
-      // that would kill the whole host process on a single transient throw.
-      std::fprintf(stderr, "ERROR running model inference: %s\n", exception.what());
-      throw;
-    }
+    // Counts MUST come from the caller-provided spans, not the model's full
+    // declared name lists: callers pass fixed-size stack arrays sized to the
+    // outputs they actually read. Using the full declared count would make ORT
+    // write/read past those arrays for a model with more I/O than expected.
+    // A failure throws to the node, which reports it and skips the frame.
+    session.Run(
+        Ort::RunOptions{nullptr},
+        spec.input_names_char.data(),
+        input_tensors.data(),
+        input_tensors.size(),
+        spec.output_names_char.data(),
+        output_values.data(),
+        output_values.size());
   }
 };
 
