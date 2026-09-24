@@ -38,15 +38,22 @@ public:
       int maxTokens = 512,
       float temperature = 0.7f,
       float topP = 0.9f,
-      int topK = 40);
+      int topK = 40,
+      bool thinking = true);
 
+  // thinking = false asks a reasoning model (see supportsThinking) for its
+  // reply without the <think> block, as Qwen3's enable_thinking=false does.
   void generateStreaming(
       const std::string& prompt,
       std::function<bool(const std::string&)> tokenCallback,
       int maxTokens = 100,
       float temperature = 0.7f,
       float topP = 0.9f,
-      int topK = 40);
+      int topK = 40,
+      bool thinking = true);
+
+  // The tokenizer knows <think> and </think>: Qwen3, DeepSeek-R1, ...
+  bool supportsThinking() const noexcept { return thinkingModel; }
 
 private:
   std::vector<int64_t> tokenize(const std::string& text) const;
@@ -66,6 +73,7 @@ private:
       float temperature,
       float topP,
       int topK,
+      bool thinking,
       std::function<bool(int64_t)> onToken);
 
   void applyTemperature(std::span<float> logits, float temperature);
@@ -83,10 +91,15 @@ private:
   // Applies the model's own chat template to a single user message;
   // falls back to Qwen-style ChatML when the model does not ship one.
   std::string applyChatTemplate(const std::string& userPrompt) const;
+  // Then closes the think block right away when thinking is off.
+  std::string
+  applyChatTemplate(const std::string& userPrompt, bool thinking) const;
 
   // Token ids that end the reply, from generation_config.json /
   // config.json; defaults to Qwen's <|endoftext|> + <|im_end|>.
   std::vector<int64_t> stopTokenIds{151643, 151645};
+
+  bool thinkingModel = false;
 
   // Every decoder input is bound by name, in the session's own order: the
   // exports do not agree on it, and a positional binding silently swapped

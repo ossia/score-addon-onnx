@@ -48,6 +48,35 @@ static std::vector<int64_t> readStopTokens(const std::filesystem::path& file)
   return ids;
 }
 
+// Reasoning models declare <think> and </think> as added tokens in
+// tokenizer.json.
+static bool declaresThinkTokens(const std::filesystem::path& file)
+{
+  std::ifstream in(file);
+  if (!in)
+    return false;
+  std::stringstream buf;
+  buf << in.rdbuf();
+
+  const auto json
+      = nlohmann::json::parse(buf.str(), nullptr, /*allow_exceptions=*/false);
+  if (json.is_discarded() || !json.is_object())
+    return false;
+  const auto it = json.find("added_tokens");
+  if (it == json.end() || !it->is_array())
+    return false;
+  bool open = false, close = false;
+  for (const auto& t : *it)
+  {
+    if (!t.is_object() || !t.contains("content") || !t["content"].is_string())
+      continue;
+    const auto& c = t["content"].get_ref<const std::string&>();
+    open |= c == "<think>";
+    close |= c == "</think>";
+  }
+  return open && close;
+}
+
 static std::size_t qwenKvElementSize(ONNXTensorElementDataType t)
 {
   switch (t)
@@ -109,6 +138,7 @@ QwenLLMInference::QwenLLMInference(
       ids = readStopTokens(tokDir / "config.json");
     if (!ids.empty())
       stopTokenIds = std::move(ids);
+    thinkingModel = declaresThinkTokens(tokDir / "tokenizer.json");
   }
 
   // Get input/output names and inspect shapes
@@ -406,6 +436,20 @@ int64_t QwenLLMInference::sampleToken(
 }
 
 std::string
+QwenLLMInference::applyChatTemplate(const std::string& userPrompt, bool thinking) const
+{
+  auto text = applyChatTemplate(userPrompt);
+  if (thinking || !thinkingModel)
+    return text;
+  // What Qwen3's template adds for enable_thinking=false, which the Jinja
+  // engine has no way to pass: an empty, closed think block. DeepSeek-R1's
+  // newer templates already open the block.
+  if (text.ends_with("<think>\n"))
+    return text + "\n</think>\n\n";
+  return text + "<think>\n\n</think>\n\n";
+}
+
+std::string
 QwenLLMInference::applyChatTemplate(const std::string& userPrompt) const
 {
   // Only a user message: templates insert their model's own default system
@@ -448,9 +492,10 @@ void QwenLLMInference::generateLoop(
     float temperature,
     float topP,
     int topK,
+    bool thinking,
     std::function<bool(int64_t)> onToken)
 {
-  auto inputIds = tokenize(applyChatTemplate(prompt));
+  auto inputIds = tokenize(applyChatTemplate(prompt, thinking));
   if (inputIds.empty())
     return;
   const size_t promptLen = inputIds.size();
@@ -598,11 +643,12 @@ std::string QwenLLMInference::generate(
     int maxTokens,
     float temperature,
     float topP,
-    int topK)
+    int topK,
+    bool thinking)
 {
   std::vector<int64_t> generated;
   generateLoop(
-      prompt, maxTokens, temperature, topP, topK,
+      prompt, maxTokens, temperature, topP, topK, thinking,
       [&generated](int64_t token)
       {
         generated.push_back(token);
@@ -618,14 +664,15 @@ void QwenLLMInference::generateStreaming(
     int maxTokens,
     float temperature,
     float topP,
-    int topK)
+    int topK,
+    bool thinking)
 {
   // Decoding tokens one at a time splits multi-byte UTF-8 sequences (byte
   // level BPE): re-decode the whole reply each step and emit the increment.
   std::vector<int64_t> ids;
   std::string lastText;
   generateLoop(
-      prompt, maxTokens, temperature, topP, topK,
+      prompt, maxTokens, temperature, topP, topK, thinking,
       [&, this](int64_t token)
       {
         ids.push_back(token);

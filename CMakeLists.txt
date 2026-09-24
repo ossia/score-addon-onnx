@@ -676,6 +676,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
   add_executable(score_addon_onnx_tests
     tests/test_rapidlib_models.cpp
     tests/test_text_segmentation.cpp
+    tests/test_think_filter.cpp
     # real object sources under test:
     RapidlibModels/Classifier.cpp
     RapidlibModels/Regressor.cpp
@@ -736,6 +737,16 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
   )
   if(TARGET Boost::boost)
     target_link_libraries(score_addon_onnx_node_tests PRIVATE Boost::boost)
+  endif()
+  # The Language Model node needs the tokenizer library.
+  if(SCORE_ONNX_ENABLE_EXTENSIONS)
+    target_sources(score_addon_onnx_node_tests PRIVATE
+      tests/test_llm_thinking.cpp
+      OnnxModels/QwenLLM.cpp
+      Onnx/helpers/QwenLLM.cpp)
+    target_link_libraries(score_addon_onnx_node_tests PRIVATE
+      ocos_operators
+      onnxruntime_extensions)
   endif()
   add_test(NAME score_addon_onnx_node_tests COMMAND score_addon_onnx_node_tests)
   set_tests_properties(score_addon_onnx_node_tests PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED")
