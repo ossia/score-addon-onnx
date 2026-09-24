@@ -108,6 +108,7 @@ ImageProcessor::~ImageProcessor() = default;
 
 void ImageProcessor::reloadModel()
 {
+  ++gen;
   ctx = std::make_shared<Onnx::OnnxRunContext>(
       inputs.model.file.bytes, inputs.model.file.filename);
   spec = ctx->readModelSpec();
@@ -425,6 +426,7 @@ void ImageProcessor::dispatchInfer(
     job->kind = kind;
     job->wm = wm;
     job->out_kinds = out_kinds;
+    job->gen = gen;
     worker.request(std::move(job));
     return;
   }
@@ -481,9 +483,11 @@ ImageProcessor::worker::work(std::unique_ptr<InferJob> job)
     const int idx = std::clamp(job->output_index, 0, nout - 1);
     std::vector<float> scratch;
     auto ds = decodeAll(outs, idx, job->kind, job->wm, job->out_kinds, scratch);
-    return [ds = std::move(ds)](ImageProcessor& self) mutable
+    return [ds = std::move(ds), gen = job->gen](ImageProcessor& self) mutable
     {
       self.inferenceInProgress = false;
+      if(gen != self.gen)
+        return; // a job of the previous model
       applyDecoded(self, ds);
     };
   }
