@@ -137,6 +137,7 @@ enum class AuxRole : uint8_t
   GenericInt,  // any other small int scalar
   Mask,        // attention_mask / valid_ids : int, ones shaped like the tokens
   TokenTypes,  // token_type_ids / segment_ids : int, zeros shaped like the tokens
+  Style,       // style / speaker embedding (Kitten, Kokoro) : a voices.bin row
   Autoregress, // KV-cache / past_* / step : node must REFUSE
   Unknown,
 };
@@ -203,6 +204,11 @@ inline AuxRole classifyAux(
 
   if(detail::anyName(name, {"sid", "speaker", "spk", "voice_id", "spk_id"}))
     return AuxRole::SpeakerId;
+
+  // A speaker embedding: one row of the model's voices file.
+  if(!isInt && pos > 3
+     && detail::anyName(name, {"style", "speaker_emb", "spk_emb", "ref_s"}))
+    return AuxRole::Style;
 
   // A small float vector named "scales" packs (noise, length, noise_w).
   if(!isInt && detail::anyName(name, {"scales", "scale"}) && pos >= 1)
