@@ -69,6 +69,7 @@ public:
 
 private:
   std::unique_ptr<Onnx::OnnxRunContext> ctx;
+  std::string lastModelPath;
 
   Resnet resnet;
   boost::container::vector<float> storage;
