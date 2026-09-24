@@ -100,6 +100,8 @@ private:
   std::vector<int64_t> stopTokenIds{151643, 151645};
 
   bool thinkingModel = false;
+  // Replace SentencePiece's U+2581 left in the decoded text (see HfConfig).
+  bool spaceMarker = false;
 
   // Every decoder input is bound by name, in the session's own order: the
   // exports do not agree on it, and a positional binding silently swapped

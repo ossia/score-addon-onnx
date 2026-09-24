@@ -10,6 +10,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Onnx::HfConfig
@@ -81,6 +82,41 @@ inline std::optional<std::string> imageToken(const std::filesystem::path& dir)
     if(const auto it = p.find("image_token"); it != p.end() && it->is_string())
       return it->get<std::string>();
   return std::nullopt;
+}
+
+// SentencePiece tokenizers (gemma) mark spaces with U+2581 and their
+// tokenizer.json decoder replaces it with a space. onnxruntime-extensions
+// skips that step for added tokens, and gemma's whitespace runs ("▁▁▁") are
+// added tokens: a markdown list comes out as "*▁▁▁**Top". True when the
+// decoder declares that Replace, so the caller can finish the job.
+inline bool decoderReplacesSpaceMarker(const std::filesystem::path& tokenizerJson)
+{
+  const auto json = read(tokenizerJson);
+  if(!json.is_object() || !json.contains("decoder"))
+    return false;
+  auto isReplace = [](const nlohmann::json& d) {
+    return d.is_object() && d.value("type", "") == "Replace" && d.contains("pattern")
+           && d["pattern"].is_object()
+           && d["pattern"].value("String", "") == "\u2581" && d.value("content", "") == " ";
+  };
+  const auto& dec = json["decoder"];
+  if(isReplace(dec))
+    return true;
+  if(dec.is_object() && dec.contains("decoders") && dec["decoders"].is_array())
+    for(const auto& d : dec["decoders"])
+      if(isReplace(d))
+        return true;
+  return false;
+}
+
+inline void replaceSpaceMarkers(std::string& text)
+{
+  static constexpr std::string_view marker = "\u2581";
+  for(std::size_t pos = 0; (pos = text.find(marker, pos)) != std::string::npos;)
+  {
+    text.replace(pos, marker.size(), " ");
+    pos += 1;
+  }
 }
 
 // Whether tokenizer.json declares both tokens among its added tokens.

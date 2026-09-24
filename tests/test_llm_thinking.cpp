@@ -101,3 +101,21 @@ TEST_CASE("Language Model: Thinking Off leaves other models alone", "[onnx][llm]
   off.node.inputs.thinking.value = OnnxModels::QwenLLMNode::Off;
   CHECK(show.ask(q, 16) == off.ask(q, 16));
 }
+
+// SentencePiece's space marker (U+2581) was left in gemma's text wherever it
+// produced a run of spaces, e.g. the indentation of a markdown list.
+TEST_CASE("Language Model: gemma's text has plain spaces", "[onnx][llm]")
+{
+  const auto dir = llmDir("gemma-3-1b-it");
+  if(!std::filesystem::exists(dir + "/onnx/model_q4.onnx"))
+    SKIP("gemma-3-1b-it not found");
+  REQUIRE(OnnxModels::initOnnxRuntime());
+  Harness h{dir, "model_q4.onnx"};
+  const auto reply = h.ask(
+      "Write a nested markdown bullet list of two fruits, each with two "
+      "varieties, indented under it.", 64);
+  INFO(reply);
+  CHECK(!reply.empty());
+  CHECK(reply.find("\u2581") == std::string::npos);
+  CHECK(h.partials == reply);
+}

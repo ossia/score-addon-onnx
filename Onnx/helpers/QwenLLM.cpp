@@ -81,6 +81,7 @@ QwenLLMInference::QwenLLMInference(
     // Reasoning models declare <think> and </think> as added tokens.
     thinkingModel
         = HfConfig::addsTokens(tokDir / "tokenizer.json", "<think>", "</think>");
+    spaceMarker = HfConfig::decoderReplacesSpaceMarker(tokDir / "tokenizer.json");
   }
 
   // Get input/output names and inspect shapes
@@ -221,6 +222,8 @@ std::string QwenLLMInference::decodeToken(int64_t tokenId) const
   OrtxStringArrayGetItem(texts, 0, &text);
   std::string strResult(text);
   OrtxDispose((OrtxObject**)&texts);
+  if (spaceMarker)
+    HfConfig::replaceSpaceMarkers(strResult);
 
   return strResult;
 }
@@ -241,6 +244,8 @@ std::string QwenLLMInference::decodeTokens(std::span<int64_t> tokens) const
   OrtxStringArrayGetItem(texts, 0, &text);
   std::string strResult(text);
   OrtxDispose((OrtxObject**)&texts);
+  if (spaceMarker)
+    HfConfig::replaceSpaceMarkers(strResult);
 
   return strResult;
 }
