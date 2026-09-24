@@ -135,6 +135,8 @@ enum class AuxRole : uint8_t
   SpeakerId,   // sid / speaker / spk : int scalar
   GenericFloat,// any other small float scalar -> mapped to a Param
   GenericInt,  // any other small int scalar
+  Mask,        // attention_mask / valid_ids : int, ones shaped like the tokens
+  TokenTypes,  // token_type_ids / segment_ids : int, zeros shaped like the tokens
   Autoregress, // KV-cache / past_* / step : node must REFUSE
   Unknown,
 };
@@ -186,9 +188,17 @@ inline AuxRole classifyAux(
   if(detail::anyName(name, {"noise_scale", "noise"}))
     return AuxRole::NoiseScale;
 
+  // Per-token int inputs of text encoders: fed at the token tensor's shape
+  // (a [1,1] mask fails BERT's reshape, and a [1,1] valid_ids gives the
+  // punctuation model zero valid tokens).
+  if(isInt && detail::anyName(name, {"mask", "valid", "attention"}))
+    return AuxRole::Mask;
+  if(isInt && detail::anyName(name, {"token_type", "segment"}))
+    return AuxRole::TokenTypes;
+
   if(detail::anyName(
          name, {"input_lengths", "text_lengths", "x_lengths", "token_length",
-                "length", "lengths", "seq_len"}))
+                "length", "lengths", "seq_len", "lens"}))
     return AuxRole::InputLength;
 
   if(detail::anyName(name, {"sid", "speaker", "spk", "voice_id", "spk_id"}))
