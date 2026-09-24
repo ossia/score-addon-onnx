@@ -215,7 +215,7 @@ inline AuxRole classifyAux(
 // ---------------------------------------------------------------------------
 enum class TokenOutputRole : uint8_t
 {
-  Waveform, // TTS audio [1,1,N] / [1,N] / [N]
+  Waveform, // TTS audio [1,1,1,N] / [1,1,N] / [1,N] / [N]
   Vector,   // embedding / logits / scores [1,D]
   Tokens,   // int token ids out (e.g. unit/codec codes) -> Data
 };
@@ -235,6 +235,11 @@ inline TokenOutputRole classifyTokenOutput(
   if(isInt)
     return TokenOutputRole::Tokens;
 
+  // Piper / VITS [B,T=1,1,N] -> waveform. A [1,C,1,W] image-like output with
+  // C>1 is not audio.
+  if(rank == 4 && shape[2] == 1 && (shape[1] == 1 || shape[1] <= 0)
+     && (last <= 0 || last > 32))
+    return TokenOutputRole::Waveform;
   // [1,1,N] / [1,C,N] with a long last axis -> waveform.
   if(rank == 3 && (shape[1] == 1 || shape[1] == 2)
      && (last <= 0 || last > 32))
