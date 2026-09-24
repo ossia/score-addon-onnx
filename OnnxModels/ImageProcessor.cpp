@@ -333,7 +333,10 @@ try
 
   // (Re)load / (re)classify on model or output-index change.
   if(!ctx || lastModelPath != inputs.model.file.filename)
-    reloadModel();
+  {
+    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
+      return;
+  }
   else if(inputs.output_index.value != lastOutputIndex)
   {
     role = Onnx::classifyImage(
@@ -342,6 +345,8 @@ try
   }
   if(spec.inputs.empty() || spec.outputs.empty())
     return;
+  if(!failures.ready())
+    return; // the last frames failed the same way: backing off
 
   // A model with an image input is never run from a latent, whatever its
   // other inputs look like.
@@ -352,9 +357,14 @@ try
   else
     runImage();
 }
+catch(const std::exception& e)
+{
+  // A frame that fails is reported and skipped; the node keeps running.
+  failures.failed(name(), inputs.model.file.filename, e.what());
+}
 catch(...)
 {
-  inputs.model.current_model_invalid = true;
+  failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
 // image -> image / mask / depth / data
@@ -638,9 +648,21 @@ ImageProcessor::worker::work(std::unique_ptr<InferJob> job)
       applyDecoded(self, ds);
     };
   }
+  catch(const std::exception& e)
+  {
+    return [what = std::string(e.what())](ImageProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(ImageProcessor::name(), self.inputs.model.file.filename, what);
+    };
+  }
   catch(...)
   {
-    return [](ImageProcessor& self) { self.inferenceInProgress = false; };
+    return [](ImageProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(ImageProcessor::name(), self.inputs.model.file.filename, "unknown error");
+    };
   }
 }
 

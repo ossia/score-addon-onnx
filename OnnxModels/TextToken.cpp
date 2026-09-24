@@ -465,7 +465,10 @@ try
     return;
 
   if(!ctx || lastModelPath != inputs.model.file.filename)
-    reloadModel();
+  {
+    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
+      return;
+  }
   if(refused) // autoregressive: documented no-op
     return;
   if(spec.inputs.empty() || spec.outputs.empty())
@@ -513,9 +516,14 @@ try
   if(produces_audio)
     playUtterance(frames);
 }
+catch(const std::exception& e)
+{
+  // A frame that fails is reported and skipped; the node keeps running.
+  failures.failed(name(), inputs.model.file.filename, e.what());
+}
 catch(...)
 {
-  inputs.model.current_model_invalid = true;
+  failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
 // The style vector of the voice Param 4 picks, from the Voices port or a
@@ -683,6 +691,7 @@ void TextToken::dispatchInfer(int64_t token_len, bool force_async)
   for(int i = 0; i < nout; ++i)
     outs.emplace_back(nullptr);
   ctx->infer(spec, ins, outs);
+  failures.succeeded();
 
   // Route the chosen output.
   const int idx = std::clamp(produces_audio ? wave_out_index : 0, 0, nout - 1);
@@ -841,6 +850,7 @@ TextToken::worker::work(std::unique_ptr<TokenInferJob> job)
       return [planar = std::move(planar), gen = job->gen](TextToken& self) mutable
       {
         self.inferenceInProgress = false;
+        self.failures.succeeded();
         if(gen == self.gen) // else superseded while running
           self.outputs.data.value.assign(planar.begin(), planar.end());
       };
@@ -856,13 +866,26 @@ TextToken::worker::work(std::unique_ptr<TokenInferJob> job)
     return [u = std::move(u), gen = job->gen](TextToken& self) mutable
     {
       self.inferenceInProgress = false;
+      self.failures.succeeded();
       if(gen == self.gen)
         std::swap(self.utterance, u);
     };
   }
+  catch(const std::exception& e)
+  {
+    return [what = std::string(e.what())](TextToken& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(TextToken::name(), self.inputs.model.file.filename, what);
+    };
+  }
   catch(...)
   {
-    return [](TextToken& self) { self.inferenceInProgress = false; };
+    return [](TextToken& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(TextToken::name(), self.inputs.model.file.filename, "unknown error");
+    };
   }
 }
 

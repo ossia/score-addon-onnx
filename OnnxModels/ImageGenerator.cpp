@@ -178,6 +178,7 @@ DecodedOutput decodeOutput(
 
 void applyDecoded(ImageGenerator& self, DecodedOutput& d)
 {
+  self.failures.succeeded();
   switch(d.target)
   {
     case DecodedOutput::Image:
@@ -316,21 +317,52 @@ try
   if(inputs.model.file.bytes.empty())
     return;
 
-  // (Re)load on either model port changing.
-  if(!ctx || lastModelPath != inputs.model.file.filename
-     || lastMappingPath != inputs.mapping_model.file.filename)
-    reloadModel();
+  // (Re)load on either model port changing. A failure is reported once and
+  // the node waits for another file on either port (it cannot tell which
+  // one is at fault, so it marks neither invalid).
+  if(lastModelPath != inputs.model.file.filename
+     || lastMappingPath != inputs.mapping_model.file.filename || (!ctx && !loadFailed))
+  {
+    try
+    {
+      reloadModel();
+      loadFailed = false;
+      failures.succeeded();
+    }
+    catch(const std::exception& e)
+    {
+      lastModelPath = inputs.model.file.filename;
+      lastMappingPath = inputs.mapping_model.file.filename;
+      ctx.reset();
+      map_ctx.reset();
+      spec = {};
+      loadFailed = true;
+      failures.failed(
+          name(), inputs.model.file.filename,
+          std::string("cannot load the model: ") + e.what());
+      return;
+    }
+  }
+  if(!ctx)
+    return;
 
   if(spec.inputs.empty() || spec.outputs.empty())
     return;
   if(latent_dim <= 0)
     return;
+  if(!failures.ready())
+    return; // the last frames failed the same way: backing off
 
   runGenerate();
 }
+catch(const std::exception& e)
+{
+  // A frame that fails is reported and skipped; the node keeps running.
+  failures.failed(name(), inputs.model.file.filename, e.what());
+}
 catch(...)
 {
-  inputs.model.current_model_invalid = true;
+  failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
 void ImageGenerator::runGenerate()
@@ -488,9 +520,21 @@ ImageGenerator::worker::work(std::unique_ptr<GenJob> job)
       applyDecoded(self, d);
     };
   }
+  catch(const std::exception& e)
+  {
+    return [what = std::string(e.what())](ImageGenerator& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(ImageGenerator::name(), self.inputs.model.file.filename, what);
+    };
+  }
   catch(...)
   {
-    return [](ImageGenerator& self) { self.inferenceInProgress = false; };
+    return [](ImageGenerator& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(ImageGenerator::name(), self.inputs.model.file.filename, "unknown error");
+    };
   }
 }
 

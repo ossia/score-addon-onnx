@@ -195,6 +195,7 @@ inline DecodedOutput decodeOutput(
 template <typename Node>
 void applyDecoded(Node& self, DecodedOutput& d)
 {
+  self.failures.succeeded();
   // A degenerate output shape (0-sized spatial dim) would create a 0x0 texture
   // and memcpy from an empty buffer; only the Data path is meaningful then.
   if(d.target != DecodedOutput::Data && (d.w <= 0 || d.h <= 0))
@@ -282,6 +283,7 @@ inline DecodedOutputs decodeAll(
 template <typename Node>
 void applyDecoded(Node& self, DecodedOutputs& ds)
 {
+  self.failures.succeeded();
   for(auto& d : ds)
     applyDecoded(self, d);
 }

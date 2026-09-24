@@ -248,6 +248,7 @@ DecodedGeom decodeOutput(
 
 void applyDecoded(GeometryProcessor& self, DecodedGeom& d)
 {
+  self.failures.succeeded();
   switch(d.kind)
   {
     case GeomOutputKind::PointCloud:
@@ -305,20 +306,30 @@ try
     return;
 
   if(!ctx || lastModelPath != inputs.model.file.filename)
-    reloadModel();
+  {
+    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
+      return;
+  }
   else if(inputs.output_index.value != lastOutputIndex)
     lastOutputIndex = inputs.output_index.value;
 
   if(spec.inputs.empty() || spec.outputs.empty())
     return;
+  if(!failures.ready())
+    return; // the last frames failed the same way: backing off
   if(!in_layout.valid())
     return; // not a point-set model
 
   runCloud();
 }
+catch(const std::exception& e)
+{
+  // A frame that fails is reported and skipped; the node keeps running.
+  failures.failed(name(), inputs.model.file.filename, e.what());
+}
 catch(...)
 {
-  inputs.model.current_model_invalid = true;
+  failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
 void GeometryProcessor::runCloud()
@@ -441,9 +452,21 @@ GeometryProcessor::worker::work(std::unique_ptr<GeomInferJob> job)
       applyDecoded(self, d);
     };
   }
+  catch(const std::exception& e)
+  {
+    return [what = std::string(e.what())](GeometryProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(GeometryProcessor::name(), self.inputs.model.file.filename, what);
+    };
+  }
   catch(...)
   {
-    return [](GeometryProcessor& self) { self.inferenceInProgress = false; };
+    return [](GeometryProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(GeometryProcessor::name(), self.inputs.model.file.filename, "unknown error");
+    };
   }
 }
 

@@ -249,9 +249,10 @@ inline std::unique_ptr<Ort::Session> create_session_with_fallback(
 {
   try
   {
-    auto quiet = sessionOptions.Clone();
-    quiet.SetLogSeverityLevel(ORT_LOGGING_LEVEL_FATAL);
-    return std::make_unique<Ort::Session>(env, path.data(), quiet);
+    // Muted only for this attempt: the session keeps its normal log level,
+    // so its warnings and run errors are still printed afterwards.
+    QuietOrtLog quiet;
+    return std::make_unique<Ort::Session>(env, path.data(), sessionOptions);
   }
   catch (const Ort::Exception& e)
   {
@@ -398,6 +399,8 @@ private:
   }
 
   ModelSpec m_spec; // built once in the ctor; returned by readModelSpec()
+  std::mutex m_error_mutex;
+  std::string m_last_error;
 
 public:
   void infer(
@@ -423,10 +426,18 @@ public:
     }
     catch (const Ort::Exception& exception)
     {
-      // Per-frame failure (bad/odd output shape on a frame, ORT hiccup): log and
-      // rethrow so the node's operator() catch skips this frame. NEVER exit() —
-      // that would kill the whole host process on a single transient throw.
-      std::fprintf(stderr, "ERROR running model inference: %s\n", exception.what());
+      // Per-frame failure (bad/odd output shape on a frame, ORT hiccup): log
+      // and rethrow so the node's operator() catch skips this frame. NEVER
+      // exit(): that would kill the whole host process on a single transient
+      // throw. The same error on the next frames is not printed again.
+      {
+        std::lock_guard lock{m_error_mutex};
+        if(m_last_error != exception.what())
+        {
+          m_last_error = exception.what();
+          std::fprintf(stderr, "ERROR running model inference: %s\n", exception.what());
+        }
+      }
       throw;
     }
   }

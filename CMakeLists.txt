@@ -711,6 +711,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     tests/test_audio_mel.cpp
     tests/test_classifier_routing.cpp
     tests/test_image_outputs.cpp
+    tests/test_node_failures.cpp
     OnnxModels/Resnet.cpp
     OnnxModels/ENet.cpp
     OnnxModels/SequenceProcessor.cpp

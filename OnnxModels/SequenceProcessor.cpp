@@ -335,19 +335,14 @@ void SequenceProcessor::reloadModel()
   // probe finds that the graph only runs at another.
   const auto& pin = spec.inputs[primaryIn].shape;
   batch = (pin.size() >= 2 && pin[0] > 1 && !stateful) ? pin[0] : 1;
-  lastError.clear();
+  failures.succeeded();
   if(!probe())
     inputs.model.current_model_invalid = true;
 }
 
 void SequenceProcessor::reportError(std::string_view what)
 {
-  if(what == lastError)
-    return;
-  lastError = what;
-  std::fprintf(
-      stderr, "Sequence Processor: %s: %s\n", lastModelPath.c_str(),
-      lastError.c_str());
+  failures.failed(name(), inputs.model.file.filename, what);
 }
 
 // The model needs a fixed T when the primary input rank>=3 with a concrete time
@@ -415,6 +410,8 @@ try
 
   if(inputs.in.value.empty())
     return;
+  if(!failures.ready())
+    return; // the last frames failed the same way: backing off
 
   // Build the primary input ([1,T,F] / [1,D]) from the payload, windowing as
   // resolved. feat_hint comes from a concrete last declared dim if present.
@@ -571,6 +568,7 @@ SeqResult runInference(
 
 void applyResult(SequenceProcessor& self, SeqResult& r)
 {
+  self.failures.succeeded();
   self.outputs.out.value = std::move(r.out);
   if(r.has_data)
     self.outputs.data.value = std::move(r.data);

@@ -158,6 +158,7 @@ private:
   Onnx::ModelSpec map_spec;                      // mapping spec (when loaded)
   std::string lastModelPath;
   std::string lastMappingPath;
+  bool loadFailed = false; // the current files did not load: wait for others
   int latent_dim = 0;
   bool inferenceInProgress = false;
   std::vector<Onnx::AuxPlan> synth_aux, map_aux; // inputs after input 0

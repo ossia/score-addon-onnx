@@ -422,7 +422,10 @@ try
     return;
 
   if(!ctx || lastModelPath != inputs.model.file.filename)
-    reloadModel();
+  {
+    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
+      return;
+  }
   else if(inputs.output_index.value != lastOutputIndex)
   {
     role = Onnx::classifyImage(toImageIO(spec, imageInputIndex),
@@ -448,9 +451,14 @@ try
 
   runImage();
 }
+catch(const std::exception& e)
+{
+  // A frame that fails is reported and skipped; the node keeps running.
+  failures.failed(name(), inputs.model.file.filename, e.what());
+}
 catch(...)
 {
-  inputs.model.current_model_invalid = true;
+  failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
 void VideoProcessor::runImage()
@@ -628,9 +636,21 @@ VideoProcessor::worker::work(std::unique_ptr<VideoInferJob> job)
       applyDecoded(self, ds);
     };
   }
+  catch(const std::exception& e)
+  {
+    return [what = std::string(e.what())](VideoProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(VideoProcessor::name(), self.inputs.model.file.filename, what);
+    };
+  }
   catch(...)
   {
-    return [](VideoProcessor& self) { self.inferenceInProgress = false; };
+    return [](VideoProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(VideoProcessor::name(), self.inputs.model.file.filename, "unknown error");
+    };
   }
 }
 

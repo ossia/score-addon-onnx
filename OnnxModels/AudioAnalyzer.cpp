@@ -190,7 +190,10 @@ try
     return;
 
   if(!ctx || lastModelPath != inputs.model.file.filename)
-    reloadModel();
+  {
+    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
+      return;
+  }
   if(spec.inputs.empty() || spec.outputs.empty() || unsupported_input)
     return;
   if(inputs.model_rate.value != lastRateOverride)
@@ -206,13 +209,35 @@ try
   if(hc > 0 && frames > 0)
     audio_in.push(inputs.audio.samples, hc, (std::size_t)frames);
 
+  // A block that fails is reported and skipped; while the same failure
+  // repeats, the blocks are dropped instead of run (see FailureLog).
   int guard = 0;
+  if(!failures.ready())
+  {
+    while(audio_in.ready() && guard++ < 32)
+      audio_in.fill(staged);
+  }
   while(audio_in.ready() && guard++ < 32)
-    runBlock();
+  {
+    try
+    {
+      runBlock();
+    }
+    catch(const std::exception& e)
+    {
+      failures.failed(name(), inputs.model.file.filename, e.what());
+      break;
+    }
+  }
+}
+catch(const std::exception& e)
+{
+  // A frame that fails is reported and skipped; the node keeps running.
+  failures.failed(name(), inputs.model.file.filename, e.what());
 }
 catch(...)
 {
-  inputs.model.current_model_invalid = true;
+  failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
 void AudioAnalyzer::runBlock()
@@ -268,6 +293,7 @@ void AudioAnalyzer::runBlock()
   for(int i = 0; i < nout; ++i)
     outs.emplace_back(nullptr);
   ctx->infer(spec, ins, outs);
+  failures.succeeded();
 
   // Choose the primary (non-state) output: the first output that is not paired
   // with a recurrent state input.

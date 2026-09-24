@@ -330,8 +330,7 @@ try
 
   if(!ctx || lastModelPath != inputs.model.file.filename)
   {
-    reloadModel();
-    if(inputs.model.current_model_invalid)
+    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
       return;
   }
   if(spec.inputs.empty() || spec.outputs.empty())
@@ -356,12 +355,28 @@ try
 
   // Fire the model for every full block currently buffered (bounded loop to
   // avoid runaway if a huge host block arrived).
+  // A block that fails is reported and skipped, here rather than in the
+  // outer catch so the output below is still pulled. While the same failure
+  // repeats, the blocks are dropped instead of run (see FailureLog).
   int guard = 0;
+  if(!failures.ready())
+  {
+    while(audio_in.ready() && guard++ < 32)
+      audio_in.fill(staged);
+  }
   while(audio_in.ready() && guard++ < 32)
   {
     if(async_model && inferenceInProgress)
       break; // keep the block in the ring until the worker is free
-    runBlock();
+    try
+    {
+      runBlock();
+    }
+    catch(const std::exception& e)
+    {
+      failures.failed(name(), inputs.model.file.filename, e.what());
+      break;
+    }
   }
 
   // Drain processed audio back to the host outputs.
@@ -369,9 +384,14 @@ try
   if(oc > 0 && frames > 0)
     audio_out.pull(outputs.audio.samples, oc, (std::size_t)frames);
 }
+catch(const std::exception& e)
+{
+  // A frame that fails is reported and skipped; the node keeps running.
+  failures.failed(name(), inputs.model.file.filename, e.what());
+}
 catch(...)
 {
-  inputs.model.current_model_invalid = true;
+  failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
 void AudioProcessor::runBlock()
@@ -488,6 +508,7 @@ void AudioProcessor::dispatchInfer(int64_t n, bool force_async)
   for(int i = 0; i < nout; ++i)
     outs.emplace_back(nullptr);
   ctx->infer(spec, ins, outs);
+  failures.succeeded();
 
   // Waveform output -> resample -> host ring.
   {
@@ -691,6 +712,7 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
             acc = std::move(job->synth_acc)](AudioProcessor& self) mutable
     {
       self.inferenceInProgress = false;
+      self.failures.succeeded();
       if(gen != self.gen)
         return; // Reset while it ran: keep the zeroed states, drop the block
       if(acc.size() == self.synth_acc.size())
@@ -707,9 +729,21 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
             s.data = std::move(ns.second);
     };
   }
+  catch(const std::exception& e)
+  {
+    return [what = std::string(e.what())](AudioProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(AudioProcessor::name(), self.inputs.model.file.filename, what);
+    };
+  }
   catch(...)
   {
-    return [](AudioProcessor& self) { self.inferenceInProgress = false; };
+    return [](AudioProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.failures.failed(AudioProcessor::name(), self.inputs.model.file.filename, "unknown error");
+    };
   }
 }
 

@@ -160,7 +160,6 @@ private:
   // Exports that bake a batch size into the graph (Informer: 2, while the
   // input declares it dynamic) are fed that many copies of the input.
   int64_t batch = 1;
-  std::string lastError; // printed once, not on every failing tick
   // Bumped by Reset and by a model reload: a job dispatched before either
   // must not bring its state and output back.
   uint32_t gen = 0;
