@@ -94,6 +94,18 @@ TEST_CASE("VLM: gemma3 describes the image in clean text", "[onnx][vlm][model]")
   const auto vlm = load(models() + "/gemma-3-4b-it", "_q4");
   if(!vlm)
     SKIP("gemma-3-4b-it not found");
+  CHECK(std::string_view{vlm->familyName()} == "gemma3");
+
+  // One <bos> (id 2), first: the tokenizer must not add one to the template's
+  // own, nor after the image block where each text segment is tokenized.
+  const auto ids = vlm->promptTokens("What is this?");
+  REQUIRE(!ids.empty());
+  CHECK(ids.front() == 2);
+  CHECK(std::count(ids.begin(), ids.end(), 2) == 1);
+  CHECK(std::count(ids.begin(), ids.end(), vlm->imagePlaceholderId()) == 256);
+
+  const auto answer = vlm->generateResponse(
+      image, "List three things you see in this image, as a markdown bullet list.", 0.f, 64);
   INFO(answer);
   // The photo: football players on a pitch.
   const auto a = lower(answer);

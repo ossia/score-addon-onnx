@@ -125,6 +125,12 @@ public:
   {
     return createPromptTemplate(userPrompt);
   }
+  // The token ids the decoder receives for a prompt, the image tokens
+  // included (for tests).
+  std::vector<int64_t> promptTokens(std::string_view userPrompt) const
+  {
+    return tokenizeImagePrompt(createPromptTemplate(userPrompt));
+  }
 
 private:
   // Every decoder input is bound by name: exports differ in which of
