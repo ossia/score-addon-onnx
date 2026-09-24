@@ -8,6 +8,7 @@
 #include <Onnx/helpers/ModelRole.hpp>  // detail::nameContains
 #include <Onnx/helpers/TensorType.hpp> // TensorElemType
 
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -60,6 +61,9 @@ struct ArchPort
   std::vector<int64_t> shape;
   TensorElemType dtype = TensorElemType::Float;
   PortArchetype arch = PortArchetype::Unknown;
+  // RecurrentState pairing: on an input, the index of the output it is fed back
+  // from; on an output, the index of the input it feeds. -1 when unpaired.
+  int state_pair = -1;
 };
 
 struct ModelArchetype
@@ -266,42 +270,18 @@ inline ModelArchetype classifyModel(const ArchIO& io)
       return true; // foo_in -> foo_out
     return false;
   };
-  // Retag the OUTPUT side of a state pair too: a state output left as
-  // Sequence/Vector would otherwise drive NodeKind routing (silero's hn/cn made
-  // the whole model look like a SequenceProcessor).
-  auto retagPairedOutput = [&](const ArchPort& in)
-  {
-    for(auto& o : m.outputs)
-    {
-      if(o.arch == PortArchetype::RecurrentState)
-        continue; // already claimed by another state input (h->hn, then c->cn)
-      const auto& nm = in.name;
-      const bool named
-          = (!nm.empty() && nm.back() == 'i'
-             && o.name == nm.substr(0, nm.size() - 1) + "o")
-            || (endsWith(nm, "_in") && o.name == nm.substr(0, nm.size() - 3) + "_out")
-            || (o.name == nm + "n"); // h -> hn, c -> cn (silero / LSTM exports)
-      if(named || (o.arch != PortArchetype::Image && sameShape(in.shape, o.shape)))
-      {
-        o.arch = PortArchetype::RecurrentState;
-        return;
-      }
-    }
-  };
   for(size_t i = 0; i < m.inputs.size(); ++i)
   {
     auto& in = m.inputs[i];
     if(in.arch == PortArchetype::RecurrentState) // name-flagged (state/hidden/...)
     {
       m.stateful = true;
-      retagPairedOutput(in);
       continue;
     }
     if(nameStatePair(in.name)) // r#i/r#o, *_in/*_out — any shape, any index
     {
       in.arch = PortArchetype::RecurrentState;
       m.stateful = true;
-      retagPairedOutput(in);
       continue;
     }
     // Shape-matched state only for SECONDARY inputs: input 0 is the primary media
@@ -317,9 +297,75 @@ inline ModelArchetype classifyModel(const ArchIO& io)
       {
         in.arch = PortArchetype::RecurrentState;
         m.stateful = true;
-        retagPairedOutput(in);
         break;
       }
+    }
+  }
+
+  // Pair every state input with the output it is fed back from, once, for all
+  // the nodes (they used to each pair by first same-shape match, so silero's h
+  // and c both read hn). Two passes over ALL state inputs: names first, so a
+  // later input's name partner cannot be taken by an earlier input's shape
+  // match; then shape (wildcard-aware) among the outputs still free. Paired
+  // outputs are retagged too: a state output left as Sequence/Vector would
+  // otherwise drive the NodeKind routing (silero's hn/cn made the whole model
+  // look like a SequenceProcessor).
+  auto lower = [](std::string s)
+  {
+    for(char& c : s)
+      c = (char)std::tolower((unsigned char)c);
+    return s;
+  };
+  auto namePartner = [&](const std::string& in, const std::string& out)
+  {
+    if(in.empty() || out.empty())
+      return false;
+    if((in.back() == 'i' || in.back() == 'I') && out.size() == in.size()
+       && (out.back() == 'o' || out.back() == 'O')
+       && out.compare(0, out.size() - 1, in, 0, in.size() - 1) == 0)
+      return true; // r1i -> r1o
+    if(endsWith(in, "_in") && out == in.substr(0, in.size() - 3) + "_out")
+      return true; // foo_in -> foo_out
+    const auto li = lower(in), lo = lower(out);
+    return lo == li + "n"                 // h -> hn, state -> stateN
+           || lo == "new_" + li           // h -> new_h
+           || lo == li + "_new"           // h -> h_new
+           || lo == li + "_out"           // h -> h_out
+           || lo == "next_" + li          // h -> next_h
+           || (li.starts_with("past_") && lo == "present_" + li.substr(5));
+  };
+  {
+    std::vector<char> claimed(m.outputs.size(), 0);
+    auto claim = [&](size_t i, size_t o)
+    {
+      m.inputs[i].state_pair = (int)o;
+      m.outputs[o].state_pair = (int)i;
+      m.outputs[o].arch = PortArchetype::RecurrentState;
+      claimed[o] = 1;
+    };
+    for(size_t i = 0; i < m.inputs.size(); ++i)
+    {
+      if(m.inputs[i].arch != PortArchetype::RecurrentState)
+        continue;
+      for(size_t o = 0; o < m.outputs.size(); ++o)
+        if(!claimed[o] && namePartner(m.inputs[i].name, m.outputs[o].name))
+        {
+          claim(i, o);
+          break;
+        }
+    }
+    for(size_t i = 0; i < m.inputs.size(); ++i)
+    {
+      if(m.inputs[i].arch != PortArchetype::RecurrentState
+         || m.inputs[i].state_pair >= 0)
+        continue;
+      for(size_t o = 0; o < m.outputs.size(); ++o)
+        if(!claimed[o] && m.outputs[o].arch != PortArchetype::Image
+           && sameShape(m.inputs[i].shape, m.outputs[o].shape))
+        {
+          claim(i, o);
+          break;
+        }
     }
   }
 
