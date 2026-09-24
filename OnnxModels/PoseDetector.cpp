@@ -50,6 +50,17 @@ static Onnx::ModelIO toModelIO(const Onnx::ModelSpec& s)
   return io;
 }
 
+// classify(), retried from probed output shapes when the declared ones are
+// too dynamic to tell (see probeOutputShapes).
+static Onnx::ModelRole classifyModel(Onnx::OnnxRunContext& ctx)
+{
+  auto io = toModelIO(ctx.readModelSpec());
+  auto role = Onnx::classify(io);
+  if(role.kind == Onnx::ModelKind::Unknown && probeOutputShapes(ctx, io))
+    role = Onnx::classify(io);
+  return role;
+}
+
 Onnx::ModelRole PoseDetector::roleForWorkflow(PoseWorkflow w) const
 {
   // Keep the real model's input dims/layout; override the kind by selection.
@@ -248,14 +259,13 @@ try
     {
       this->ctx = std::make_unique<Onnx::OnnxRunContext>(
           this->inputs.model.file.bytes, this->inputs.model.file.filename);
-      m_landmark_role = Onnx::classify(toModelIO(this->ctx->readModelSpec()));
+      m_landmark_role = classifyModel(*this->ctx);
     }
     if(have_det && !this->det_ctx)
     {
       this->det_ctx = std::make_unique<Onnx::OnnxRunContext>(
           this->inputs.det_model.file.bytes, this->inputs.det_model.file.filename);
-      m_detector_role
-          = Onnx::classify(toModelIO(this->det_ctx->readModelSpec()));
+      m_detector_role = classifyModel(*this->det_ctx);
     }
     if(have_reid && !this->reid_ctx)
     {

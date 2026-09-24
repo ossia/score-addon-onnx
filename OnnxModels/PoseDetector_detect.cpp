@@ -140,8 +140,11 @@ PoseDetector::runDetector(
   // top-left letterbox. Used as a body/person detector (class 0). ---
   if(role.kind == Onnx::ModelKind::MultiClassDetector)
   {
-    const int mw = model;
-    const int mh = role.input_h > 0 ? role.input_h : model;
+    // A dynamic-input "post" export resizes internally to 160x128 and gives
+    // its boxes in that space whatever it is fed (PINTO 426/434/449/459), so
+    // feed it that size or the boxes land at the wrong scale.
+    const int mw = role.input_w > 0 ? role.input_w : 160;
+    const int mh = role.input_h > 0 ? role.input_h : 128;
     // The YOLOX / YOLOv9 "post" exports (..._score_x1y1x2y2) take raw 0-255;
     // Gold-YOLO (..._x1y1x2y2_score) takes [0,1] and saturates on raw input
     // (every row scores 1.0 with inverted boxes).

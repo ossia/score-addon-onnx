@@ -1,5 +1,7 @@
 #include "PoseDetector_internal.hpp"
 
+#include <span>
+
 namespace OnnxModels
 {
 
@@ -123,8 +125,64 @@ static constexpr std::array<std::pair<int, int>, 17> ap10k = {{
     {4, 14}, {14, 15}, {15, 16},              // right back leg
 }};
 
+// Animal-Pose (mmpose animalpose), 20 keypoints:
+// 0 L-eye 1 R-eye 2 L-ear 3 R-ear 4 nose 5 throat 6 tail 7 withers
+// 8-11 elbows (LF, RF, LB, RB) 12-15 knees 16-19 paws
+static constexpr std::array<std::pair<int, int>, 20> animalpose20 = {{
+    {0, 1}, {0, 2}, {1, 3}, {0, 4}, {1, 4}, {4, 5}, {5, 7}, {6, 7},
+    {5, 8}, {8, 12}, {12, 16}, {5, 9}, {9, 13}, {13, 17},
+    {6, 10}, {10, 14}, {14, 18}, {6, 11}, {11, 15}, {15, 19},
+}};
+
+// AI Challenger, 14 keypoints:
+// 0 R-shoulder 1 R-elbow 2 R-wrist 3 L-shoulder 4 L-elbow 5 L-wrist
+// 6 R-hip 7 R-knee 8 R-ankle 9 L-hip 10 L-knee 11 L-ankle 12 head-top 13 neck
+static constexpr std::array<std::pair<int, int>, 14> aic14 = {{
+    {12, 13}, {13, 0}, {0, 1}, {1, 2}, {13, 3}, {3, 4}, {4, 5},
+    {0, 6}, {3, 9}, {6, 7}, {7, 8}, {9, 10}, {10, 11}, {6, 9},
+}};
+
+// MPII, 16 keypoints:
+// 0 R-ankle 1 R-knee 2 R-hip 3 L-hip 4 L-knee 5 L-ankle 6 pelvis 7 thorax
+// 8 neck 9 head-top 10 R-wrist 11 R-elbow 12 R-shoulder 13 L-shoulder
+// 14 L-elbow 15 L-wrist
+static constexpr std::array<std::pair<int, int>, 15> mpii16 = {{
+    {0, 1}, {1, 2}, {2, 6}, {3, 6}, {3, 4}, {4, 5}, {6, 7}, {7, 8},
+    {8, 9}, {7, 12}, {12, 11}, {11, 10}, {7, 13}, {13, 14}, {14, 15},
+}};
+
 // clang-format on
 } // namespace Skeletons
+
+namespace
+{
+using Edges = std::span<const std::pair<int, int>>;
+
+// The body/hand/face skeleton of a keypoint layout, from its count: the
+// workflow alone doesn't tell (ViTPose ships COCO-17, AIC-14 and MPII-16; a
+// whole-body SimCC with a dynamic K runs as RTMPose_COCO). Empty when the
+// count matches no known layout: those get dots only.
+Edges skeletonByCount(int k)
+{
+  switch(k)
+  {
+    case 14: return Skeletons::aic14;
+    case 16: return Skeletons::mpii16;
+    case 17: return Skeletons::coco17;
+    case 21: return Skeletons::hands;
+    case 68: return Skeletons::dlib68;
+    case 133: return Skeletons::wholebody_body; // its first 17 are COCO body
+    default: return {};
+  }
+}
+
+Edges animalSkeleton(int k)
+{
+  if(k == 20)
+    return Skeletons::animalpose20;
+  return Skeletons::ap10k;
+}
+}
 
 // Color schemes for different body parts (float RGBA in [0,1]).
 using Onnx::Rgba;
@@ -444,15 +502,10 @@ void PoseDetector::drawOnePose(
         break;
       case PoseWorkflow::RTMPose_COCO:
         // Generic heatmap/SimCC route: pick the skeleton by keypoint count.
-        // 21 = hand, 68 = dlib face (e.g. 2DFAN-4), 17 = COCO body. An unknown
-        // count (e.g. 13-pt garment keypoints) gets NO skeleton — just the dots
-        // below — instead of a COCO body scribbled over unrelated points.
-        if(num_kps == 21)
-          drawConnections(Skeletons::hands, 21);
-        else if(num_kps == 68)
-          drawConnections(Skeletons::dlib68, 68);
-        else if(num_kps == 17)
-          drawConnections(Skeletons::coco17, 17);
+        // An unknown count (e.g. 13-pt garment keypoints) gets NO skeleton —
+        // just the dots below — instead of a COCO body scribbled over
+        // unrelated points.
+        drawConnections(skeletonByCount(num_kps), num_kps);
         break;
       case PoseWorkflow::RTMPose_Whole:
         if (num_kps == 21)
@@ -514,16 +567,12 @@ void PoseDetector::drawOnePose(
           drawConnections(Skeletons::dlib68, 68);
         break;
       case PoseWorkflow::AnimalPose:
-        drawConnections(Skeletons::ap10k, 17);
+        drawConnections(animalSkeleton(num_kps), num_kps);
         break;
       default:
-        // Only draw a body skeleton if the count actually matches one; a 68-pt
-        // face gets the face skeleton, any other unrecognized count draws dots
-        // only (no spurious COCO lines all over the points).
-        if(num_kps == 17)
-          drawConnections(Skeletons::coco17, 17);
-        else if(num_kps == 68)
-          drawConnections(Skeletons::dlib68, 68);
+        // Only draw a skeleton if the count actually matches one; any other
+        // count draws dots only (no spurious COCO lines all over the points).
+        drawConnections(skeletonByCount(num_kps), num_kps);
         break;
     }
   }
@@ -914,27 +963,19 @@ void PoseDetector::appendGeometry(
           break;
 
         case PoseWorkflow::RTMPose_COCO:
-          // RTMPose COCO body has 17 keypoints, Hand has 21 keypoints
-          if (kps.size() == 21)
-          {
-            out.reserve(Skeletons::hands.size() * 6);
-            for (const auto& [from, to] : Skeletons::hands)
-              addLine(from, to);
-          }
-          else
-          {
-            out.reserve(Skeletons::coco17.size() * 6);
-            for (const auto& [from, to] : Skeletons::coco17)
-              addLine(from, to);
-          }
-          break;
-
         case PoseWorkflow::ViTPose:
         case PoseWorkflow::YOLOPose:
-          out.reserve(Skeletons::coco17.size() * 6);
-          for (const auto& [from, to] : Skeletons::coco17)
+        {
+          // By keypoint count (COCO-17, hand 21, AIC-14, MPII-16, whole-body
+          // 133, dlib 68); an unknown count keeps the COCO lines it had.
+          Edges edges = skeletonByCount((int)kps.size());
+          if(edges.empty())
+            edges = Skeletons::coco17;
+          out.reserve(edges.size() * 6);
+          for (const auto& [from, to] : edges)
             addLine(from, to);
           break;
+        }
 
         case PoseWorkflow::RTMPose_Whole:
           out.reserve(Skeletons::wholebody_body.size() * 6);
@@ -961,10 +1002,13 @@ void PoseDetector::appendGeometry(
           break;
 
         case PoseWorkflow::AnimalPose:
-          out.reserve(Skeletons::ap10k.size() * 6);
-          for (const auto& [from, to] : Skeletons::ap10k)
+        {
+          const Edges edges = animalSkeleton((int)kps.size());
+          out.reserve(edges.size() * 6);
+          for (const auto& [from, to] : edges)
             addLine(from, to);
           break;
+        }
 
         case PoseWorkflow::RTMPoseFace:
           // 106 LaPa landmarks have no fixed line skeleton; emit dlib lines only
