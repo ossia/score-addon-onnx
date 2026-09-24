@@ -196,6 +196,7 @@ SequenceProcessor::~SequenceProcessor() = default;
 
 void SequenceProcessor::resetState()
 {
+  ++gen;
   for(auto& s : states)
     std::fill(s.values.begin(), s.values.end(), 0.f);
   window.reset();
@@ -583,6 +584,7 @@ void SequenceProcessor::dispatchInfer(
     job->params[1] = inputs.param2.value;
     job->data_out_index = dataOut;
     job->batch = batch;
+    job->gen = gen;
     // The job is recycled: resize + indexed assignment (not push_back) so
     // stale states from a previous use never accumulate.
     job->states.resize(states.size());
@@ -695,9 +697,11 @@ SequenceProcessor::worker::work(std::unique_ptr<SeqInferJob> job)
         *job->ctx, spec, job->input, job->ishape, job->in_dt,
         job->primary_in_index, job->primary_out_index, job->data_out_index,
         job->states, job->aux, job->params, job->batch);
-    return [r = std::move(r)](SequenceProcessor& self) mutable
+    return [r = std::move(r), gen = job->gen](SequenceProcessor& self) mutable
     {
       self.inferenceInProgress = false;
+      if(gen != self.gen)
+        return; // Reset or a new model while it ran: its state is stale
       applyResult(self, r);
     };
   }

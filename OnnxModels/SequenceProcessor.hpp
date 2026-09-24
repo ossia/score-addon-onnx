@@ -44,6 +44,7 @@ struct SeqInferJob
   int primary_out_index = 0;       // which model output is the data result
   int data_out_index = -1;         // secondary "Data" output (-1 == same as primary)
   int64_t batch = 1;               // > 1: the input is replicated, slice 0 read
+  uint32_t gen = 0;                // the node's generation at dispatch
 
   // Recurrent state threaded internally: for each (input_index -> output_index)
   // pair, the current state values + shape. work() feeds `values` in and reads
@@ -160,6 +161,9 @@ private:
   // input declares it dynamic) are fed that many copies of the input.
   int64_t batch = 1;
   std::string lastError; // printed once, not on every failing tick
+  // Bumped by Reset and by a model reload: a job dispatched before either
+  // must not bring its state and output back.
+  uint32_t gen = 0;
 
   void reportError(std::string_view what);
   bool probe();
