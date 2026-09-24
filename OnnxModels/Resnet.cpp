@@ -23,10 +23,24 @@ try
   if (!in_tex.changed)
     return;
 
-  if (!this->ctx)
+  // Recreate the session when the model file changes: keyed on "no ctx yet"
+  // only, a model swap kept running the previous model. Only a failed load
+  // marks the model invalid; a per-frame failure (e.g. a resolution the model
+  // rejects) just skips that frame.
+  if (!this->ctx || lastModelPath != this->inputs.model.file.filename)
   {
-    this->ctx
-        = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
+    this->ctx.reset();
+    try
+    {
+      this->ctx
+          = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
+      lastModelPath = this->inputs.model.file.filename;
+    }
+    catch (...)
+    {
+      inputs.model.current_model_invalid = true;
+      return;
+    }
   }
   auto& ctx = *this->ctx;
   const auto& spec = ctx.readModelSpec();
@@ -62,6 +76,6 @@ try
 }
 catch (...)
 {
-  inputs.model.current_model_invalid = true;
+  outputs.detection.value.clear();
 }
 }
