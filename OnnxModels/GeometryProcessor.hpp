@@ -45,6 +45,7 @@ enum class GeomTaskMode
 
 struct GeomInferJob
 {
+  uint32_t gen = 0; // the node's generation at dispatch
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   boost::container::vector<float> input; // packed tensor (NPC or NCP)
   std::vector<int64_t> ishape;
@@ -146,6 +147,9 @@ private:
   std::string lastModelPath;
   int lastOutputIndex = -1;
   bool inferenceInProgress = false;
+  // Bumped by a model reload: a job of the previous model finishing later
+  // must not publish its result (nor, for Auto, its mapping).
+  uint32_t gen = 0;
 
   // Preprocessing buffers, reused across frames (grow-only).
   std::vector<float> normalized;          // interleaved xyz(+f) after normalize

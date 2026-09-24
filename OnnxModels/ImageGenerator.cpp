@@ -270,6 +270,7 @@ bool ImageGenerator::chainCompatible(
 
 void ImageGenerator::reloadModel()
 {
+  ++gen;
   ctx = std::make_shared<Onnx::OnnxRunContext>(
       inputs.model.file.bytes, inputs.model.file.filename);
   spec = ctx->readModelSpec();
@@ -429,6 +430,7 @@ void ImageGenerator::runGenerate()
   job->scale = inputs.scale.value;
   job->params[0] = inputs.param1.value;
   job->params[1] = inputs.param2.value;
+  job->gen = gen;
   worker.request(std::move(job));
 }
 
@@ -512,9 +514,12 @@ ImageGenerator::worker::work(std::unique_ptr<GenJob> job)
 
     std::vector<float> scratch;
     DecodedOutput d = decodeOutput(img, job->wm, job->pick_auto, scratch);
-    return [d = std::move(d), picked = job->pick_auto](ImageGenerator& self) mutable
+    return [d = std::move(d), picked = job->pick_auto,
+            gen = job->gen](ImageGenerator& self) mutable
     {
       self.inferenceInProgress = false;
+      if(gen != self.gen)
+        return; // a job of the previous model: its mapping and image are stale
       if(picked)
         self.autoMode = d.mode; // keep it: no flicker between mappings
       applyDecoded(self, d);

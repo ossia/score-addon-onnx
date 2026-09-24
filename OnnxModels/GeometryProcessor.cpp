@@ -281,6 +281,7 @@ GeometryProcessor::~GeometryProcessor() = default;
 
 void GeometryProcessor::reloadModel()
 {
+  ++gen;
   ctx = std::make_shared<Onnx::OnnxRunContext>(
       inputs.model.file.bytes, inputs.model.file.filename);
   spec = ctx->readModelSpec();
@@ -403,6 +404,7 @@ void GeometryProcessor::dispatchInfer(int64_t npoints, bool force_async)
     job->aux = aux;
     job->params[0] = inputs.param1.value;
     job->params[1] = inputs.param2.value;
+    job->gen = gen;
     worker.request(std::move(job));
     return;
   }
@@ -446,9 +448,11 @@ GeometryProcessor::worker::work(std::unique_ptr<GeomInferJob> job)
     const int idx = std::clamp(job->output_index, 0, nout - 1);
     std::vector<float> scratch;
     DecodedGeom d = decodeOutput(outs[idx], job->task, job->in_layout.channels, scratch);
-    return [d = std::move(d)](GeometryProcessor& self) mutable
+    return [d = std::move(d), gen = job->gen](GeometryProcessor& self) mutable
     {
       self.inferenceInProgress = false;
+      if(gen != self.gen)
+        return; // a job of the previous model
       applyDecoded(self, d);
     };
   }

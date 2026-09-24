@@ -64,6 +64,7 @@ enum class GenOutputMode
 // steady-state request path does not allocate). See OnnxModels/JobPool.hpp.
 struct GenJob
 {
+  uint32_t gen = 0; // the node's generation at dispatch
   std::shared_ptr<Onnx::OnnxRunContext> synth_ctx; // synthesis / main generator
   std::shared_ptr<Onnx::OnnxRunContext> map_ctx;   // optional mapping network
   boost::container::vector<float> z;               // seeded + overlaid + scaled
@@ -161,6 +162,9 @@ private:
   bool loadFailed = false; // the current files did not load: wait for others
   int latent_dim = 0;
   bool inferenceInProgress = false;
+  // Bumped by a model reload: a job of the previous model finishing later
+  // must not publish its result (nor, for Auto, its mapping).
+  uint32_t gen = 0;
   std::vector<Onnx::AuxPlan> synth_aux, map_aux; // inputs after input 0
   std::optional<Onnx::WriteMode> autoMode; // Auto's choice for this model
 
