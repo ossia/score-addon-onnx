@@ -58,7 +58,18 @@ struct GeomModel
 
 struct GeomInferJob
 {
-  std::shared_ptr<Onnx::OnnxRunContext> ctx;
+  // Infer runs the model; Build makes one for `build_path`; Dispose frees
+  // `model` here, off the processing thread.
+  enum class Kind : uint8_t
+  {
+    Infer,
+    Build,
+    Dispose
+  } kind = Kind::Infer;
+  std::string build_path;
+  std::shared_ptr<const GeomModel> model;
+
+  uint32_t gen = 0; // the node's generation at dispatch
   boost::container::vector<float> input; // packed tensor (NPC or NCP)
   std::vector<int64_t> ishape;
   int output_index = 0;
@@ -149,6 +160,9 @@ private:
   bool building = false;
   std::string requested; // the file the last build was for
   bool inferenceInProgress = false;
+  // Bumped by a new model: a job of the previous model finishing later must
+  // not publish its result.
+  uint32_t gen = 0;
 
   // Preprocessing buffers, reused across frames (grow-only).
   std::vector<float> normalized;          // interleaved xyz(+f) after normalize
