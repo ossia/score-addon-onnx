@@ -554,7 +554,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     FetchContent_Declare(
       Catch2onnx
       GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-      GIT_TAG v3.15.3
+      GIT_TAG v3.16.0
       GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(Catch2onnx)
