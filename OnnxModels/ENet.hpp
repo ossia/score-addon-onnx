@@ -27,12 +27,16 @@ public:
   halp_meta(name, "EmotionNet detector");
   halp_meta(c_name, "emotionnet");
   halp_meta(category, "AI/Computer Vision");
-  halp_meta(author, "Resnet authors, Onnxruntime");
-  halp_meta(description, "Resnet recognizer using a DNN model.");
+  halp_meta(author, "EmotiEffLib authors, Onnxruntime");
+  halp_meta(
+      description,
+      "Facial emotion recognizer (EmotiEffLib / HSEmotion EfficientNet, FER+). "
+      "The model classifies the whole input: the face must fill the frame, e.g. "
+      "cropped upstream with the Pose Detector.");
   halp_meta(uuid, "db264156-4d19-4134-9381-4a43adb57fd0");
   halp_meta(
       manual_url,
-      "https://ossia.io/score-docs/processes/ai-recognition.html#resnet")
+      "https://ossia.io/score-docs/processes/ai-recognition.html#emotionnet")
 
       struct
   {
