@@ -411,6 +411,33 @@ inline std::vector<Detection> decodeMultiClass(
 // center-form. Keeps detections whose argmax class is in [cls_lo,cls_hi]
 // (person=0; COCO animals 14..23). obj/cls are assumed already sigmoided
 // (Megvii/rtmlib convention). Followed by NMS.
+// Highest obj * class score over a raw YOLOX grid [1,A,5+C], or 0. Tells a
+// model fed the wrong input range: it scores ~0 everywhere.
+inline float yoloxMaxScore(std::span<Ort::Value> outputs)
+{
+  float best = 0.f;
+  for(auto& o : outputs)
+  {
+    if(!o.IsTensor())
+      continue;
+    auto info = o.GetTensorTypeAndShapeInfo();
+    auto sh = info.GetShape();
+    if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || sh.size() != 3
+       || sh[2] < 6)
+      continue;
+    const int64_t F = sh[2];
+    const int64_t A = static_cast<int64_t>(info.GetElementCount()) / F;
+    const float* d = o.GetTensorData<float>();
+    for(int64_t i = 0; i < A; ++i)
+    {
+      const float* r = d + i * F;
+      const float cls = *std::max_element(r + 5, r + F);
+      best = std::max(best, r[4] * cls);
+    }
+  }
+  return best;
+}
+
 inline std::vector<Detection> decodeYoloxGrid(
     std::span<Ort::Value> outputs, int in_w, int in_h, int cls_lo, int cls_hi,
     float score_thr, float nms_thr)

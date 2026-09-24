@@ -136,18 +136,24 @@ PoseDetector::runDetector(
     return dets;
   }
 
-  // --- PINTO multi-class detector ([N,7] batchno,classid,score,xyxy): raw BGR,
+  // --- PINTO multi-class detector ([N,7] batchno,classid,score,xyxy): BGR,
   // top-left letterbox. Used as a body/person detector (class 0). ---
   if(role.kind == Onnx::ModelKind::MultiClassDetector)
   {
     const int mw = model;
     const int mh = role.input_h > 0 ? role.input_h : model;
+    // The YOLOX / YOLOv9 "post" exports (..._score_x1y1x2y2) take raw 0-255;
+    // Gold-YOLO (..._x1y1x2y2_score) takes [0,1] and saturates on raw input
+    // (every row scores 1.0 with inverted boxes).
+    const bool sbb = !spec.outputs.empty()
+                     && icontains(spec.outputs[0].name, "score_x"); // score before box
+    const float range = sbb ? 1.f : 255.f;
     Onnx::LetterboxInfo lb;
     Ort::Value input_value{nullptr};
     {
       auto t = fusedLetterboxTensor(
           spec.inputs[0], src, mw, mh, /*center=*/false,
-          normMeanStd(Onnx::TensorLayout::NchwBgr, {0, 0, 0}, {1, 1, 1}),
+          normMeanStd(Onnx::TensorLayout::NchwBgr, {0, 0, 0}, {range, range, range}),
           det_storage, lb);
       input_value = std::move(t.value);
       std::swap(det_storage, t.storage);
@@ -157,9 +163,18 @@ PoseDetector::runDetector(
     const size_t n_out = std::min<size_t>(2, spec.output_names_char.size());
     dctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
 
-    const bool sbb = !spec.outputs.empty()
-                     && icontains(spec.outputs[0].name, "score_x"); // score before box
-    const int keep = (keep_class == -2) ? 0 : keep_class;
+    // -2 (domain default): the body/head/hand(/face) exports label body 0,
+    // head 1, hand 2, face 3, so a hand or face landmark stage gets its own
+    // class. Other layouts (wholebody12/25) need the Detection Class port.
+    int keep = keep_class;
+    if(keep_class == -2)
+    {
+      keep = 0;
+      if(target == Onnx::ModelDomain::Hand)
+        keep = 2;
+      else if(target == Onnx::ModelDomain::Face)
+        keep = 3;
+    }
     auto dets = Onnx::Detection::decodeMultiClass(
         std::span<Ort::Value>(outs, n_out), mw, mh, keep, useThr(0.4f), sbb);
     // remove top-left letterbox (non-square aware)
@@ -186,21 +201,43 @@ PoseDetector::runDetector(
     if(target == Onnx::ModelDomain::Animal) { cls_lo = 14; cls_hi = 23; }
     if(keep_class == -1) { cls_lo = 0; cls_hi = 100000; }      // all classes
     else if(keep_class >= 0) { cls_lo = cls_hi = keep_class; } // one class
+    // The PINTO YOLOX-COCO exports want BGR [0,1]; the ailia yolox_*.opt ones
+    // raw 0-255, and each scores ~0 everywhere on the other range. Nothing in
+    // the graph tells them apart, so probe: while undecided, a frame that
+    // scores ~0 in [0,1] is re-run raw, and whichever range gives a confident
+    // score is kept until the model changes.
     Onnx::LetterboxInfo lb;
-    Ort::Value input_value{nullptr};
-    {
-      // This PINTO YOLOX-COCO export wants BGR [0,1] (raw 0-255 gives garbage).
-      auto t = fusedLetterboxTensor(
-          spec.inputs[0], src, mw, mh, /*center=*/false,
-          normMeanStd(Onnx::TensorLayout::NchwBgr, {0, 0, 0}, {255.f, 255.f, 255.f}),
-          det_storage, lb);
-      input_value = std::move(t.value);
-      std::swap(det_storage, t.storage);
-    }
-    Ort::Value ins[1] = {std::move(input_value)};
     Ort::Value outs[2]{Ort::Value{nullptr}, Ort::Value{nullptr}};
     const size_t n_out = std::min<size_t>(2, spec.output_names_char.size());
-    dctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+    auto run = [&](float range) {
+      Ort::Value input_value{nullptr};
+      {
+        auto t = fusedLetterboxTensor(
+            spec.inputs[0], src, mw, mh, /*center=*/false,
+            normMeanStd(Onnx::TensorLayout::NchwBgr, {0, 0, 0}, {range, range, range}),
+            det_storage, lb);
+        input_value = std::move(t.value);
+        std::swap(det_storage, t.storage);
+      }
+      Ort::Value ins[1] = {std::move(input_value)};
+      for(auto& o : outs)
+        o = Ort::Value{nullptr};
+      dctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+    };
+    run(m_yolox_range == YoloxRange::Raw ? 1.f : 255.f);
+    if(m_yolox_range == YoloxRange::Unknown)
+    {
+      if(Onnx::Detection::yoloxMaxScore(std::span<Ort::Value>(outs, n_out)) >= 0.01f)
+        m_yolox_range = YoloxRange::Unit;
+      else
+      {
+        run(1.f);
+        if(Onnx::Detection::yoloxMaxScore(std::span<Ort::Value>(outs, n_out)) > 0.3f)
+          m_yolox_range = YoloxRange::Raw;
+        else
+          run(255.f); // nothing in view either way: stay undecided
+      }
+    }
     auto dets = Onnx::Detection::decodeYoloxGrid(
         std::span<Ort::Value>(outs, n_out), mw, mh, cls_lo, cls_hi, useThr(0.3f),
         0.45f);
@@ -323,7 +360,11 @@ PoseDetector::runDetector(
             Onnx::Detection::blazePoseParams(224)};
         break;
       case Onnx::ModelKind::PalmDetector:
-        candidates = {Onnx::Detection::palmParams(model)};
+        // The 256 "full" palm model (2944 anchors) uses five layers.
+        candidates = {
+            Onnx::Detection::palmParams(model),
+            Onnx::Detection::SsdParams{
+                .input_size = model, .strides = {8, 16, 32, 32, 32}}};
         break;
       default:
         candidates = {Onnx::Detection::blazeFaceParams(model)};
