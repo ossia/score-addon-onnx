@@ -49,6 +49,7 @@ enum class OutputMode
   Denormalize,
   Passthrough,
   Half255,
+  Sigmoid, // appended: saved scores store the index
 };
 
 }
