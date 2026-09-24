@@ -10,14 +10,18 @@
 // to keep the lock-free acquire()/release() semantics; otherwise we fall back
 // to a small mutex-guarded queue with the same API (acquire pops, release
 // pushes), which preserves correctness if not the lock-freedom.
+
 #include <mutex>
 #include <utility>
-
 #if __has_include(<concurrentqueue/concurrentqueue.h>)
 #define OSSIA_COMPAT_HAS_MOODYCAMEL 1
+#include <ossia/detail/buffer_pool.hpp>
+
 #include <concurrentqueue/concurrentqueue.h>
 #elif __has_include(<concurrentqueue.h>)
 #define OSSIA_COMPAT_HAS_MOODYCAMEL 1
+#include <ossia/detail/buffer_pool.hpp>
+
 #include <concurrentqueue.h>
 #else
 #define OSSIA_COMPAT_HAS_MOODYCAMEL 0
@@ -56,8 +60,6 @@ private:
   std::mutex m_mutex;
   std::vector<T> m_impl;
 };
-#endif
-
 template <typename Obj_T>
 struct object_pool
 {
@@ -72,4 +74,5 @@ struct object_pool
 
   void release(Obj_T b) { buffers.enqueue(std::move(b)); }
 };
+#endif
 }

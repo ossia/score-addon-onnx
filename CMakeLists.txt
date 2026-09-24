@@ -288,6 +288,119 @@ avnd_addon_object(
   SOURCES
     OnnxModels/DepthAnything2.hpp
     OnnxModels/DepthAnything2.cpp)
+  
+  
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+  OnnxModels/ImageProcessor.hpp
+  OnnxModels/ImageProcessor.cpp
+  TARGET
+  image_processor
+  MAIN_CLASS
+  ImageProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/VideoProcessor.hpp
+    OnnxModels/VideoProcessor.cpp
+  TARGET
+    video_processor
+  MAIN_CLASS
+    VideoProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/AudioProcessor.hpp
+    OnnxModels/AudioProcessor.cpp
+  TARGET
+    audio_processor
+  MAIN_CLASS
+    AudioProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/AudioAnalyzer.hpp
+    OnnxModels/AudioAnalyzer.cpp
+  TARGET
+    audio_analyzer
+  MAIN_CLASS
+    AudioAnalyzer
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/SequenceProcessor.hpp
+    OnnxModels/SequenceProcessor.cpp
+  TARGET
+    sequence_processor
+  MAIN_CLASS
+    SequenceProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/GeometryProcessor.hpp
+    OnnxModels/GeometryProcessor.cpp
+  TARGET
+    geometry_processor
+  MAIN_CLASS
+    GeometryProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/ImageGenerator.hpp
+    OnnxModels/ImageGenerator.cpp
+  TARGET
+    image_generator
+  MAIN_CLASS
+    ImageGenerator
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/TextToken.hpp
+    OnnxModels/TextToken.cpp
+  TARGET
+    text_token
+  MAIN_CLASS
+    TextToken
+  NAMESPACE
+    OnnxModels
+)
 
 avnd_addon_object(
   BASE score_addon_onnx_models
@@ -295,6 +408,8 @@ avnd_addon_object(
   CLASS Regressor
   NAMESPACE RapidlibModels
   BACKENDS ${ONNX_DATA_BACKENDS}
+  BASE_TARGET
+    score_addon_onnx_models
   SOURCES
     RapidlibModels/Regressor.hpp
     RapidlibModels/Regressor.cpp)
@@ -308,7 +423,6 @@ avnd_addon_object(
   SOURCES
     RapidlibModels/Classifier.hpp
     RapidlibModels/Classifier.cpp)
-
 
 # FastVLM and QwenLLM are the only objects that #include the onnxruntime-extensions
 # tokenizer headers (Onnx/helpers/TokenIO.hpp etc.), so they are built only when the
