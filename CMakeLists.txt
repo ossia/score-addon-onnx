@@ -707,6 +707,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     tests/test_aux_inputs.cpp
     tests/test_audio_processor.cpp
     tests/test_audio_overlap.cpp
+    tests/test_audio_mel.cpp
     tests/test_classifier_routing.cpp
     tests/test_image_outputs.cpp
     OnnxModels/Resnet.cpp

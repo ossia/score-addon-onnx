@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -163,6 +164,33 @@ void AudioProcessor::resolveIO()
   }
 
   in_shape = Onnx::WaveformShape::fromInputShape(spec.inputs[wave_in_index].shape);
+  // [1,F,T] with F > 8: a spectrogram, not F channels of audio. A vocoder
+  // (mel bins in, waveform out) gets the log-mel of the input. STFT bins
+  // (F = 2^k + 1: a magnitude/phase model) or a spectrogram output need a
+  // pipeline this node does not have: refused once, instead of ORT throwing
+  // on every block.
+  mel_input = false;
+  {
+    const auto& s = spec.inputs[wave_in_index].shape;
+    if(s.size() == 3 && s[1] > 8)
+    {
+      const int64_t f = s[1];
+      const bool stftBins = ((f - 1) & (f - 2)) == 0;
+      const auto& o = spec.outputs[wave_out_index].shape;
+      const bool waveOut = o.size() <= 2 || (o.size() == 3 && o[1] <= 2);
+      if(stftBins || !waveOut)
+      {
+        std::fprintf(
+            stderr,
+            "Audio Processor: %s: the input [1,%lld,T] is a spectrogram and "
+            "the model is not a mel vocoder; not supported\n",
+            lastModelPath.c_str(), (long long)f);
+        inputs.model.current_model_invalid = true;
+        return;
+      }
+      mel_input = true;
+    }
+  }
   out_shape = Onnx::WaveformShape::fromOutputShape(
       spec.outputs[wave_out_index].shape, in_shape.channels);
   if(out_shape.channels < 1)
@@ -179,25 +207,36 @@ void AudioProcessor::resolveIO()
   }
 
   lastRateOverride = inputs.model_rate.value;
-  model_rate = lastRateOverride > 0
-                   ? (double)lastRateOverride
-                   : Onnx::audioModelRate(*ctx, inputs.model.file.filename, host_rate);
+  model_rate = lastRateOverride > 0 ? (double)lastRateOverride
+               : Onnx::audioModelRate(
+                   *ctx, inputs.model.file.filename,
+                   mel_input ? 22050. : host_rate);
 
   const int hc = host_in_channels > 0 ? host_in_channels : 1;
+  if(mel_input)
+  {
+    const auto n_mels = spec.inputs[wave_in_index].shape[1];
+    mel.prepare((int)n_mels, model_rate);
+    in_shape.channels = 1;
+    in_shape.block = mel.blockSize();
+    mel_shape = {1, n_mels, mel.frames};
+    mel_staged.resize((std::size_t)n_mels * mel.frames);
+  }
   const int64_t block = in_shape.block > 0 ? in_shape.block : 1024;
   // Heavy models (separation/vocoder, >32MB or big block) run async; light
   // streaming models (recurrent denoise) run inline for low latency.
   async_model = inputs.model.file.bytes.size() > 32u * 1024 * 1024 || block > 48000;
   const int backlog = async_model ? 4 : 0;
   lastOverlap = inputs.overlap.value;
-  const int64_t hop = lastOverlap == AudioOverlap::Half            ? block / 2
+  const int64_t hop = mel_input ? mel.hopSize()
+                      : lastOverlap == AudioOverlap::Half          ? block / 2
                       : lastOverlap == AudioOverlap::ThreeQuarters ? block / 4
                                                                    : block;
   audio_in.prepare(in_shape, host_rate, model_rate, block, hop, hc,
                    max_frames, backlog);
   audio_out.prepare(out_shape.channels, model_rate, host_rate, block,
                     max_frames, backlog);
-  audio_out.prepareOverlap(block, hop);
+  audio_out.prepareOverlap(block, mel_input ? block : hop);
   staged.reserve((std::size_t)out_shape.channels * block + 16);
   out_planar.reserve((std::size_t)out_shape.channels * block + 16);
 }
@@ -221,7 +260,11 @@ try
     return;
 
   if(!ctx || lastModelPath != inputs.model.file.filename)
+  {
     reloadModel();
+    if(inputs.model.current_model_invalid)
+      return;
+  }
   if(spec.inputs.empty() || spec.outputs.empty())
     return;
   if((inputs.model_rate.value != lastRateOverride
@@ -266,6 +309,11 @@ void AudioProcessor::runBlock()
   const int64_t n = audio_in.fill(staged);
   if(n <= 0)
     return;
+  if(mel_input)
+  {
+    mel.compute(staged.data(), mel_staged.data());
+    staged.assign(mel_staged.begin(), mel_staged.end());
+  }
 
   // Param 1 selects which separation stem to route to the output (0..1 mapped
   // across the available waveform outputs).
@@ -292,7 +340,7 @@ void AudioProcessor::dispatchInfer(int64_t n, bool force_async)
     auto job = JobPool<AudioInferJob>::instance().acquire();
     job->ctx = ctx;
     job->input = staged;
-    job->ishape = in_shape.tensorShape(n);
+    job->ishape = mel_input ? mel_shape : in_shape.tensorShape(n);
     job->wave_in_index = wave_in_index;
     job->wave_out_index = wave_out_index;
     job->out_shape = out_shape;
@@ -322,7 +370,7 @@ void AudioProcessor::dispatchInfer(int64_t n, bool force_async)
   const int nin = (int)spec.inputs.size();
   std::vector<Ort::Value> ins;
   ins.reserve(nin);
-  auto ishape = in_shape.tensorShape(n);
+  auto ishape = mel_input ? mel_shape : in_shape.tensorShape(n);
   const float params[3]{inputs.param2.value, inputs.param3.value, inputs.param4.value};
   const Onnx::AuxHost host{
       .params = params, .sample_rate = model_rate, .primary_shape = ishape};

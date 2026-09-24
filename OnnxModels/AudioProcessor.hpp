@@ -12,6 +12,7 @@
 
 #include <Onnx/helpers/AudioIO.hpp>
 #include <Onnx/helpers/AuxInputs.hpp>
+#include <Onnx/helpers/MelFrontend.hpp>
 #include <Onnx/helpers/ModelArchetype.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
 
@@ -157,6 +158,13 @@ private:
                                   // scalars take Params 2..4
   std::vector<std::vector<uint8_t>> aux_store;
   Onnx::WaveformShape in_shape, out_shape;
+
+  // A vocoder's [1,n_mels,T] input is fed the log-mel spectrogram of the
+  // incoming audio (HiFi-GAN settings).
+  bool mel_input = false;
+  Onnx::MelFrontend mel;
+  std::vector<float> mel_staged;
+  std::vector<int64_t> mel_shape;
 
   Onnx::WaveformInput audio_in;
   Onnx::WaveformOutput audio_out;
