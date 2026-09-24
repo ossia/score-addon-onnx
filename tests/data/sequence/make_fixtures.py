@@ -49,3 +49,20 @@ save("counter",
       helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [1, 1])],
      [const("one", np.array([[1.0]], np.float32))])
 
+# A scalar control declared before the data: y = x * t.
+save("scalar_first",
+     [helper.make_node("Mul", ["x", "t"], ["y"])],
+     [helper.make_tensor_value_info("t", TensorProto.FLOAT, [1]),
+      helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
+     [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])])
+
+# A fixed 8-frame window of 3 features, [?,8,3] -> [1,2]: every value of the
+# window has its own weight, so the output tells which frames it saw, in
+# which order.
+save("window8x3",
+     [helper.make_node("Reshape", ["x", "flat"], ["f"]),
+      helper.make_node("MatMul", ["f", "w"], ["y"])],
+     [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["B", 8, 3])],
+     [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 2])],
+     [const("flat", np.array([1, 24], np.int64)),
+      const("w", (np.arange(48, dtype=np.float32).reshape(24, 2) % 11 - 5) / 4)])

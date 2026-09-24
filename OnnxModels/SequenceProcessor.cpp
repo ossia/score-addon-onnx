@@ -219,14 +219,6 @@ void SequenceProcessor::reloadModel()
   dataOut = -1;
   stateful = arch.stateful;
 
-  for(size_t i = 0; i < arch.inputs.size(); ++i)
-  {
-    if(arch.inputs[i].arch != PortArchetype::RecurrentState)
-    {
-      primaryIn = (int)i;
-      break;
-    }
-  }
 
   // --- recurrent state: each state input with the output it is fed from ---
   // Paired once by classifyModel (names first, then free same-shape outputs,
@@ -274,6 +266,44 @@ void SequenceProcessor::reloadModel()
     states.pop_back();
   }
   stateful = !states.empty(); // tagged-but-unpaired/released -> effectively stateless
+
+  // The data input, once the threaded states are known: a sequence / vector
+  // / latent first; else anything that is not a control (scalar), a bool
+  // mask or token ids; else the first input that is not a threaded state. A
+  // scalar declared first (t, then x) would otherwise take the payload and
+  // fail on every frame. An input tagged as a state whose pairing was
+  // released above (x [1,4] -> y [1,4]) is data again.
+  {
+    auto threaded = [&](size_t i) {
+      return std::any_of(states.begin(), states.end(), [&](const StateBuf& sb) {
+        return sb.in_index == (int)i;
+      });
+    };
+    auto pick = [&](auto pred) {
+      for(size_t i = 0; i < arch.inputs.size(); ++i)
+        if(!threaded(i) && spec.inputs[i].elem_type != TensorElemType::Bool
+           && pred(arch.inputs[i].arch))
+          return (int)i;
+      return -1;
+    };
+    int p = pick([](PortArchetype a) {
+      return a == PortArchetype::Sequence || a == PortArchetype::Vector
+             || a == PortArchetype::Latent;
+    });
+    if(p < 0)
+      p = pick([](PortArchetype a) {
+        return a != PortArchetype::Scalar && a != PortArchetype::Unknown
+               && a != PortArchetype::TokenSeq;
+      });
+    if(p < 0)
+      for(size_t i = 0; i < arch.inputs.size(); ++i)
+        if(!threaded(i))
+        {
+          p = (int)i;
+          break;
+        }
+    primaryIn = std::max(p, 0);
+  }
 
   // Route primary + secondary (Data) outputs from the non-state remainder.
   bool first_out = true;
