@@ -45,14 +45,13 @@ try
   }
   auto& ctx = *this->ctx;
   const auto& spec = ctx.readModelSpec();
+  // The model's own input size; the resolution knob only sizes dynamic
+  // exports.
+  const auto [mw, mh] = nchwInputSize(
+      spec.inputs[0], this->inputs.resolution.value.x,
+      this->inputs.resolution.value.y);
   auto t = nchw_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      this->inputs.resolution.value.x,
-      this->inputs.resolution.value.y,
-      storage,
+      spec.inputs[0], in_tex.bytes, in_tex.width, in_tex.height, mw, mh, storage,
       {255.f * 0.485f, 255.f * 0.456f, 255.f * 0.406f},
       {255.f * 0.229f, 255.f * 0.224f, 255.f * 0.225f});
   Ort::Value tt[1] = {std::move(t.value)};
