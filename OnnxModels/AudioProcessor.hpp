@@ -60,6 +60,26 @@ struct AudioInferJob
   std::vector<Onnx::AuxPlan> aux;   // the other inputs
   float params[3]{};                // Params 2..4, for the scalar ones
   double model_rate = 48000.0;
+
+  // Vocoder: `input` holds audio and the job computes its log-mel first. The
+  // output is a waveform, of which samples [keep_from, keep_from +
+  // keep_count) are kept (the context frames' are dropped), or a spectrum
+  // (spec_out: magnitude, cos, sin) synthesised over frames [keep_from,
+  // keep_from + keep_count) with the node's overlap state synth_acc.
+  std::shared_ptr<const Onnx::MelFrontend> mel;
+  std::shared_ptr<const Onnx::SpectrumSynth> synth;
+  std::vector<float> synth_acc;
+  int spec_out[3]{-1, -1, -1};
+  int64_t keep_from = 0;
+  int64_t keep_count = -1;
+};
+
+// The log-mel features a vocoder expects (see MelFrontend.hpp).
+enum class AudioMelStyle
+{
+  Auto,    // Vocos for 100 mel bins, else HiFi-GAN
+  HiFiGAN, // Slaney, 0..8 kHz, log floor 1e-5 (HiFi-GAN, MelGAN, Matcha)
+  Vocos    // HTK, 0..Nyquist, log floor 1e-7 (vocos-mel-24khz)
 };
 
 // Frame-based streaming models (DTLN-style enhancement) take a block every
@@ -108,6 +128,13 @@ public:
           "(Hann window); for models that return a block as long as their "
           "input");
     } overlap;
+    struct : halp::enum_t<AudioMelStyle, "Mel">
+    {
+      halp_meta(
+          description,
+          "Log-mel features fed to a vocoder ([1,n_mels,T] input); the "
+          "model's metadata sets the sample rate, n_fft and hop");
+    } mel_style;
   } inputs;
 
   struct
@@ -154,6 +181,7 @@ private:
   std::vector<int> wave_out_indices; // separation stems (Param 1 selects)
   int lastRateOverride = 0;
   AudioOverlap lastOverlap{};
+  AudioMelStyle lastMelStyle{};
   std::vector<Onnx::AuxPlan> aux; // inputs other than the waveform and states:
                                   // scalars take Params 2..4
   std::vector<std::vector<uint8_t>> aux_store;
@@ -162,9 +190,12 @@ private:
   // A vocoder's [1,n_mels,T] input is fed the log-mel spectrogram of the
   // incoming audio (HiFi-GAN settings).
   bool mel_input = false;
-  Onnx::MelFrontend mel;
-  std::vector<float> mel_staged;
+  std::shared_ptr<Onnx::MelFrontend> mel;
   std::vector<int64_t> mel_shape;
+  // A vocoder that returns a spectrum (Vocos: mag, x = cos, y = sin).
+  std::shared_ptr<Onnx::SpectrumSynth> synth;
+  std::vector<float> synth_acc;
+  int spec_out[3]{-1, -1, -1};
 
   Onnx::WaveformInput audio_in;
   Onnx::WaveformOutput audio_out;

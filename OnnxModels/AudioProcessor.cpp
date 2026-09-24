@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <type_traits>
 #include <cstring>
 #include <utility>
 
@@ -165,11 +167,12 @@ void AudioProcessor::resolveIO()
 
   in_shape = Onnx::WaveformShape::fromInputShape(spec.inputs[wave_in_index].shape);
   // [1,F,T] with F > 8: a spectrogram, not F channels of audio. A vocoder
-  // (mel bins in, waveform out) gets the log-mel of the input. STFT bins
-  // (F = 2^k + 1: a magnitude/phase model) or a spectrogram output need a
-  // pipeline this node does not have: refused once, instead of ORT throwing
-  // on every block.
+  // (mel bins in; a waveform out, or Vocos' magnitude / cos / sin spectrum)
+  // gets the log-mel of the input. STFT bins (F = 2^k + 1: a magnitude/phase
+  // model) or another output need a pipeline this node does not have:
+  // refused once, instead of ORT throwing on every block.
   mel_input = false;
+  spec_out[0] = spec_out[1] = spec_out[2] = -1;
   {
     const auto& s = spec.inputs[wave_in_index].shape;
     if(s.size() == 3 && s[1] > 8)
@@ -178,7 +181,20 @@ void AudioProcessor::resolveIO()
       const bool stftBins = ((f - 1) & (f - 2)) == 0;
       const auto& o = spec.outputs[wave_out_index].shape;
       const bool waveOut = o.size() <= 2 || (o.size() == 3 && o[1] <= 2);
-      if(stftBins || !waveOut)
+      for(int i = 0; i < (int)spec.outputs.size(); ++i)
+      {
+        const auto& n = spec.outputs[i].name;
+        const int k = (n == "mag" || n == "magnitude") ? 0
+                      : (n == "x" || n == "cos")       ? 1
+                      : (n == "y" || n == "sin")       ? 2
+                                                       : -1;
+        if(k >= 0 && spec.outputs[i].shape.size() == 3)
+          spec_out[k] = i;
+      }
+      const bool spectrumOut = spec_out[0] >= 0 && spec_out[1] >= 0 && spec_out[2] >= 0;
+      if(!spectrumOut)
+        spec_out[0] = spec_out[1] = spec_out[2] = -1;
+      if(stftBins || !(waveOut || spectrumOut))
       {
         std::fprintf(
             stderr,
@@ -206,29 +222,81 @@ void AudioProcessor::resolveIO()
     aux_shapes.resize(aux.size());
   }
 
+  // Vocoder features: the style from the Mel input (Auto: Vocos for 100 bins,
+  // the vocos-mel-24khz layout, else HiFi-GAN), then the model's metadata
+  // (sherpa-onnx exports carry n_fft / hop_length) over the style's values.
+  lastMelStyle = inputs.mel_style.value;
+  Onnx::MelConfig melcfg;
+  if(mel_input)
+  {
+    const int n_mels = (int)spec.inputs[wave_in_index].shape[1];
+    const bool vocos = lastMelStyle == AudioMelStyle::Vocos
+                       || (lastMelStyle == AudioMelStyle::Auto && n_mels == 100);
+    melcfg = vocos ? Onnx::MelConfig::vocos(n_mels, 24000.)
+                   : Onnx::MelConfig::hifigan(n_mels, 22050.);
+    try
+    {
+      Ort::AllocatorWithDefaultOptions alloc;
+      auto meta = ctx->session.GetModelMetadata();
+      auto number = [&](const char* key, auto& dst) {
+        if(auto v = meta.LookupCustomMetadataMapAllocated(key, alloc))
+          if(const double d = std::atof(v.get()); d > 0)
+            dst = (std::remove_reference_t<decltype(dst)>)d;
+      };
+      number("n_fft", melcfg.n_fft);
+      number("hop_length", melcfg.hop);
+      number("fmin", melcfg.fmin);
+      number("fmax", melcfg.fmax);
+    }
+    catch(...)
+    {
+    }
+  }
+
   lastRateOverride = inputs.model_rate.value;
   model_rate = lastRateOverride > 0 ? (double)lastRateOverride
                : Onnx::audioModelRate(
                    *ctx, inputs.model.file.filename,
-                   mel_input ? 22050. : host_rate);
+                   mel_input ? melcfg.rate : host_rate);
 
   const int hc = host_in_channels > 0 ? host_in_channels : 1;
   if(mel_input)
   {
-    const auto n_mels = spec.inputs[wave_in_index].shape[1];
-    mel.prepare((int)n_mels, model_rate);
+    melcfg.rate = model_rate;
+    if(melcfg.fmax > model_rate / 2.)
+      melcfg.fmax = model_rate / 2.;
+    auto m = std::make_shared<Onnx::MelFrontend>();
+    m->prepare(melcfg);
+    mel = std::move(m);
     in_shape.channels = 1;
-    in_shape.block = mel.blockSize();
-    mel_shape = {1, n_mels, mel.frames};
-    mel_staged.resize((std::size_t)n_mels * mel.frames);
+    in_shape.block = mel->blockSize();
+    mel_shape = {1, melcfg.n_mels, mel->blockFrames()};
+    if(spec_out[0] >= 0)
+    {
+      auto sy = std::make_shared<Onnx::SpectrumSynth>();
+      sy->prepare(melcfg.n_fft, melcfg.hop);
+      synth = std::move(sy);
+      synth_acc.assign(melcfg.n_fft, 0.f);
+      out_shape.channels = 1; // the spectrum is one channel of audio
+    }
+    else
+      synth.reset();
+  }
+  else
+  {
+    mel.reset();
+    synth.reset();
   }
   const int64_t block = in_shape.block > 0 ? in_shape.block : 1024;
   // Heavy models (separation/vocoder, >32MB or big block) run async; light
-  // streaming models (recurrent denoise) run inline for low latency.
-  async_model = inputs.model.file.bytes.size() > 32u * 1024 * 1024 || block > 48000;
+  // streaming models (recurrent denoise) run inline for low latency. A
+  // vocoder always does: its mel analysis alone is too long for the audio
+  // thread.
+  async_model = inputs.model.file.bytes.size() > 32u * 1024 * 1024 || block > 48000
+                || mel_input;
   const int backlog = async_model ? 4 : 0;
   lastOverlap = inputs.overlap.value;
-  const int64_t hop = mel_input ? mel.hopSize()
+  const int64_t hop = mel_input ? mel->hopSize()
                       : lastOverlap == AudioOverlap::Half          ? block / 2
                       : lastOverlap == AudioOverlap::ThreeQuarters ? block / 4
                                                                    : block;
@@ -245,6 +313,7 @@ void AudioProcessor::zeroStates()
 {
   for(auto& s : states)
     std::fill(s.data.begin(), s.data.end(), 0.f);
+  std::fill(synth_acc.begin(), synth_acc.end(), 0.f);
   audio_in.reset();
   audio_out.reset();
 }
@@ -268,7 +337,8 @@ try
   if(spec.inputs.empty() || spec.outputs.empty())
     return;
   if((inputs.model_rate.value != lastRateOverride
-      || inputs.overlap.value != lastOverlap)
+      || inputs.overlap.value != lastOverlap
+      || inputs.mel_style.value != lastMelStyle)
      && !inferenceInProgress)
     resolveIO(); // re-prepares the resamplers and the block hop
 
@@ -309,11 +379,6 @@ void AudioProcessor::runBlock()
   const int64_t n = audio_in.fill(staged);
   if(n <= 0)
     return;
-  if(mel_input)
-  {
-    mel.compute(staged.data(), mel_staged.data());
-    staged.assign(mel_staged.begin(), mel_staged.end());
-  }
 
   // Param 1 selects which separation stem to route to the output (0..1 mapped
   // across the available waveform outputs).
@@ -341,6 +406,20 @@ void AudioProcessor::dispatchInfer(int64_t n, bool force_async)
     job->ctx = ctx;
     job->input = staged;
     job->ishape = mel_input ? mel_shape : in_shape.tensorShape(n);
+    job->mel = mel;
+    job->synth = synth;
+    job->synth_acc = synth_acc;
+    for(int k = 0; k < 3; ++k)
+      job->spec_out[k] = spec_out[k];
+    if(mel)
+    {
+      // Only the new frames: the context frames' output is dropped.
+      const int64_t h = synth ? 1 : mel->cfg.hop;
+      job->keep_from = mel->context * h;
+      job->keep_count = mel->frames * h;
+    }
+    else
+      job->keep_count = -1;
     job->wave_in_index = wave_in_index;
     job->wave_out_index = wave_out_index;
     job->out_shape = out_shape;
@@ -370,7 +449,7 @@ void AudioProcessor::dispatchInfer(int64_t n, bool force_async)
   const int nin = (int)spec.inputs.size();
   std::vector<Ort::Value> ins;
   ins.reserve(nin);
-  auto ishape = mel_input ? mel_shape : in_shape.tensorShape(n);
+  auto ishape = in_shape.tensorShape(n); // vocoders always run async
   const float params[3]{inputs.param2.value, inputs.param3.value, inputs.param4.value};
   const Onnx::AuxHost host{
       .params = params, .sample_rate = model_rate, .primary_shape = ishape};
@@ -486,11 +565,20 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
     const Onnx::AuxHost host{
         .params = job->params, .sample_rate = job->model_rate,
         .primary_shape = job->ishape};
+    // A vocoder's input: the log-mel of the audio block.
+    std::vector<float> features;
+    if(job->mel)
+    {
+      std::vector<float> magnitude;
+      features.resize((std::size_t)job->mel->cfg.n_mels * job->mel->blockFrames());
+      job->mel->compute(job->input.data(), features.data(), magnitude);
+    }
     for(int i = 0; i < nin; ++i)
     {
       if(i == job->wave_in_index)
       {
-        ins.emplace_back(Onnx::vec_to_tensor<float>(job->input, job->ishape));
+        ins.emplace_back(Onnx::vec_to_tensor<float>(
+            job->mel ? features : job->input, job->ishape));
         continue;
       }
       int si = -1;
@@ -524,18 +612,61 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
 
     // Decode waveform output to a planar float buffer on this thread.
     std::vector<float> scratch;
-    auto& res = outs[std::clamp(job->wave_out_index, 0, nout - 1)];
-    const auto info = res.GetTensorTypeAndShapeInfo();
-    const auto osh = info.GetShape();
-    const int64_t cnt = (int64_t)info.GetElementCount();
-    const Onnx::TensorElemType odt
-        = Onnx::fromOrtElementType(info.GetElementType());
-    const float* f
-        = Onnx::toFloat(res.GetTensorData<uint8_t>(), cnt, odt, scratch);
-    const auto st = selectStem(f, cnt, osh, job->out_shape.channels, job->stem);
-    std::vector<float> planar(st.data, st.data + st.channels * st.frames);
-    const int oc = st.channels;
-    const int64_t on = st.frames;
+    std::vector<float> planar;
+    int oc = 1;
+    int64_t on = 0;
+    if(job->synth && job->spec_out[0] >= 0)
+    {
+      // Vocos: magnitude * (cos + i sin), inverse STFT of the new frames.
+      std::vector<float> parts[3];
+      int64_t T = 0;
+      for(int k = 0; k < 3; ++k)
+      {
+        auto& o = outs[job->spec_out[k]];
+        const auto oi = o.GetTensorTypeAndShapeInfo();
+        const auto sh = oi.GetShape();
+        const int64_t c = (int64_t)oi.GetElementCount();
+        const float* p = Onnx::toFloat(
+            o.GetTensorData<uint8_t>(), c,
+            Onnx::fromOrtElementType(oi.GetElementType()), scratch);
+        parts[k].assign(p, p + c);
+        if(sh.size() == 3)
+          T = sh[2];
+      }
+      const int F = job->synth->n_fft / 2 + 1;
+      if(T > 0 && (int64_t)parts[0].size() == F * T)
+      {
+        const int64_t t0 = std::min<int64_t>(job->keep_from, T);
+        const int64_t t1 = std::min<int64_t>(t0 + job->keep_count, T);
+        job->synth->push(
+            parts[0].data(), parts[1].data(), parts[2].data(), (int)T, (int)t0,
+            (int)t1, job->synth_acc, planar);
+      }
+      on = (int64_t)planar.size();
+    }
+    else
+    {
+      auto& res = outs[std::clamp(job->wave_out_index, 0, nout - 1)];
+      const auto info = res.GetTensorTypeAndShapeInfo();
+      const auto osh = info.GetShape();
+      const int64_t cnt = (int64_t)info.GetElementCount();
+      const Onnx::TensorElemType odt
+          = Onnx::fromOrtElementType(info.GetElementType());
+      const float* f
+          = Onnx::toFloat(res.GetTensorData<uint8_t>(), cnt, odt, scratch);
+      const auto st = selectStem(f, cnt, osh, job->out_shape.channels, job->stem);
+      oc = st.channels;
+      on = st.frames;
+      if(job->keep_count >= 0 && oc == 1)
+      {
+        // A vocoder's waveform: the samples of the new frames only.
+        const int64_t from = std::min<int64_t>(job->keep_from, on);
+        on = std::min<int64_t>(job->keep_count, on - from);
+        planar.assign(st.data + from, st.data + from + on);
+      }
+      else
+        planar.assign(st.data, st.data + st.channels * st.frames);
+    }
 
     // Capture new state values.
     std::vector<std::pair<int, std::vector<float>>> new_states;
@@ -556,12 +687,16 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
     }
 
     return [planar = std::move(planar), oc, on, gen = job->gen,
-            new_states = std::move(new_states)](AudioProcessor& self) mutable
+            new_states = std::move(new_states),
+            acc = std::move(job->synth_acc)](AudioProcessor& self) mutable
     {
       self.inferenceInProgress = false;
       if(gen != self.gen)
         return; // Reset while it ran: keep the zeroed states, drop the block
-      self.audio_out.pushOverlap(planar.data(), oc, on);
+      if(acc.size() == self.synth_acc.size())
+        self.synth_acc = std::move(acc);
+      if(on > 0)
+        self.audio_out.pushOverlap(planar.data(), oc, on);
       for(auto& ns : new_states)
         for(auto& s : self.states)
           // Size guard: if the model was swapped while this job was in flight,
