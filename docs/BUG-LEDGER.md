@@ -1,0 +1,222 @@
+# score-addon-onnx: bug & task ledger
+
+This ledger comes from the model-to-object analysis and the preset-building pass of 2026-09-23.
+In that pass, each model was run in onnxruntime with Python replicas of the node's pre- and post-processing, and the
+LLM/VLM were run through the built smoke binaries. **Nothing was run inside score itself.**
+Line numbers refer to this tree (score-workshop) at the time of writing.
+
+**Scope.** Legacy objects that are being deprecated are left out: YOLO Pose, YOLO Blob, YOLO Segmentation, Blaze Pose,
+TRT Pose, Depth Anything v2, Image-to-Image GAN and Generative Image GAN. Their findings are kept briefly in the appendix.
+**EmotionNet and Resnet are kept.**
+
+Severity:
+- **S1**: wrong or empty output for valid models.
+- **S2**: a feature is unusable or degraded.
+- **S3**: a robustness or UX issue.
+- **S4**: cleanup.
+
+Status: `open` unless noted.
+
+**Diagnosis:** every open item has been re-verified and root-caused in `BUG-DIAGNOSIS.md`, which also corrects several entries below. Read it before fixing.
+
+---
+
+## Cross-cutting
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| X1 | S2 — **fixed** | `Onnx/helpers/OnnxContext.hpp` (`OnnxRunContext(bytes)`) | Every node except LLM/VLM builds its session from mmapped bytes. Models with external data (`.onnx_data`) cannot load. | Done. `OnnxRunContext(bytes, model_path)` sets `session.model_external_initializers_file_folder_path` to the model's folder; every node passes its filename (14 call sites). Test: `test_external_data.cpp` (tiny `.onnx` + `.onnx_data` fixture, run from another working directory). |
+| X2 | S1 — **fixed** | Resnet.cpp:26, ENet.cpp:37 (the same pattern is in the legacy nodes) | `ctx` is created once (`if(!ctx)`) and never reset. Changing the model, or applying a preset to a node that has already run, keeps the old session. | Done (Resnet, EmotionNet): the session is rebuilt when the model filename changes. Test: `test_node_model_swap.cpp`, swapped node equals a fresh node on the new model. |
+| X3 | S3 — **fixed** | Resnet.cpp:65 and the other catch blocks | `current_model_invalid` is sticky. It is only cleared when a new model file loads, so one transient exception disables the node. | Done (Resnet, EmotionNet): only a session that fails to build marks the model invalid; a frame that fails to run clears the output and the next good frame recovers. Test: `test_node_model_swap.cpp`. |
+| X4 | S2 — **fixed** | `Onnx/helpers/ModelArchetype.hpp` `classifyModel` | The classifier routes some models to the wrong kind. The kind is advisory, but it drives port roles. Known cases:<br>- bare rank-2 audio input (`[B,1024]` CREPE, `[B,T]` Silero) → Sequence<br>- SAM / EdgeSAM decoders → Geometry<br>- Moirai → TextToken<br>- UniAD head → Audio<br>- HWC image without batch `[128,128,3]` → Geometry | Done: the nine rules of the diagnosis (bool → mask, `*_id` metadata, HWC images, batch-like waveform front dim, sr / CREPE fingerprints, SAM decoders, primary-input routing, NHWC and symbolic-channel guards), plus: a model with a KV cache (past_key_values.*, cache_key_N) stays with TextToken. Over 1052 swept signatures only the intended kinds change. Test: `test_classifier_routing.cpp` (11 real signatures). |
+| X6 | **S1** — **fixed** | `score-plugin-gfx/Gfx/Graph/NodeRenderer.{hpp,cpp}`, `score-plugin-avnd/Crousti/CpuFilterNode.hpp`, `Crousti/GpuUtils.hpp` (`texture_outputs_storage::init`) | **In CPU-texture avnd nodes, texture outlets other than the first did not draw their own texture.** There were two faults. (1) At init, `texture_outputs_storage::init` only created passes via `defaultPassesInit`, which covers the edges of `output[0]`, so an edge from Mask or Depth got **no pass** and drew nothing. (2) A pass created later (`addOutputPass`, for cables added while playing) bound *every* sampler, and `generic_texgen_fs` samples only binding 3, i.e. `m_samplers[0]`, so it drew the **first outlet**. That is the reported symptom. | Done. `GenericNodeRenderer::samplersForOutputEdge(edge)` is a virtual hook that defaults to all samplers, so other nodes are unchanged; it is used by `addOutputPass` and `defaultPassesInit`. `CpuFilterNode` overrides it to return only the source outlet's sampler (port index maps to field index via `for_all_n2`), and `texture_outputs_storage::init` now adds a pass for every edge of every texture outlet. Validated by `tests/integration/multi-outlet` (below): it FAILS with the avnd part reverted and PASSES with it, both when the cables are in the document from the start (`init`) and when they are added while playing (`live`). |
+| X7 | S1 — **fixed** | `score-plugin-scenario` resize / `score-plugin-engine` BaseScenarioComponent | **The root interval ends at its stale max duration even though the max is flagged infinite.** After `Score.setIntervalDuration(root, 600 s)`, the saved root has Default = Min = 600 s but `MaxDuration` = 15.75 s (the new-document default) with `MaxInf=true`, and playback ends about 15.75 s after play. Setting the max explicitly avoids it. This is why `text-render.sh` and similar harnesses currently die about 17 s in. | Done: `IntervalExecution.cpp` pushes min/max to the engine on `min/maxDurationChanged`, `minNullChanged` and `maxInfiniteChanged`. Test: `tests/integration/headless-end` (`resize` mode; `STOPPED-AT-STALE-MAX` without the fix). |
+| X8 | S1 — **fixed** | `score-plugin-engine/Execution/DocumentPlugin.cpp:104` (`recreateBase` finished handler) | **Headless (`--no-gui`) score aborts when the root interval finishes.** The handler looks up `Actions::Stop`, which is only registered with a GUI, so `ankerl::unordered_dense::map::at()` throws `out_of_range` and the app terminates. Together with X7, this breaks every scripted headless test after about 17 s (confirmed with `text-render.sh`). | Done: `Execution/DocumentPlugin.cpp` and the remote-control websocket handlers call `request_stop` / `request_play_global` headless instead of the GUI actions. Test: `tests/integration/headless-end` (`end` mode; aborts with exit 134 without the fix). |
+| X9 | S1 — **fixed** | `score-plugin-gfx/Gfx/Filter/Process.cpp` `Model::setProgram` / ISF execution | **An ISF whose program is replaced after creation renders nothing.** This covers `loadPreset`, a library preset drop, and even reloading the identical program into a `.fs`-created ISF. The model state (ports, values, shader) is identical to a working ISF created from the file, but the node draws nothing at all (a red gap probe stays black), in both `--no-gui` and GUI modes. As a result the new `Grid 2x2.scp` preset, and probably any ISF preset, does not render when applied. | Done: `Filter::Model::loadPreset` and `VSA::Model::loadPreset` emit `programChanged()`. Validated by `tests/integration/multi-outlet`, which now applies `Grid 2x2.scp` with `Score.loadPreset`, at load and while playing. |
+| X10 | S2 | score gfx graph: image inputs of downstream processes | **Float outlets are clamped to [0,1] on their way into a consumer.** The Image Processor Depth outlet is R32F metres, but an ISF image input receives it through an 8-bit render target, so everything beyond 1 m saturates before the shader can scale it. This makes raw Depth unusable downstream without a normalising step. | Allow float input render targets (per input, or inferred from the upstream texture format), or have the processor also expose a normalised depth. |
+| X11 | S3 | `score-plugin-js/JS/Qml/EditContext.scenario.cpp` `loadPreset` — **changed** | `Score.loadPreset` called `ProcessModel::loadPreset` directly, skipping the command a library drop uses (cable backup and restore, `inletsChanged`/`outletsChanged`, undo). | Done: it now submits the `LoadPresetCommandFactoryList` command in the script macro, and falls back to the direct call only if no factory matches. This alone does **not** fix X9. `test_integration_js_presets` passes. |
+| X5 | S4 | `docs/MODELS.md` (score-master) | It claims `tacotron2__decoder_iter` is refused. It isn't (see T7). | Update after T7. |
+
+### Validation harness: `tests/integration/multi-outlet/` (ctest `test_multi_outlet`)
+
+- **Scene:** Images (stretched) → Image Processor (Depth Anything 3 metric: Output Index 1 = sky → Mask, depth → Depth) and the **Grid 2x2** ISF (`grid-2x2.fs`, the shader the `Grid 2x2.scp` preset carries; see X9) tiling source | Image | Mask | Depth onto `Window:/`.
+- **Environment:** own Xvfb, Mesa llvmpipe, ONNX CPU provider.
+- **Runs:** twice, with cables present from the start (`init`) and cables added over OSC while playing (`live`).
+- **Checks:** `analyze.py` correlates each tile with onnxruntime references: Mask ~ sky r = 0.75, Depth ~ clamped depth r = 0.58 (see X10).
+- **Results:** PASS with the fixes. With the avnd part of X6 reverted, both runs FAIL: Mask and Depth show the first, unwritten outlet.
+- **Model and photo:** from `MULTI_OUTLET_MODEL` / `MULTI_OUTLET_IMAGE`; the test SKIPs without them.
+
+## Pose Detector
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| P1 | S1 — **fixed** | `PoseDetector_detect.cpp` (MultiClassDetector path) | Gold-YOLO head models (PINTO 423) need [0,1] input, but the path feeds raw 0-255 BGR, which gives about 20 garbage boxes at score ≈1.0. A ModelRole comment claims Gold-YOLO is supported. | Done: the input range follows the output column order: `..._score_x1y1x2y2` exports get raw 0-255, Gold-YOLO's `..._x1y1x2y2_score` gets [0,1]. Test: `test_pose_detector.cpp`. |
+| P2 | S2 — **fixed** | same | MultiClassDetector with a dynamic input size (YOLOv9-Wholebody25, PINTO 459) falls back to 128×128 and finds nothing on full-body shots. | Done: a dynamic-input multi-class detector is fed its native 160×128 (it reports boxes in that space). Test: `test_pose_detector.cpp` (459 wholebody25 on body.jpg: boxes inside the image; the right edge was at 1.22). |
+| P3 | S2 — **fixed** | same (YoloxDetector path) | ailia `yolox_*.opt` exports need raw 0-255 input, while the PINTO nano exports need /255. The path always does /255, so the ailia models give 0 detections. | Done: the range is probed per model ([0,1] first; a frame scoring below 0.01 is re-run raw) and kept once a range gives a confident score. Test: `test_pose_detector.cpp` (two ailia and two PINTO models). |
+| P4 | S1 — **fixed** | palm anchors (`palmParams`) | blazepalm 256 (wild2) has 2944 anchors, but `palmParams(256)` generates 3584, so the decode is misaligned. | Done: `{8,16,32,32,32}` is a second palm candidate, picked by anchor count. Test: `test_pose_detector.cpp`. |
+| P5 | S2 — **fixed** | `Onnx/helpers/ModelRole.hpp` `classify`, `workflowForRole` | SimCC models with a dynamic K (RTMW3D, DWPose) are reported as K=17. Auto then picks the RTMPose_COCO draw workflow, and 133 keypoints are drawn without a skeleton. | Done (draw side): the skeleton is chosen by keypoint count, so 133 keypoints get the whole-body skeleton under RTMPose_COCO. Colours and radii still follow the declared K. No automated draw test. |
+| P6 | S2 — **fixed** | `runDetector` (`keep_class=-2`) | Multi-class body/head/hand detectors can't serve as the *hand* detector in two-stage mode, because class 0 (body) is always kept. | Done: the two-stage paths pass the Detection Class when set; otherwise hand and face landmark models take classes 2 and 3 of a multi-class detector (body stays 0). Test: `test_pose_detector.cpp`. Shipped two-stage presets use body landmarks, so they are unchanged. |
+| P7 | ~~S1~~ **REFUTED** (same keypoint order; only the crop size differs) | `mediapipeRect` ROI (FaceMesh / MobileFaceNet) | The ROI assumes BlazeFace's keypoint order. With RetinaFace as the detector, the crops are misaligned. | Build the ROI per detector family (RetinaFace 5-point order). |
+| P8 | S3 — **fixed** | skeleton drawing | HRNet Animal-Pose (20 keypoints) is drawn with the AP-10K 17-point skeleton. | Done: Animal-Pose 20-point skeleton, used by the AnimalPose workflow when K = 20 (drawing and skeleton data). No automated draw test. |
+| P9 | S3 — **fixed** | skeleton drawing | ViTPose aic / mpii / coco_25 keypoint sets get dots only, no skeleton. | Done for AIC-14 and MPII-16 (drawing and skeleton data, chosen by count). COCO-25 is not added: its keypoint order was not verified. |
+| P10 | S3 — **fixed** | `classify` (FaceBoxes) | 3DDFA `FaceBoxesProd` declares all output dims dynamic. It classifies correctly only because ORT shape inference fills them in. With OpenVINO (`ORT_DISABLE_ALL`) it is Unknown, and it runs at the 320 fallback. | Done: when a pose model classifies as Unknown and its output dims are dynamic, one inference on a zero 320 px image gives the real output shapes, and it is classified again. Test: `test_pose_detector.cpp` (FaceBoxes with cleared output dims: Unknown, then FaceBoxesDetector after the probe). |
+| P11 | S2 — **fixed** | `Yolo.hpp` `YOLO_pose` (single-stage path) | Only 56×8400 (v8/v11 at 640) and 300×57 (yolo26) decode, and only 17 keypoints are kept. Other resolutions or K values pass `classify` but decode to nothing. | Done: `YOLO_pose` decodes by output shape (channel-major v8/v11 [1,5+3K,A], its transpose, row-major yolo26 [1,N,6+3K]) with K from the shape, and returns K for the node; the 68-landmark rule no longer catches a [1,68,8400] hand head. Tests: `test_pose_detector.cpp` (synthetic 320 px, K=21, transposed, yolo26); the four shipped YOLO-pose presets give identical poses before and after; no pose classification changes over 1052 signatures. |
+
+### Pose Detector: preset data fixes (the `pose-detector` package, not code)
+
+| ID | Preset(s) | Fix |
+|---|---|---|
+| PD1 | all 58 | Add `[30,{"Int":6}]` (Detection Hold). Harmless today. |
+| PD2 | `lm-rtmw3d-yolox-3d`, `wholeframe-rtmw3d-wholeframe` | Set Workflow `[2,{"Int":3}]` (RTMPose_Whole). Without it they draw no skeleton (see P5). |
+| PD3 | `lm-facemesh` | Min Confidence 1.0 → 0.5. At 1.0 it produces essentially nothing. |
+| PD4 | `reid-facemesh-facereid` | Uses the body re-ID model on face crops. Ship `face-reidentification-retail-0095` and set Preprocess `RawBGR`. |
+| PD5 | `reid-{blazepose,rtmpose,vitpose,yolopose}-osnet` | They use ResNet50-Market1501, not OSNet. Ship OSNet (2.5 MB / 8.7 MB) or rename them. |
+| PD6 | `lm-rtmpose-coco` | It actually runs WholeBody-133. Rename it. |
+| PD7 | `box-face-faceboxes*`, `box-face-retinaface` | Workflow 0 → 12 for consistency. |
+| PD8 | several | Unify the categories: "Detection (boxes)" / "Face/Detection" / "Hand", "Body/3D", "Body/Whole-frame". |
+| PD9 | `BlazePose Good`, `YOLOPose` | Legacy duplicates with dragged confidences (0.1252…). Delete them, or rename and round. |
+| PD10 | `lm-blazepose-full`, `lm-*-wholebody-full`, `lm-hand-rtmpose-full`, `lm-blazehand` | Confidence 0.55–0.69 also gates the detector. Use 0.4–0.5. |
+| PD11 | `~/Documents/ossia/score/packages/user/presets/PoseDetector/` | 54 stale copies with dead absolute paths and the old port layout. Delete. |
+
+## EmotionNet detector (`OnnxModels/ENet.*`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| E1 | S1 — **fixed** | ENet.cpp:37 | Stale session on model change (see X2). | Done with X2. |
+| E2 | S3 — **fixed** | ENet.hpp resolution port, `Images.hpp` `nchw_tensorFromRGBA` | The tensor shape comes from the model, but the buffer is sized from the knob. Any value other than 224×224 throws and marks the model invalid, so the knob is effectively useless. | Done: `nchwInputSize` takes a fixed model's own H/W (the resolution knob only sizes dynamic exports), and `nchw_tensorFromRGBA` shapes the tensor like the buffer it fills. Test: `test_node_model_swap.cpp` (resnet18 at knob 224/256/128 gives the same result; the recovery test uses a dynamic 8×8-only fixture). |
+| E3 | S2 — **fixed** | `nchw_tensorFromRGBA` | 1-channel models (FER+ `[1,1,64,64]`) can't be fed, because the 3-plane buffer doesn't match the 1-channel shape. | Done: a 1-channel model gets a raw 0-255 luma plane and the FER+ label order. Test: `test_node_model_swap.cpp` (emotion-ferplus-8 on face.png: Neutral/Happiness on top, labels in FER+ order). |
+| E4 | S2 — **fixed** | design | These are face-crop classifiers, but the node runs them on the whole frame. | Documented: the description says the face must fill the frame (crop it upstream, e.g. with the Pose Detector). A built-in face detector stage is not done. |
+| E5 | S3 — **fixed** | `Resnet.hpp` classes_10 / output loop | The 10-class list pads with "class_8"/"class_9", and the output is capped at `min(N,8)`. | Done: 9/10-output models get the softmax over the 7/8 emotions only, and Valence / Arousal passed through raw. Test: `test_node_model_swap.cpp`. |
+| E6 | S4 — **fixed** | ENet.hpp halp_meta | The description and manual_url still say "Resnet". | Done: EmotiEffLib author, an emotion-recognizer description, the `#emotionnet` manual anchor. |
+
+## Resnet detector (`OnnxModels/Resnet.*`, `Onnx/helpers/Resnet.hpp`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| R1 | S1 — **fixed** | Resnet.cpp:26 | Stale session on model change (see X2). | Done with X2. |
+| R2 | S3 — **fixed** | Resnet.cpp:65 | The invalid flag is sticky (see X3). | Done with X3. |
+| R3 | S2 — **fixed** | Resnet.hpp:53 | `thread_local std::vector<int> idx(N)` is sized on the first call only. A later model with a different N sorts or reads out of bounds. This is shared with ENet (L128 area). | Done: resized on every call, top-k bounded by `min(5, N)`. Test: `test_node_model_swap.cpp` (3, 1000 and 10 classes on one thread; SIGSEGV before). |
+| R4 | S3 — **fixed** | Resnet.hpp | Softmax is always applied, so models that already output probabilities get it twice. The ranking is fine but the values are wrong. | Done: no softmax when the output is already a probability vector (non-negative, sums to 1). Test: `test_node_model_swap.cpp`. |
+| R5 | S3 — **fixed** | resolution port | Same knob and shape mismatch as E2. | Done with E2. |
+
+## Image Processor (`OnnxModels/ImageProcessor.*`, `Onnx/helpers/ImageOps.*`, `ImageModelRole.hpp`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| I1 | S2 — **fixed** | `resolveLayout` / `preprocessTexture` | Only 3-channel or 1-channel (gray) tensors are built. 4-channel inputs (RGBA, or RGB + prior mask, e.g. PINTO 060 hair) throw, and the model is marked invalid for good. | Done: a model declaring 4 input channels gets the RGB sample plus a zero 4th channel (NCHW plane or NHWC repack), in the single-input, multi-input and Video paths. Test: `test_image_outputs.cpp` (PINTO 060 hair segmenter runs, 512×512 mask). |
+| I2 | S1 — **fixed** | Mask decode | For 2-class logit outputs (hand seg, PP-HumanSeg) Mask takes channel 0, which is the background, so the mask is inverted. | Done: 2 is a channel count in rank-4 layouts (NHWC checked first), a 2-channel result is a mask, and the mask shows the foreground: channel 1 if it holds probabilities, else the softmax of the two logits. Test: `test_image_outputs.cpp` (synthetic NCHW/NHWC probabilities and logits; PP-HumanSeg and the hand segmenter give the person / hand as foreground). |
+| I3 | S2 — **fixed** | `classifyImage` / scalar binding | Only rank ≤1 scalars bind to Param 1/2. A rank-2 `[?,1]` scalar such as FILM's `time` is typed Latent and zero-filled. A model whose input 0 is not an image goes down the LatentToImage path. | Done: the roles are resolved first and the image input is classified (FILM's `time` is declared first), a model with an image input is never run from a latent, and a single-value `[?,1]` input binds to a Param. Test: `test_image_outputs.cpp` (FILM between two identical frames returns the frame). |
+| I4 | S3 — **fixed** | multi-output models | Some models need an Output Index that Auto doesn't find, e.g. DexiNed's fused output is index 6. | Done: a `Sigmoid` pixel mapping (appended to the enum), and the DexiNed preset uses it. Output Index stays manual, as documented. |
+| I7 | S2 — **fixed** | ImageProcessor.cpp `decodeAll` | **Only one model output reached one outlet per run.** | Done. The Output Index output is decoded as before (Task and Pixel Mapping apply to it). Every other output is then routed by its own role (`out_kinds`, computed once per model) to an outlet it left free, using the Auto pixel mapping, and is only decoded when its outlet is free. Applies to the sync, multi-input and async paths. Validated with Depth Anything 3 metric: sky goes to Mask and depth goes to Depth in the same run. |
+| I5 | — | preset data | **DeblurGAN-v2 preset: checked, no change needed.** In the Image Processor pipeline, Centered/Denormalize scores best (34.8 dB). **HAN x3**: the sweep's best was Centered/Denormalize (31.2 dB), while the preset uses None/Passthrough. Compare the two by eye. | done / HAN open |
+| I6 | — | migration | **Replacing Image-to-Image GAN with Image Processor: all 18 models tried run and give an RGB image in Image Processor.** That is the 9 I2I presets plus Fast-SRGAN (package, PINTO hxw and 480×640), DeblurGAN inception, AnimeGANv2 NHWC, ESRGAN 077, SRResNet, Real-ESRGAN fp16 and white-box. This includes Fast-SRGAN (DivBy255 + Denormalize, 38 dB), which I2I-GAN cannot run correctly. Super-resolution and deblurring quality was checked by PSNR. Style-transfer outputs were not checked by eye. Sweep: scratchpad `cmp/cmp.py`. | Check the style outputs by eye, then deprecate I2I-GAN. |
+
+## Video Processor (`OnnxModels/VideoProcessor.*`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| V1 | S2 — **fixed** | `runInferAndThread` | Only `outs[output_index]` is decoded, so RVM can't fill Image (fgr) and Mask (pha) from one run. A composite needs two nodes, which doubles the cost and keeps two separate state chains. | Done: the decode helpers moved verbatim from ImageProcessor.cpp to `OnnxModels/ImageDecode.hpp` (`applyDecoded` is a template), and VideoProcessor uses `decodeAll`: the other outputs go to the outlets the Output Index one left free, and the recurrent state outputs are dropped unless picked. Test: `test_video_outputs.cpp` (RVM: Image and Mask from one node, at Output Index 0 and 1). |
+| V2 | S3 — **fixed** | `resolveWriteMode` | Auto on a Mask task gives MinMaxNormalize, which stretches the alpha matte and amplifies noise when nobody is in frame. | Done: Auto on a mask is `AutoRange`: a frame within [0,1] is written as is, other ranges are stretched. Test: `test_image_outputs.cpp`. |
+| V3 | S2 — **fixed** | Reset handling | Reset is ignored while `inferenceInProgress`. At HD/4K a job is almost always in flight, so Reset is often lost, and the finished job then returns its old states. | Done: Reset is latched until no job is in flight, and a generation counter keeps a job dispatched before the Reset (or before a model change) from bringing its states back. Test: `test_video_outputs.cpp` (after a Reset during a job, RVM gives the same matte as a fresh node). |
+| V4 | S3 — **fixed** | heavy heuristic | 512×288 counts as "not heavy" and runs synchronously on the render thread (about 0.13 s/frame on CPU). | Done: a synchronous run over 8 ms moves the model to the worker until the model or its geometry changes. Test: `test_video_outputs.cpp` (RVM 512 px, downsample ratio 1). |
+
+## Audio Processor (`OnnxModels/AudioProcessor.*`, `Onnx/helpers/AudioIO.hpp`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| A1 | S1 — **fixed** | `dispatchInfer(force_async)` | If `inferenceInProgress` is set, it returns after `audio_in.fill()` has already consumed the block. The block is lost, so slow models play bursts with gaps. | Done: the async path no longer pops a block while a job is in flight; the input and output rings hold 4 extra blocks for async models; Reset during a job drops its result (generation counter). Batching several small blocks per job is not done. Test: `test_audio_processor.cpp` (17 jobs for 20 blocks at 14-tick latency; 10 before). |
+| A2 | S1 — **fixed** | `WaveformShape::fromInputShape` | 4-D stem outputs `[B,S,C,N]` (Demucs) are pushed as mono `8·N`, which scrambles them and overflows the ring. | Done: `WaveformShape::fromOutputShape` reads a rank-4 [B,S,C,N] output as S stems of C channels; Param 1 picks the stem (sync and worker), and the other stems are dropped. Test: `test_audio_processor.cpp` (4 stereo stems, stem 2 on both channels). Demucs itself still needs a block-size control (A4). |
+| A3 | S2 — **fixed** | `guessModelRate` | The sample rate is guessed from port names only, and almost nothing matches, so 16 kHz models get the host rate. | Done: `Onnx/helpers/AudioRate.hpp` takes the rate from the model's `sample_rate`/`sr` metadata, then a family name in the ports, then in the file name (demucs 44.1k, dtln/silero/crepe/whisper 16k, hifigan 22.05k, vocos/encodec 24k, clap/rave/deepfilter 48k); a new "Model Rate" spinbox (appended, 0 = auto) overrides it. Test: `test_audio_processor.cpp`. |
+| A4 | S2 | `resolveIO` | `hop = block` always, with no overlap-add, so frame-based streaming models (DTLN) can't work. | Add hop and OLA support. |
+| A5 | S2 | design | There is no mel or STFT frontend, so vocoders and spectrogram models get raw samples in a `[1,80,T]` tensor. | Optional mel frontend. |
+| A6 | S4 — **fixed** | hpp | `AudioTaskMode` is unused and Params 2–4 do nothing. | Done: `AudioTaskMode` removed; Params 2–4 now drive the model's scalar inputs through the shared aux plan (which also feeds the other inputs typed as declared). The ports stay, so saved indices are unchanged. Test: `test_audio_processor.cpp` (gain = Param 2). |
+
+## Audio Analyzer (`OnnxModels/AudioAnalyzer.*`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| AA1 | S1 — **fixed** | AudioAnalyzer.cpp:121-133 (`resolveIO`) | Each state input pairs with the **first** output of the same shape, without skipping outputs already claimed, so Silero's `h` and `c` both read `hn`. Measured: speech 0.88 → 0.4–0.8 (and down to 0.07 on the sherpa export), noise 0.02 → 0.06–0.10. | Done: `ModelArchetype.hpp` pairs every state input with one output (name pass, then shape pass over unclaimed outputs) into `ArchPort::state_pair`, used by the audio, sequence and video nodes. Test: `test_state_pairing.cpp`; the classifier gives identical results on 1052 swept models. |
+| AA2 | S2 — **fixed** | design | CREPE needs per-frame normalisation (mean/std), which nothing does. At amplitude 0.02 a 330 Hz tone gives the wrong bin with confidence 0.1. | Done: a CREPE-shaped model ([?,1024] → [?,360]) gets each frame at zero mean / unit variance. Test: `test_audio_processor.cpp` (a 330 Hz tone at 0.02 lands on bin 203; it landed on 246). |
+| AA3 | S3 — **fixed** | `guessModelRate` | Only a name containing "clap" gives 48 kHz; everything else is assumed to be 16 kHz. | Done with A3 (same helper and Model Rate override; fallback 16 kHz). |
+| AA4 | S2 — **fixed** | aux input feeding | A BOOL aux input (CLAP `longer`) is fed a float buffer, which is a type error. A rank-4 spectrogram input falls back to `[1,1,64]`. | Done: aux inputs go through the aux plan (bool → false, sr → model rate); a rank-4 primary input is refused once with a message instead of failing every block. Test: `test_aux_inputs.cpp` (bool fixture, CLAP, Silero regression). |
+
+## Sequence Processor (`OnnxModels/SequenceProcessor.*`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| S1 | S2 — **fixed** | `reloadModel` | `resolvedWindow` is computed only on reload, so changing Window at runtime does nothing. | Done: `resolveWindow()` re-runs when the Window input changes and restarts the window. Test: `test_sequence_window.cpp` (RNNoise, Passthrough then Sliding equals Sliding from the start). |
+| S2 | S2 — **fixed** | aux inputs | Every non-primary, non-state input gets zeros. That breaks scalar controls such as Silero `sr` (the output depends on it), bbox sizes and time marks. | Done: `Onnx/helpers/AuxInputs.hpp` plans the inputs a node does not own (sr → rate, masks → ones at the primary's shape, int lengths → length, bool → false, scalars → Param k, else zeros) and fills them typed as declared. Sequence uses it. Test: `test_aux_inputs.cpp` (Silero through the node: mean speech probability > 0.5, 0.006 before). |
+| S3 | S4 — **fixed** | hpp | Param 1/2 are declared but never read. | Done with S2: scalar inputs take Param 1 / 2, carried in the async job. Test: `test_aux_inputs.cpp` (`scale.onnx`, y = x · Param 1). |
+| S4 | S3 | design | There is no L2-normalise option for embedding heads. The CLIP NSFW heads need it, and a wrapper model was built for the pack. | Add a normalise-input option. |
+| S5 | S3 | error reporting | Batch-baked exports (informer: batch 2) fail inside `infer()` and are only caught silently. | Surface the error, or check the batch dimension at load. |
+
+## Geometry Processor (`OnnxModels/GeometryProcessor.*`, `GeometryIO.hpp`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| G1 | S1 — **fixed** | `classifyGeomOutput` | Task=Auto treats per-point segmentation logits `[1,N,C]` (C 3..16) as a point cloud: the first 3 logits become "xyz" and nothing goes to Data. | Done: `classifyGeomOutput` takes the input channel count; only 3 channels, or the input's channel count when above 3, is a point cloud. Test: `test_geometry_output.cpp`; `geometry_node_test` 49/49 before and after. |
+| G2 | S3 — **fixed** | `dispatchInfer` | Only one input is bound. Param 1/2 are never forwarded, and models with extra inputs (SDF time, scale) fail. | Done: every declared input is bound: the cloud at `findCloudInput`'s index, the others through the aux plan. Test: `test_aux_inputs.cpp` (`geom_2in`, `geom_cloud_second`). |
+
+## Text Token Processor (`OnnxModels/TextToken.*`, `Onnx/helpers/TokenIO.hpp`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| T1 | S1 — **fixed** | TokenIO.hpp ≈L239 `classifyTokenOutput` | There is no rank-4 rule, and standard Piper exports output `[B,T,1,N]`, so they route to Data and produce no audio. | Done: rank 4 `[B,1|?,1,N]` with a long last axis is a waveform. Of the swept token models only Piper matches. Test: `test_texttoken_rate.cpp`. |
+| T2 | S1 — **fixed** | TextToken.cpp:80 `guessTtsRate` | Always 22050 (Piper amy-low is 16 kHz, Kitten/Kokoro 24 kHz), so pitch and speed are wrong. | Done: `sample_rate` metadata, then the `<model>.onnx.json` sidecar (`audio.sample_rate`), then the name guess. Test: `test_texttoken_rate.cpp` (fixtures in `tests/data/tts`, generated by `make_fixtures.py`). |
+| T3 | S1 — **fixed** | TextToken.cpp:301 | `if(produces_audio || changed)` re-synthesises every tick once the previous job is done, so the ring keeps dropping the oldest samples and the output is chopped fragments. | Done: the model runs when the ids change or on Reset (Reset now also means 'speak again'), once per request: the ids are committed on dispatch, a request made during a job waits for it (latest wins), and a generation counter drops superseded results. Test: `test_texttoken_rate.cpp` (one dispatch over 50 ticks; three changes while busy give one follow-up with the latest ids; ct-transformer keeps the last change). |
+| T4 | S1 — **fixed** | TextToken.cpp:247 | With a dynamic output, the ring is sized from the fallback block 22050 (about 1.09 s), which truncates longer utterances. | Done: TTS no longer goes through the streaming ring. The worker resamples the whole utterance to the host rate, and the node swaps it into a one-shot player (`TtsUtterance`). Test: `test_texttoken_rate.cpp` (a 6.5 s Piper utterance plays past 4 s; the ring kept 1.4 s). |
+| T5 | S2 — **fixed** | token tensor | Always int64, so int32-token models (punctuation, moonshine) fail. | Done: token and int aux tensors are built in the declared type (int32, bool, other widths) on both paths. Test: `test_texttoken_rate.cpp` (int32/bool fixture, sync; ct-transformer, async). Async errors are still swallowed. |
+| T6 | S1 — **fixed** | aux inputs | A dynamic aux input (BERT `attention_mask[?,?]`) resolves to `[1,1]` and is filled with `round(Param1)`, which breaks every model with more than one token. | Done: int inputs named mask / valid / attention get ones, token_type / segment zeros, both at the token tensor's shape; `lens` counts as a length. Test: `test_texttoken_rate.cpp` (BERT NIDS and online-punct-en match Python ORT). |
+| T7 | S2 — **fixed** | `isAutoregressive` | The refusal list misses tacotron2 `decoder_iter` (attention_hidden/cell), pocket-tts `lm_main` (`state_*`) and moonshine `cached_decode` (`args_*`). | Done: a model is refused when it is stateful (a state carried output → input) or has a non-token input of rank ≥ 3, and the refusal is printed once; bool tensors are never taken as the token ids. Test: `test_texttoken_rate.cpp` (Tacotron2 decoder_iter refused; Piper, Kitten, BERT, punctuation, ct-transformer still run). |
+| T8 | S3 — **fixed** | `WaveformOutput::push` | `rs_scratch` can grow past its reserve, which allocates on the realtime path. `TextTokenTask` is unused. | Done with T4: nothing is resampled on the processing thread any more; `TextTokenTask` removed. |
+| T9 | S2 — **fixed** | design | Style-vector TTS (Kitten, Kokoro `voices.bin`) gets a constant Param 1 as its `style[1,256]`. Only style = 0 is barely intelligible. | Done: a float input named style / speaker_emb / spk_emb / ref_s takes a row of a voices file: a new Voices port (appended), else a voices.bin next to the model; Param 4 picks the voice; `style_dim` metadata gives the rows per voice (Kokoro's row follows the token count). Without voices the model is not run. The preset pack now carries Kitten's voices.bin. Test: `test_texttoken_rate.cpp` (Kitten rms 0.094, peak 0.66; not run without voices). |
+
+## Image Generator (`OnnxModels/ImageGenerator.*`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| IG1 | S2 — **fixed** | `runStage` | Only input 0 is fed, so generators with more than one input (EigenGAN: 7) fail at Run, and `reloadModel` doesn't warn. | Done: each stage feeds its other inputs through the aux plan with seeded noise (seed + index, times Scale) for extra latents. Test: `test_aux_inputs.cpp` (EigenGAN gives a 256×256 image that changes with the seed; StyleGAN2 unchanged). |
+| IG2 | S2 — **fixed** | `chainCompatible` | There is no w→w+ broadcast, so a StyleGAN mapping net `[1,512]` can't chain into a w+ synthesis net `[1,18,512]` (e4e decoder). | Done: a mapping net's w [1,D] chains into a w+ synthesis [1,K,D] (tiled K times); the e4e preset now references the MobileStyleGAN mapping net (Scale 1.0). Test: `test_aux_inputs.cpp` (chain rules; e4e + mapping produces an image). |
+| IG3 | S3 — **fixed** | Output Mode Auto | Auto gives MinMaxNormalize. Denormalize is correct for the common [-1,1] generators. | Done: Auto picks the mapping from the first output's range ([-2,2] with negatives → Denormalize, [0,1] → DirectClamp, 0..255 → Passthrough, else MinMax) and keeps it for the model. Test: `test_aux_inputs.cpp` (StyleGAN2 Auto equals Denormalize). |
+
+## Language Model (`OnnxModels/QwenLLM.*`, `Onnx/helpers/QwenLLM.*`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| L1 | S2 — **fixed** | QwenLLM.cpp input binding (`inputNamePtrs`, `outs[1+2l]`) | Inputs and outputs are bound by position. Exports with extra inputs (`num_logits_to_keep`, LFM2 `past_conv.*`) or a different order are silently mis-bound. | Done: every decoder input is bound by name in session order (input_ids, attention_mask, position_ids, num_logits_to_keep, past_key_values.N.* and LFM2's past_conv.N as generic state slots with their own dtype), outputs are requested by name, and unknown inputs are refused by name. `qwenllm_smoke`: SmolLM2, Qwen2.5-genai-fp16, gemma-3 unchanged; LFM2 now answers; SmolLM2 copies with swapped inputs or outputs answer 'Paris' (they errored / gave garbage). |
+| L2 | S3 | output | Qwen3 and DeepSeek-R1 `<think>` blocks count against Max tokens and are emitted as-is. | Optional think-block filter. |
+
+## Vision Language Model (`OnnxModels/FastVLM.*`, `Onnx/helpers/FastVLM.*`)
+
+| ID | Sev | Where | Problem | Suggested fix |
+|---|---|---|---|---|
+| F1 | S2 | FastVLM.cpp:32-35 | BOS 151643, EOS 151645, `<image>` 151646 and the ChatML template are hard-coded, which ties the node to Qwen2-based FastVLM. | Read the ids and template from `tokenizer_config.json` / `config.json`, as QwenLLM does. |
+| F2 | S4 — **fixed** | q4f16 load | The first session init logs "Tensor type mismatch float vs MLFloat16"; the automatic BASIC-opt retry then succeeds. This is noisy. | Done: the first attempt runs with ORT logging at FATAL; the retry keeps the caller's options (it used `Options{}`) at BASIC and prints one line. `fastvlm_smoke q4f16 fp32`: no `[E:onnxruntime` line, same answers; a broken model is still reported. |
+
+---
+
+## Appendix: deprecated objects (for reference, not scheduled)
+
+- **YOLO Pose:** stale session (X2), dead resolution knob, `hasSimilarRect` instead of NMS, confidence hard-coded at 0.75.
+- **YOLO Blob:**
+  - `Yolo.hpp:161` reads `arr[i+0]` (the batch index) as confidence, and `:155` loops over the wrong bound, so YOLOv7 end2end never outputs anything.
+  - A trailing newline in the class file makes a v8 model fall into the v7 path.
+- **YOLO Segmentation:** a trailing newline in the class file shifts the mask coefficients. No check on the 32 coefficients / prototype channels. 640 is hard-coded.
+- **Blaze Pose:** Min Confidence has no effect (check commented out in `Images.hpp:301`). No NCHW check. Dead resolution knob.
+- **TRT Pose:**
+  - The PAF link topology in `Trt.hpp:62-91` is wrong for NVIDIA trt_pose. It should be link k = channels (2k+1, 2k) with the official skeleton. On a test image this took keypoints from 8 to 15; a patched header is in the scratchpad.
+  - The threshold sliders' maximums are too low (0.05 / 0.01, vs trt_pose's 0.1 / 0.1).
+- **Depth Anything v2:**
+  - `c_name "emotionnet"` (hpp:22).
+  - The ×16 output scale is fixed and saturates ViT-B.
+  - Knob/shape mismatch.
+- **Image-to-Image GAN:**
+  - The FastSRGAN config can't express [0,1] in → [-1,1] out.
+  - NHWC ignores mean/std, so the Model Type does nothing for NHWC.
+  - Dynamic-size models always run at 256².
+- **Generative Image GAN:**
+  - EigenGAN is broken (only `{latent}` is passed; `generateRandom()` is never called).
+  - psi is hard-coded to 0.7.
+  - Scale only affects the first 16 dims.
+  - Only PyTorchGAN fixes a -1 batch dimension.
+  - MobileStyleGAN mnet+snet can't be chained.
