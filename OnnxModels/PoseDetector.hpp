@@ -285,8 +285,10 @@ public:
     {
       halp_meta(
           description,
-          "Box Detection: keep only this class id (-1 = all). Multi-class "
-          "detectors only (COCO ids); ignored by single-class detectors.");
+          "Keep only this class id of a multi-class detector; ignored by "
+          "single-class detectors. Box Detection: -1 = all classes. Two-stage: "
+          "the class to crop for the landmark model; -1 = by its domain "
+          "(body 0, then hand 2 / face 3 on body-head-hand(-face) detectors).");
     } detection_class;
 
     struct : halp::toggle<"Draw Landmarks">
@@ -647,6 +649,14 @@ private:
     return m_had_detection ? 0.66f * enter : enter;
   }
 
+  // The class the two-stage detector keeps: the Detection Class port when set,
+  // else -2, the landmark model's domain default.
+  int detectorClass() const noexcept
+  {
+    const int c = static_cast<int>(inputs.detection_class.value);
+    return c >= 0 ? c : -2;
+  }
+
   // Temporal One-Euro smoothing of the detected keypoints (in place).
   void applySmoothing(DetectedPose& pose);
 
@@ -705,6 +715,8 @@ private:
 
   std::string m_last_model;
   std::string m_last_det_model;
+  // YoloxDetector input range, probed per detection model (see runDetector).
+  enum class YoloxRange : uint8_t { Unknown, Unit, Raw } m_yolox_range{};
   std::string m_last_reid_model;
   std::string m_last_cfg_log; // de-dup for the debug config trace
 
