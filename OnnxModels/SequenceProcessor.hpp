@@ -43,6 +43,7 @@ struct SeqInferJob
   int primary_in_index = 0;        // which model input is the data port
   int primary_out_index = 0;       // which model output is the data result
   int data_out_index = -1;         // secondary "Data" output (-1 == same as primary)
+  int64_t batch = 1;               // > 1: the input is replicated, slice 0 read
 
   // Recurrent state threaded internally: for each (input_index -> output_index)
   // pair, the current state values + shape. work() feeds `values` in and reads
@@ -144,6 +145,13 @@ private:
   Onnx::WindowMode resolvedWindow = Onnx::WindowMode::Passthrough;
   SeqWindowMode lastWindowMode{};
   std::vector<Onnx::AuxPlan> aux; // inputs other than the primary and states
+  // Exports that bake a batch size into the graph (Informer: 2, while the
+  // input declares it dynamic) are fed that many copies of the input.
+  int64_t batch = 1;
+  std::string lastError; // printed once, not on every failing tick
+
+  void reportError(std::string_view what);
+  bool probe();
 
   // Hot-path scratch (reused).
   Onnx::FrameWindow window;

@@ -8,6 +8,7 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace OnnxModels
@@ -255,6 +256,24 @@ void SequenceProcessor::reloadModel()
 
   resolveWindow();
   resetState();
+
+  // A concrete declared batch is honoured; a dynamic one is 1 unless the
+  // probe finds that the graph only runs at another.
+  const auto& pin = spec.inputs[primaryIn].shape;
+  batch = (pin.size() >= 2 && pin[0] > 1 && !stateful) ? pin[0] : 1;
+  lastError.clear();
+  if(!probe())
+    inputs.model.current_model_invalid = true;
+}
+
+void SequenceProcessor::reportError(std::string_view what)
+{
+  if(what == lastError)
+    return;
+  lastError = what;
+  std::fprintf(
+      stderr, "Sequence Processor: %s: %s\n", lastModelPath.c_str(),
+      lastError.c_str());
 }
 
 // The model needs a fixed T when the primary input rank>=3 with a concrete time
@@ -296,7 +315,22 @@ try
     return;
 
   if(!ctx || lastModelPath != inputs.model.file.filename)
-    reloadModel();
+  {
+    try
+    {
+      reloadModel();
+    }
+    catch(const std::exception& e)
+    {
+      lastModelPath = inputs.model.file.filename;
+      reportError(e.what());
+      ctx.reset();
+      inputs.model.current_model_invalid = true;
+      return;
+    }
+    if(inputs.model.current_model_invalid)
+      return; // the probe failed
+  }
   if(spec.inputs.empty() || spec.outputs.empty())
     return;
   if(inputs.window_mode.value != lastWindowMode)
@@ -321,15 +355,28 @@ try
     return; // window not yet filled, or nothing to feed
 
   std::vector<float> input(b.data, b.data + b.count);
+  if(batch > 1 && !b.shape.empty())
+  {
+    input.reserve(input.size() * batch);
+    for(int64_t k = 1; k < batch; ++k)
+      input.insert(input.end(), b.data, b.data + b.count);
+    b.shape[0] = batch;
+  }
 
   // Heavy if the model is large or the flattened input is big.
   const bool heavy = inputs.model.file.bytes.size() > 64u * 1024 * 1024
                      || b.count > 1 << 20;
   dispatchInfer(std::move(input), std::move(b.shape), heavy);
 }
+catch(const std::exception& e)
+{
+  // A frame that fails to run (a payload the model cannot take) is skipped;
+  // the next one may work. Models that cannot run at all fail the probe.
+  reportError(e.what());
+}
 catch(...)
 {
-  inputs.model.current_model_invalid = true;
+  reportError("unknown error");
 }
 
 namespace
@@ -342,7 +389,7 @@ SeqResult runInference(
     std::vector<float>& input, const std::vector<int64_t>& ishape,
     TensorElemType in_dt, int primary_in, int primary_out, int data_out,
     std::vector<SeqInferJob::State>& states, const std::vector<Onnx::AuxPlan>& aux,
-    std::span<const float> params)
+    std::span<const float> params, int64_t batch)
 {
   const int nin = (int)spec.input_names_char.size();
   const int nout = (int)spec.output_names_char.size();
@@ -377,7 +424,7 @@ SeqResult runInference(
   // the rest zeros. Each keeps its own storage while the tensors are alive.
   std::vector<std::vector<uint8_t>> aux_store(aux.size());
   std::vector<std::vector<int64_t>> aux_shape(aux.size());
-  Onnx::AuxHost host{.params = params, .primary_shape = ishape};
+  Onnx::AuxHost host{.params = params, .primary_shape = ishape, .batch = batch};
   for(std::size_t k = 0; k < aux.size(); ++k)
     if(aux[k].index >= 0 && aux[k].index < nin && !ins[aux[k].index])
       ins[aux[k].index] = Onnx::fillAux(aux[k], host, aux_store[k], aux_shape[k]);
@@ -418,7 +465,12 @@ SeqResult runInference(
         = Onnx::fromOrtElementType(info.GetElementType());
     const void* raw = outs[idx].GetTensorData<uint8_t>();
     const float* f = toFloatView(raw, cnt, odt, scratch);
-    dst.assign(f, f + std::max<int64_t>(cnt, 0));
+    // A replicated batch: every slice is the same, keep the first.
+    const auto oshape = info.GetShape();
+    const int64_t n = (batch > 1 && oshape.size() >= 2 && oshape[0] == batch)
+                          ? cnt / batch
+                          : cnt;
+    dst.assign(f, f + std::max<int64_t>(n, 0));
   };
 
   const int po = std::clamp(primary_out, 0, nout - 1);
@@ -486,6 +538,7 @@ void SequenceProcessor::dispatchInfer(
     job->params[0] = inputs.param1.value;
     job->params[1] = inputs.param2.value;
     job->data_out_index = dataOut;
+    job->batch = batch;
     // The job is recycled: resize + indexed assignment (not push_back) so
     // stale states from a previous use never accumulate.
     job->states.resize(states.size());
@@ -509,8 +562,68 @@ void SequenceProcessor::dispatchInfer(
   const float params[2]{inputs.param1.value, inputs.param2.value};
   SeqResult r = runInference(
       *ctx, spec, input, ishape, in_dt, primaryIn, primaryOut, dataOut, st, aux,
-      params);
+      params, batch);
   applyResult(*this, r);
+}
+
+// One zero inference at load, when the model's input shape does not depend
+// on the payload (every dim but the batch is concrete): a model that cannot
+// run is reported with its error instead of failing on every tick. When it
+// fails at batch 1 on a dynamic batch, the graph may have one baked in
+// (Informer: 2), which is tried next.
+bool SequenceProcessor::probe()
+{
+  const auto& pin = spec.inputs[primaryIn].shape;
+  if(pin.empty())
+    return true;
+  for(std::size_t k = 1; k < pin.size(); ++k)
+    if(pin[k] <= 0)
+      return true;
+  if(inputs.model.file.bytes.size() > 64u * 1024 * 1024)
+    return true; // the probe would stall the render thread
+
+  auto run = [&](int64_t b)
+  {
+    auto shape = pin;
+    shape[0] = b;
+    std::vector<float> input((size_t)flatPos(shape), 0.f);
+    std::vector<SeqInferJob::State> st;
+    for(auto& sb : states)
+      st.push_back({sb.in_index, sb.out_index, sb.shape, sb.dt, sb.values});
+    const float params[2]{};
+    runInference(
+        *ctx, spec, input, shape, spec.inputs[primaryIn].elem_type, primaryIn,
+        primaryOut, dataOut, st, aux, params, b);
+  };
+
+  try
+  {
+    run(batch);
+    return true;
+  }
+  catch(const std::exception& e)
+  {
+    const std::string first = e.what();
+    if(pin.size() >= 2 && pin[0] <= 0 && batch == 1 && states.empty())
+    {
+      try
+      {
+        run(2);
+        batch = 2;
+        std::fprintf(
+            stderr,
+            "Sequence Processor: %s: the graph needs a batch of 2, the input "
+            "is fed twice\n",
+            lastModelPath.c_str());
+        return true;
+      }
+      catch(...)
+      {
+      }
+    }
+    reportError("the model does not run: " + first);
+    return false;
+  }
 }
 
 std::function<void(SequenceProcessor&)>
@@ -537,16 +650,28 @@ SequenceProcessor::worker::work(std::unique_ptr<SeqInferJob> job)
     SeqResult r = runInference(
         *job->ctx, spec, job->input, job->ishape, job->in_dt,
         job->primary_in_index, job->primary_out_index, job->data_out_index,
-        job->states, job->aux, job->params);
+        job->states, job->aux, job->params, job->batch);
     return [r = std::move(r)](SequenceProcessor& self) mutable
     {
       self.inferenceInProgress = false;
       applyResult(self, r);
     };
   }
+  catch(const std::exception& e)
+  {
+    return [what = std::string(e.what())](SequenceProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.reportError(what);
+    };
+  }
   catch(...)
   {
-    return [](SequenceProcessor& self) { self.inferenceInProgress = false; };
+    return [](SequenceProcessor& self)
+    {
+      self.inferenceInProgress = false;
+      self.reportError("unknown error");
+    };
   }
 }
 
