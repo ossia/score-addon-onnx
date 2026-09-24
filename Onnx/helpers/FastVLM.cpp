@@ -10,6 +10,7 @@
 #include <fmt/ostream.h>
 
 #include <Onnx/helpers/HfConfig.hpp>
+#include <Onnx/helpers/ImageOps.hpp>
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
@@ -172,6 +173,66 @@ FastVLMInference::FastVLMInference(
         imageToken = std::move(*t);
       if (auto ids = HfConfig::stopTokens(tokDir); !ids.empty())
         stopTokenIds = std::move(ids);
+      spaceMarker
+          = HfConfig::decoderReplacesSpaceMarker(tokDir / "tokenizer.json");
+
+      // The family's image preprocessing and placeholder expansion.
+      const auto config = HfConfig::read(tokDir / "config.json");
+      const auto pre = HfConfig::read(tokDir / "preprocessor_config.json");
+      const auto proc = HfConfig::read(tokDir / "processor_config.json");
+      const auto tokcfg = HfConfig::read(tokDir / "tokenizer_config.json");
+      const auto type = HfConfig::text(config, "model_type").value_or("");
+      family = type == "idefics3" ? Family::Idefics3
+               : type == "gemma3" ? Family::Gemma3
+                                  : Family::Llava;
+      auto triple = [&](const char* key, float* out) {
+        if (pre.is_object() && pre.contains(key) && pre[key].is_array()
+            && pre[key].size() == 3)
+          for (int c = 0; c < 3; ++c)
+            if (pre[key][c].is_number())
+              out[c] = pre[key][c].get<float>();
+      };
+      auto repeat = [](const std::string& t, int n) {
+        std::string r;
+        r.reserve(t.size() * n);
+        for (int i = 0; i < n; ++i)
+          r += t;
+        return r;
+      };
+      placeholder = imageToken;
+      placeholderExpansion.clear();
+      if (family == Family::Idefics3)
+      {
+        triple("image_mean", imageMean);
+        triple("image_std", imageStd);
+        imageSize = 512;
+        if (pre.is_object() && pre.contains("max_image_size"))
+          if (auto v = HfConfig::number(pre["max_image_size"], "longest_edge"))
+            imageSize = (int)*v;
+        const int seq
+            = (int)HfConfig::number(proc, "image_seq_len").value_or(64.);
+        placeholderExpansion = "<fake_token_around_image><global-img>"
+                               + repeat(imageToken, seq)
+                               + "<fake_token_around_image>";
+      }
+      else if (family == Family::Gemma3)
+      {
+        triple("image_mean", imageMean);
+        triple("image_std", imageStd);
+        imageSize = 896;
+        if (pre.is_object() && pre.contains("size"))
+          if (auto v = HfConfig::number(pre["size"], "height"))
+            imageSize = (int)*v;
+        const int seq
+            = (int)HfConfig::number(config, "mm_tokens_per_image").value_or(256.);
+        const auto boi
+            = HfConfig::text(tokcfg, "boi_token").value_or("<start_of_image>");
+        const auto eoi
+            = HfConfig::text(tokcfg, "eoi_token").value_or("<end_of_image>");
+        placeholder = boi;
+        placeholderExpansion
+            = "\n\n" + boi + repeat(imageToken, seq) + eoi + "\n\n";
+      }
     }
 
     // Cache decoder I/O names for hot path optimization
@@ -332,12 +393,9 @@ std::string FastVLMInference::generateResponse(
 {
   try
   {
-    // Process image through vision encoder using existing Images.hpp functions
-    auto processedImageTensor = preprocessImageForFastVLM(image, tensorValues);
-
-    auto imageFeatures = runVisionEncoder(
-        processedImageTensor.storage, image.width, image.height);
-    std::swap(processedImageTensor.storage, tensorValues);
+    int w = image.width, h = image.height;
+    auto pixels = preprocess(image, w, h);
+    auto imageFeatures = runVisionEncoder(pixels, w, h);
     if (imageFeatures.empty())
       throw std::runtime_error("No image feature");
     if (!std::isfinite(imageFeatures[0]))
@@ -370,6 +428,37 @@ std::string FastVLMInference::generateResponse(
 }
 
 std::vector<float>
+FastVLMInference::preprocess(const Onnx::ImageData& image, int& w, int& h) const
+{
+  if (family == Family::Llava)
+  {
+    // FastVLM: the image's own size, 0..1 (unchanged from the original
+    // pipeline; the HF processor would resize to 1024²).
+    boost::container::vector<float> values;
+    auto t = preprocessImageForFastVLM(image, values);
+    w = image.width;
+    h = image.height;
+    return {t.storage.begin(), t.storage.end()};
+  }
+
+  // Idefics3 / gemma3: the whole image stretched to the model's square size,
+  // (x / 255 - mean) / std, planar RGB.
+  const int side = imageSize > 0 ? imageSize : 512;
+  std::vector<uint8_t> rgba((std::size_t)side * side * 4);
+  Onnx::resize(
+      {.data = image.pixels.data(), .w = image.width, .h = image.height},
+      {.data = rgba.data(), .w = side, .h = side});
+  std::vector<float> out((std::size_t)3 * side * side);
+  const std::size_t plane = (std::size_t)side * side;
+  for (std::size_t i = 0; i < plane; ++i)
+    for (int c = 0; c < 3; ++c)
+      out[c * plane + i]
+          = (rgba[i * 4 + c] / 255.f - imageMean[c]) / imageStd[c];
+  w = h = side;
+  return out;
+}
+
+std::vector<float>
 FastVLMInference::runVisionEncoder(std::span<float> imageData, int w, int h)
 {
   try
@@ -377,40 +466,63 @@ FastVLMInference::runVisionEncoder(std::span<float> imageData, int w, int h)
     auto memoryInfo
         = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-    std::vector<int64_t> inputShape = {1, 3, h, w};
-
-    Ort::Value inputTensor{nullptr};
-    if (visionInputType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+    // Bound by name: pixel_values ([1,3,H,W], or [1,1,3,H,W] for one image
+    // of idefics3) and idefics3's pixel_attention_mask (all pixels valid).
+    const std::size_t nIn = visionEncoderSession->GetInputCount();
+    std::vector<Ort::AllocatedStringPtr> names;
+    std::vector<const char*> namePtrs;
+    std::vector<Ort::Value> inputs;
+    std::vector<std::vector<int64_t>> shapes(nIn);
+    std::unique_ptr<bool[]> mask;
+    for (std::size_t i = 0; i < nIn; ++i)
     {
-      reusableF16Scratch.resize(imageData.size());
-      for (std::size_t i = 0; i < imageData.size(); ++i)
-        reusableF16Scratch[i] = Ort::Float16_t(imageData[i]);
-      inputTensor = Ort::Value::CreateTensor<Ort::Float16_t>(
-          memoryInfo,
-          reusableF16Scratch.data(),
-          reusableF16Scratch.size(),
-          inputShape.data(),
-          inputShape.size());
-    }
-    else
-    {
-      inputTensor = Ort::Value::CreateTensor<float>(
-          memoryInfo,
-          const_cast<float*>(imageData.data()),
-          imageData.size(),
-          inputShape.data(),
-          inputShape.size());
+      names.push_back(visionEncoderSession->GetInputNameAllocated(i, allocator));
+      namePtrs.push_back(names.back().get());
+      const std::string name = names.back().get();
+      const auto typeInfo = visionEncoderSession->GetInputTypeInfo(i);
+      const auto info = typeInfo.GetTensorTypeAndShapeInfo();
+      const std::size_t rank = info.GetShape().size();
+      auto& shape = shapes[i];
+      if (name == "pixel_attention_mask")
+      {
+        shape = rank == 4 ? std::vector<int64_t>{1, 1, h, w}
+                          : std::vector<int64_t>{1, h, w};
+        mask.reset(new bool[(std::size_t)w * h]);
+        std::fill_n(mask.get(), (std::size_t)w * h, true);
+        inputs.push_back(Ort::Value::CreateTensor<bool>(
+            memoryInfo, mask.get(), (std::size_t)w * h, shape.data(),
+            shape.size()));
+        continue;
+      }
+      if (i > 0 && name != "pixel_values")
+        throw std::runtime_error(
+            fmt::format("unsupported vision encoder input '{}'", name));
+      shape = rank == 5 ? std::vector<int64_t>{1, 1, 3, h, w}
+                        : std::vector<int64_t>{1, 3, h, w};
+      if (visionInputType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+      {
+        reusableF16Scratch.resize(imageData.size());
+        for (std::size_t k = 0; k < imageData.size(); ++k)
+          reusableF16Scratch[k] = Ort::Float16_t(imageData[k]);
+        inputs.push_back(Ort::Value::CreateTensor<Ort::Float16_t>(
+            memoryInfo, reusableF16Scratch.data(), reusableF16Scratch.size(),
+            shape.data(), shape.size()));
+      }
+      else
+      {
+        inputs.push_back(Ort::Value::CreateTensor<float>(
+            memoryInfo, imageData.data(), imageData.size(), shape.data(),
+            shape.size()));
+      }
     }
 
-    auto inputName = visionEncoderSession->GetInputNameAllocated(0, allocator);
     auto outputName
         = visionEncoderSession->GetOutputNameAllocated(0, allocator);
-
-    const char* inputNames[] = {inputName.get()};
     const char* outputNames[] = {outputName.get()};
 
     auto outputs = visionEncoderSession->Run(
-        Ort::RunOptions{nullptr}, inputNames, &inputTensor, 1, outputNames, 1);
+        Ort::RunOptions{nullptr}, namePtrs.data(), inputs.data(),
+        inputs.size(), outputNames, 1);
 
     return tensorToFloats(outputs[0]);
   }
@@ -489,6 +601,8 @@ std::string FastVLMInference::decodeTokens(std::span<int64_t> tokens) const
 
     std::string resultStr(decodedString);
     OrtxDispose((OrtxObject**)&stringArray);
+    if (spaceMarker)
+      HfConfig::replaceSpaceMarkers(resultStr);
     return resultStr;
   }
   catch (const std::exception& e)
@@ -558,10 +672,24 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
 std::string
 FastVLMInference::createPromptTemplate(std::string_view userPrompt) const
 {
+  // LLaVA's template concatenates a string content; the others iterate over
+  // typed items and emit their own image placeholder.
   const std::string content = imageToken + "\n" + std::string(userPrompt);
-  const std::string messages
-      = nlohmann::json::array({{{"role", "user"}, {"content", content}}})
-            .dump();
+  nlohmann::json message{{"role", "user"}};
+  if (family == Family::Llava)
+    message["content"] = content;
+  else
+    message["content"] = nlohmann::json::array(
+        {{{"type", "image"}},
+         {{"type", "text"}, {"text", std::string(userPrompt)}}});
+  const std::string messages = nlohmann::json::array({message}).dump();
+  auto expand = [this](std::string text) {
+    if (placeholderExpansion.empty())
+      return text;
+    if (const auto pos = text.find(placeholder); pos != std::string::npos)
+      text.replace(pos, placeholder.size(), placeholderExpansion);
+    return text;
+  };
 
   OrtxTensorResult* result{};
   if (OrtxApplyChatTemplate(
@@ -582,7 +710,7 @@ FastVLMInference::createPromptTemplate(std::string_view userPrompt) const
     }
     OrtxDispose((OrtxObject**)&result);
     if (!text.empty())
-      return text;
+      return expand(std::move(text));
   }
 
   return fmt::format(
@@ -607,6 +735,22 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
     // Embed the text in contiguous segments (one embed_tokens run per
     // segment instead of one per token), splicing the image features in
     // place of each image token.
+    // One image token takes all the features (FastVLM); several take one
+    // row each (SmolVLM, gemma3).
+    const auto nImageTokens
+        = std::count(tokenIds.begin(), tokenIds.end(), imageTokenId);
+    std::size_t rowSize = imageFeatures.size();
+    if (nImageTokens > 1)
+    {
+      if (imageFeatures.size() != (std::size_t)nImageTokens * hiddenSize)
+        throw std::runtime_error(fmt::format(
+            "{} image tokens in the prompt but {} feature values ({} per "
+            "token expected)",
+            nImageTokens, imageFeatures.size(), hiddenSize));
+      rowSize = (std::size_t)hiddenSize;
+    }
+    std::size_t nextRow = 0;
+
     std::vector<int64_t> segment;
     segment.reserve(tokenIds.size());
     auto flushSegment = [&]
@@ -626,8 +770,9 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
         flushSegment();
         multimodalEmbeddings.insert(
             multimodalEmbeddings.end(),
-            imageFeatures.begin(),
-            imageFeatures.end());
+            imageFeatures.begin() + nextRow,
+            imageFeatures.begin() + std::min(nextRow + rowSize, imageFeatures.size()));
+        nextRow += rowSize;
       }
       else
       {

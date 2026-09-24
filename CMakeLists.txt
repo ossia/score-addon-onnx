@@ -746,8 +746,10 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
   if(SCORE_ONNX_ENABLE_EXTENSIONS)
     target_sources(score_addon_onnx_node_tests PRIVATE
       tests/test_llm_thinking.cpp
+      tests/test_vlm.cpp
       OnnxModels/QwenLLM.cpp
-      Onnx/helpers/QwenLLM.cpp)
+      Onnx/helpers/QwenLLM.cpp
+      Onnx/helpers/FastVLM.cpp)
     target_link_libraries(score_addon_onnx_node_tests PRIVATE
       ocos_operators
       onnxruntime_extensions)

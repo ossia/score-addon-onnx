@@ -15,8 +15,11 @@
 
 namespace Onnx
 {
-// Runs the three-model FastVLM pipeline (vision encoder, token embeddings,
-// merged decoder) exported by onnx-community/FastVLM-*-ONNX. The pipeline
+// Runs the three-model VLM pipeline (vision encoder, token embeddings,
+// merged decoder) of the onnx-community exports: FastVLM (LLaVA-Qwen2),
+// SmolVLM (idefics3) and gemma3. The family (config.json model_type) decides
+// the image preprocessing and how the prompt's image placeholder expands;
+// see Family. The pipeline
 // adapts to the export variant at load time: layer count, KV heads, head
 // dimension and hidden size are read from the model graphs, and the KV cache
 // dtype (fp16 for the _fp16 / _q4f16 exports, fp32 for all others) as well as
@@ -40,6 +43,8 @@ public:
 
 private:
   std::vector<int64_t> tokenizeImagePrompt(const std::string& prompt) const;
+  // Image -> the vision encoder's input tensor values ([3,H,W] planar).
+  std::vector<float> preprocess(const Onnx::ImageData& image, int& w, int& h) const;
   std::vector<float>
   runVisionEncoder(std::span<float> imageData, int w, int h);
   std::vector<float> runEmbedTokens(std::span<int64_t> tokenIds);
@@ -77,6 +82,40 @@ private:
   std::string imageToken{"<image>"};
   int64_t imageTokenId{151646}; // a sentinel past the vocabulary
   std::vector<int64_t> stopTokenIds{151645};
+  bool spaceMarker = false; // U+2581 left by the detokenizer (HfConfig)
+
+  // How the image reaches the model:
+  // - Llava (FastVLM): the native image size, 0..1; one image token that
+  //   stands for all the features.
+  // - Idefics3 (SmolVLM): one global 512² image, ±1, as pixel_values
+  //   [1,1,3,512,512] with a pixel_attention_mask; the template's <image>
+  //   expands to <fake_token_around_image><global-img>, image_seq_len image
+  //   tokens, <fake_token_around_image>. The processor's tiling of large
+  //   images (up to 16 more 512² tiles, 64 tokens each) is not done.
+  // - Gemma3: 896², ±1; the template's <start_of_image> expands to
+  //   \n\n<start_of_image>, mm_tokens_per_image <image_soft_token>s,
+  //   <end_of_image>\n\n.
+  // With several image tokens, each takes one row of the features.
+  enum class Family : uint8_t
+  {
+    Llava,
+    Idefics3,
+    Gemma3
+  } family{Family::Llava};
+  int imageSize = 0; // square input side; 0 = the image's own size
+  float imageMean[3]{0.f, 0.f, 0.f};
+  float imageStd[3]{1.f, 1.f, 1.f};
+  std::string placeholder;          // what the chat template emits
+  std::string placeholderExpansion; // what it becomes; empty = kept
+
+public:
+  // Which family the model files describe.
+  const char* familyName() const noexcept
+  {
+    return family == Family::Idefics3 ? "idefics3"
+           : family == Family::Gemma3 ? "gemma3"
+                                      : "llava";
+  }
 
 public:
   const std::string& imagePlaceholder() const noexcept { return imageToken; }
