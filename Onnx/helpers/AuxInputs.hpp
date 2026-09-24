@@ -66,6 +66,7 @@ struct AuxHost
   float noise_scale = 1.f;
   std::span<const int64_t> primary_shape; // for masks and lengths
   int64_t primary_length = 0;             // for LinkedLength; 0 = primary's last dim
+  int64_t batch = 1; // a dynamic leading dim of a rank >= 2 input
 };
 
 namespace aux_detail
@@ -225,7 +226,8 @@ inline void auxShape(const AuxPlan& p, const AuxHost& h, std::vector<int64_t>& s
   for(std::size_t k = 0; k < s.size(); ++k)
     if(s[k] <= 0)
       s[k] = link && h.primary_shape[k] > 0 ? h.primary_shape[k] : 1;
-  return s;
+  if(h.batch > 1 && s.size() >= 2 && p.shape[0] <= 0)
+    s[0] = h.batch;
 }
 
 // Write the plan's values into `storage` (typed as declared) and return a tensor
