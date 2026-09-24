@@ -37,3 +37,15 @@ save("broken",
      [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
      [helper.make_tensor_value_info("y", TensorProto.FLOAT, [3, "N"])],
      [const("target", np.array([3, -1], np.int64))])
+
+# A recurrent counter: y = x + state, state_out = state + 1. The payload's
+# length is free, so a large one takes the worker path.
+save("counter",
+     [helper.make_node("Add", ["x", "state"], ["y"]),
+      helper.make_node("Add", ["state", "one"], ["state_out"])],
+     [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, "N"]),
+      helper.make_tensor_value_info("state", TensorProto.FLOAT, [1, 1])],
+     [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, "N"]),
+      helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [1, 1])],
+     [const("one", np.array([[1.0]], np.float32))])
+
