@@ -2,6 +2,7 @@
 // the way every node does (BUG-LEDGER X1). The fixture is y = x + W with the
 // 8-float initializer W = 1..8 stored in tests/data/external-data/tiny.onnx_data.
 #include <Onnx/helpers/OnnxContext.hpp>
+#include <OnnxModels/Utils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -52,6 +53,9 @@ TEST_CASE("External data: loading from bytes with the model path", "[onnx][exter
   const auto model = std::filesystem::path(SCORE_ONNX_TEST_DATA_DIR) / "external-data" / "tiny.onnx";
   REQUIRE(std::filesystem::exists(model));
   const auto bytes = slurp(model);
+  // The API pointer is set up by the first node, or here (ORT_API_MANUAL_INIT):
+  // without it this test crashed when run on its own.
+  REQUIRE(OnnxModels::initOnnxRuntime());
 
   ScopedCwd cwd{std::filesystem::temp_directory_path()};
 
@@ -64,6 +68,9 @@ TEST_CASE("External data: without the model path the weights are not found", "[o
   const auto model = std::filesystem::path(SCORE_ONNX_TEST_DATA_DIR) / "external-data" / "tiny.onnx";
   REQUIRE(std::filesystem::exists(model));
   const auto bytes = slurp(model);
+  // The API pointer is set up by the first node, or here (ORT_API_MANUAL_INIT):
+  // without it this test crashed when run on its own.
+  REQUIRE(OnnxModels::initOnnxRuntime());
 
   ScopedCwd cwd{std::filesystem::temp_directory_path()};
 
