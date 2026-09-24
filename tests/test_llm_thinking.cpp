@@ -5,6 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -118,4 +119,33 @@ TEST_CASE("Language Model: gemma's text has plain spaces", "[onnx][llm]")
   CHECK(!reply.empty());
   CHECK(reply.find("\u2581") == std::string::npos);
   CHECK(h.partials == reply);
+}
+
+// The rendered chat template already starts with the model's BOS; the
+// tokenizer added another (HF tokenizes the template with
+// add_special_tokens=False).
+TEST_CASE("Language Model: one BOS at the start of the prompt", "[onnx][llm]")
+{
+  REQUIRE(OnnxModels::initOnnxRuntime());
+  struct Case
+  {
+    const char* dir;
+    int64_t bos;
+  };
+  int ran = 0;
+  for(auto c : {Case{"gemma-3-1b-it", 2}, Case{"Llama-3.2-1B-Instruct", 128000}})
+  {
+    const auto dir = llmDir(c.dir);
+    if(!std::filesystem::exists(dir + "/onnx/model_q4.onnx"))
+      continue;
+    ran++;
+    Onnx::QwenLLMInference llm(dir + "/onnx/model_q4.onnx", dir + "/tokenizer.json");
+    const auto ids = llm.promptTokens("Hello");
+    INFO(c.dir);
+    REQUIRE(!ids.empty());
+    CHECK(ids.front() == c.bos);
+    CHECK(std::count(ids.begin(), ids.end(), c.bos) == 1);
+  }
+  if(!ran)
+    SKIP("no gemma / Llama model found");
 }

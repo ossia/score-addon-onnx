@@ -70,6 +70,16 @@ QwenLLMInference::QwenLLMInference(
     const char* msg = OrtxGetLastErrorMessage();
     throw std::runtime_error(std::string("Failed to create tokenizer: ") + msg);
   }
+  // The prompt is the rendered chat template, which already holds the
+  // model's special tokens (gemma's and Llama's <bos>): tokenizing it must
+  // not add them again, as HF's add_special_tokens=False after
+  // apply_chat_template. Without this gemma got "<bos><bos>" and Llama
+  // "<|begin_of_text|>" twice.
+  {
+    const char* keys[] = {"add_special_tokens"};
+    const char* values[] = {"false"};
+    OrtxUpdateTokenizerOptions(tokenizer, keys, values, 1);
+  }
 
   // The reply's stop tokens live next to the tokenizer, in
   // generation_config.json (preferred; may list several ids) or config.json.

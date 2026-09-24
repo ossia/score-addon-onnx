@@ -104,6 +104,19 @@ TEST_CASE("VLM: gemma3 describes the image in clean text", "[onnx][vlm]")
       family);
   if(family.empty())
     SKIP("gemma-3-4b-it not found");
+  {
+    // One <bos> (id 2), first: the tokenizer added one to the template's own
+    // and one after the image block, where each text segment was tokenized.
+    const auto dir = models() + "/gemma-3-4b-it";
+    Onnx::FastVLMInference vlm(
+        dir + "/onnx/vision_encoder_q4.onnx", dir + "/onnx/embed_tokens_q4.onnx",
+        dir + "/onnx/decoder_model_merged_q4.onnx", dir + "/tokenizer.json");
+    const auto ids = vlm.promptTokens("What is this?");
+    REQUIRE(!ids.empty());
+    CHECK(ids.front() == 2);
+    CHECK(std::count(ids.begin(), ids.end(), 2) == 1);
+    CHECK(std::count(ids.begin(), ids.end(), vlm.imagePlaceholderId()) == 256);
+  }
   INFO(answer);
   CHECK(family == "gemma3");
   // The photo: football players on a pitch.

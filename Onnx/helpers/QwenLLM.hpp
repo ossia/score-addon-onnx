@@ -52,6 +52,12 @@ public:
       int topK = 40,
       bool thinking = true);
 
+  // The token ids the model receives for a prompt (for tests).
+  std::vector<int64_t> promptTokens(const std::string& prompt, bool thinking = true) const
+  {
+    return tokenize(applyChatTemplate(prompt, thinking));
+  }
+
   // The tokenizer knows <think> and </think>: Qwen3, DeepSeek-R1, ...
   bool supportsThinking() const noexcept { return thinkingModel; }
 

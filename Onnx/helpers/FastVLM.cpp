@@ -162,6 +162,15 @@ FastVLMInference::FastVLMInference(
               "Failed to create Ortx tokenizer: {}",
               OrtxGetLastErrorMessage()));
     }
+    // The rendered template carries its own special tokens, and each text
+    // segment between image placeholders is tokenized on its own: adding
+    // BOS per call put gemma3's <bos> twice at the start and once more right
+    // after the image block (HF: add_special_tokens=False).
+    {
+      const char* keys[] = {"add_special_tokens"};
+      const char* values[] = {"false"};
+      OrtxUpdateTokenizerOptions(tokenizer, keys, values, 1);
+    }
 
     // The image placeholder, its id and the stop tokens are the model's own;
     // without the files, FastVLM's values stay.
