@@ -235,6 +235,22 @@ struct WaveformShape
   WaveLayout layout = WaveLayout::BNC1;
   int channels = 1; // model-side channel count
   int64_t block = 0; // N (samples per inference); <=0 means dynamic
+  int stems = 1;     // separated sources in one tensor ([B,S,C,N] outputs)
+
+  // An output: like an input, but a rank-4 [B,S,C,N] (Demucs) holds S stems
+  // of C channels. `fallback_channels` stands in for a symbolic channel count.
+  static WaveformShape
+  fromOutputShape(const std::vector<int64_t>& s, int fallback_channels) noexcept
+  {
+    if(s.size() != 4)
+      return fromInputShape(s);
+    WaveformShape w;
+    w.layout = WaveLayout::BNC1;
+    w.stems = s[1] > 0 ? (int)s[1] : 1;
+    w.channels = (s[2] == 1 || s[2] == 2) ? (int)s[2] : std::max(fallback_channels, 1);
+    w.block = s[3];
+    return w;
+  }
 
   // Derive from a model input port shape (positive dims; -1 == dynamic).
   static WaveformShape fromInputShape(const std::vector<int64_t>& s) noexcept
