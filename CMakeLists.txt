@@ -700,6 +700,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     tests/test_geometry_output.cpp
     tests/test_sequence_window.cpp
     tests/test_sequence_batch.cpp
+    tests/test_sequence_normalize.cpp
     tests/test_texttoken_rate.cpp
     tests/test_pose_detector.cpp
     tests/test_video_outputs.cpp

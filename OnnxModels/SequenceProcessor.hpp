@@ -71,6 +71,16 @@ enum class SeqWindowMode
   Sliding,     // host buffers the last T frames
 };
 
+// Per-frame normalisation of the input (each F-vector of [1,T,F], or the
+// whole [1,D] vector): embedding heads trained on unit-norm CLIP embeddings
+// saturate on raw ones.
+enum class SeqNormalize
+{
+  None,
+  L2,
+  ZScore,
+};
+
 struct SequenceProcessor : OnnxObject
 {
 public:
@@ -95,6 +105,7 @@ public:
     halp::hslider_f32<"Param 1", halp::range{-10., 10., 0.}> param1;
     halp::hslider_f32<"Param 2", halp::range{-10., 10., 0.}> param2;
     halp::impulse_button<"Reset"> reset;
+    halp::enum_t<SeqNormalize, "Normalize"> normalize;
   } inputs;
 
   struct

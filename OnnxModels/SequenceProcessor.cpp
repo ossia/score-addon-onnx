@@ -8,8 +8,10 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <span>
 
 namespace OnnxModels
 {
@@ -142,6 +144,47 @@ struct SeqResult
 };
 
 void applyResult(SequenceProcessor& self, SeqResult& r);
+
+// Normalises each frame (the last dim) of the input in place.
+void normalizeFrames(
+    std::span<float> v, const std::vector<int64_t>& shape, SeqNormalize mode)
+{
+  if(mode == SeqNormalize::None || v.empty())
+    return;
+  const std::size_t f
+      = (!shape.empty() && shape.back() > 0) ? (std::size_t)shape.back() : v.size();
+  for(std::size_t start = 0; start + f <= v.size(); start += f)
+  {
+    auto frame = v.subspan(start, f);
+    if(mode == SeqNormalize::L2)
+    {
+      double sq = 0.;
+      for(float x : frame)
+        sq += (double)x * x;
+      if(sq > 0.)
+      {
+        const float inv = (float)(1. / std::sqrt(sq));
+        for(float& x : frame)
+          x *= inv;
+      }
+    }
+    else
+    {
+      double sum = 0., sq = 0.;
+      for(float x : frame)
+      {
+        sum += x;
+        sq += (double)x * x;
+      }
+      const double mean = sum / (double)f;
+      const double var = std::max(0., sq / (double)f - mean * mean);
+      const double sd = std::sqrt(var);
+      const float inv = sd > 1e-12 ? (float)(1. / sd) : 1.f;
+      for(float& x : frame)
+        x = (float)((x - mean) * inv);
+    }
+  }
+}
 } // namespace
 
 SequenceProcessor::SequenceProcessor() noexcept
@@ -355,11 +398,12 @@ try
     return; // window not yet filled, or nothing to feed
 
   std::vector<float> input(b.data, b.data + b.count);
+  normalizeFrames(input, b.shape, inputs.normalize.value);
   if(batch > 1 && !b.shape.empty())
   {
-    input.reserve(input.size() * batch);
+    input.resize((std::size_t)(b.count * batch));
     for(int64_t k = 1; k < batch; ++k)
-      input.insert(input.end(), b.data, b.data + b.count);
+      std::copy_n(input.begin(), b.count, input.begin() + k * b.count);
     b.shape[0] = batch;
   }
 
