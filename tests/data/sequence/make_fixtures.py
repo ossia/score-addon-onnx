@@ -49,3 +49,9 @@ save("counter",
       helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [1, 1])],
      [const("one", np.array([[1.0]], np.float32))])
 
+# A scalar control declared before the data: y = x * t.
+save("scalar_first",
+     [helper.make_node("Mul", ["x", "t"], ["y"])],
+     [helper.make_tensor_value_info("t", TensorProto.FLOAT, [1]),
+      helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
+     [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])])

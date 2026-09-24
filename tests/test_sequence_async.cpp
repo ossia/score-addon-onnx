@@ -102,3 +102,20 @@ TEST_CASE("Sequence Processor: a job of the old model is dropped after a swap", 
   CHECK(s.state() == 0.f);
   std::filesystem::remove(copy);
 }
+
+// S7: the first input that was not a recurrent state became the data input,
+// even a scalar control: the probe passed, and every frame then failed.
+TEST_CASE("Sequence Processor: a scalar declared first stays a control", "[onnx][sequence]")
+{
+  REQUIRE(OnnxModels::initOnnxRuntime());
+  OnnxModels::SequenceProcessor node;
+  const std::string path = fixtures + "scalar_first.onnx";
+  const auto bytes = slurp(path);
+  node.inputs.model.file.bytes = bytes;
+  node.inputs.model.file.filename = path;
+  node.inputs.param1.value = 3.f;
+  node.inputs.in.value = {1.f, 2.f, 3.f, 4.f};
+  node();
+  CHECK_FALSE(node.inputs.model.current_model_invalid);
+  CHECK(node.outputs.out.value == std::vector<float>{3.f, 6.f, 9.f, 12.f});
+}
