@@ -50,7 +50,10 @@ struct Resnet
       recog.clear();
       Onnx::softmax(res, recog);
 
-      thread_local std::vector<int> idx(N);
+      // Resized on every call: the buffer is shared by every Resnet node on
+      // this thread, whose models may have different class counts.
+      thread_local std::vector<int> idx;
+      idx.resize(N);
       std::iota(idx.begin(), idx.end(), 0);
 
       std::stable_sort(
@@ -58,7 +61,7 @@ struct Resnet
           idx.end(),
           [&](int i1, int i2) { return recog[i1] > recog[i2]; });
 
-      for (int i = 0; i < 5; i++)
+      for (int i = 0, n = std::min(5, N); i < n; i++)
       {
         int the_class = idx[i];
         if (the_class >= 0 && the_class < (int)classes.size())
