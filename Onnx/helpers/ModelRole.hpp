@@ -425,11 +425,17 @@ inline ModelRole classify(const ModelIO& spec)
   if(anyTotal(136))
     return setKind(
         ModelKind::MobileFaceNet, ModelStage::Landmark, ModelDomain::Face, 68);
+  // [1,68] or [1,68,2|3] landmarks; not a [1,68,8400] hand YOLO-pose head
+  // (5 + 21*3 = 68 features over the anchors).
   for(auto& o : outs)
-    if(o.rank >= 2 && o.port->shape.size() >= 2 && o.port->shape[1] == 68)
+  {
+    const auto& sh = o.port->shape;
+    if(sh.size() >= 2 && sh[1] == 68
+       && (sh.size() == 2 || (sh.size() == 3 && sh[2] > 0 && sh[2] <= 3)))
       return setKind(
           ModelKind::MobileFaceNet, ModelStage::Landmark, ModelDomain::Face,
           68);
+  }
 
   // --- F) Single-stage YOLO-pose -------------------------------------------
   // Two row/feature formats:

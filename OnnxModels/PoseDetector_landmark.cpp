@@ -712,7 +712,8 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
   std::vector<Yolo::YOLO_pose::pose_type> poses;
   // Floor the threshold like runRTMO does: at ~0 every one of the 8400 grid
   // candidates survives and the helper's O(n^2) dedup blows up the frame time.
-  yolo_pose.processOutput(
+  // K from the output shape (17 for COCO; a hand head has 21).
+  const int K = yolo_pose.processOutput(
       spec, outs, poses, 100,
       std::max(0.3f, static_cast<float>(inputs.min_confidence)), 0, 0,
       model_size, model_size, model_size, model_size);
@@ -743,9 +744,9 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
     {
       const auto& pp = poses[pi];
       DetectedPose dp;
-      dp.keypoints.assign(17, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
+      dp.keypoints.assign(K, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
       for(const auto& kp : pp.keypoints)
-        if(kp.kp >= 0 && kp.kp < 17)
+        if(kp.kp >= 0 && kp.kp < K)
         {
           const Onnx::Vec2 p = Onnx::ROI::applyAffine(M, kp.x, kp.y);
           dp.keypoints[kp.kp] = {p.x / iw, p.y / ih, 0.0f, 1.0f};
@@ -765,10 +766,10 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
 
   const auto& pose = poses[0];
   DetectedPose detected;
-  detected.keypoints.assign(17, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
+  detected.keypoints.assign(K, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
   for(const auto& kp : pose.keypoints)
   {
-    if(kp.kp >= 0 && kp.kp < 17)
+    if(kp.kp >= 0 && kp.kp < K)
     {
       const Onnx::Vec2 p = Onnx::ROI::applyAffine(M, kp.x, kp.y);
       detected.keypoints[kp.kp] = {p.x / iw, p.y / ih, 0.0f, 1.0f};

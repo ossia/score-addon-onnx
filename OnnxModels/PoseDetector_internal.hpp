@@ -312,4 +312,49 @@ inline bool rectClose(const Onnx::ROI::Rect& c, const Onnx::ROI::Rect& p)
   return true;
 }
 
+
+// Classifier input from a model: when its declared output dims are all
+// dynamic (3DDFA's FaceBoxesProd under a provider that turns ORT's shape
+// inference off, e.g. OpenVINO), the classifier cannot tell what it is. Run it
+// once on a zero image (320 px for dynamic sides) and use the real output
+// shapes instead. Returns false when no probe was needed or it failed.
+inline bool probeOutputShapes(Onnx::OnnxRunContext& ctx, Onnx::ModelIO& io)
+{
+  const auto& spec = ctx.readModelSpec();
+  if(spec.inputs.size() != 1 || spec.inputs[0].shape.size() != 4
+     || spec.inputs[0].elem_type != Onnx::TensorElemType::Float)
+    return false;
+  const bool dynamic_out = std::any_of(
+      spec.outputs.begin(), spec.outputs.end(), [](const auto& o) {
+        return std::any_of(o.shape.begin(), o.shape.end(), [](int64_t d) { return d <= 0; });
+      });
+  if(!dynamic_out)
+    return false;
+  try
+  {
+    std::vector<int64_t> shape = spec.inputs[0].shape;
+    shape[0] = 1;
+    const bool nhwc = shape[3] == 3 || shape[3] == 1;
+    for(std::size_t d = 1; d < 4; ++d)
+      if(shape[d] <= 0)
+        shape[d] = (!nhwc && d == 1) || (nhwc && d == 3) ? 3 : 320;
+    std::size_t n = 1;
+    for(auto d : shape)
+      n *= (std::size_t)d;
+    std::vector<float> zeros(n, 0.f);
+    Ort::Value ins[1]{Onnx::vec_to_tensor<float>(zeros, shape)};
+    std::vector<Ort::Value> outs;
+    for(std::size_t i = 0; i < spec.outputs.size(); ++i)
+      outs.emplace_back(nullptr);
+    ctx.infer(spec, ins, outs);
+    for(std::size_t i = 0; i < outs.size() && i < io.outputs.size(); ++i)
+      if(outs[i] && outs[i].IsTensor())
+        io.outputs[i].shape = outs[i].GetTensorTypeAndShapeInfo().GetShape();
+    return true;
+  }
+  catch(...)
+  {
+    return false;
+  }
+}
 } // namespace OnnxModels
