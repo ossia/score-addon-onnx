@@ -690,6 +690,56 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
   )
   add_test(NAME score_addon_onnx_tests COMMAND score_addon_onnx_tests)
 
+  # Node-level tests on the real object sources and real models (models from
+  # $ONNX_TEST_MODELS, default the models-presets pack; tests SKIP without them).
+  add_executable(score_addon_onnx_node_tests
+    tests/test_node_model_swap.cpp
+    tests/test_external_data.cpp
+    tests/test_state_pairing.cpp
+    tests/test_geometry_output.cpp
+    tests/test_sequence_window.cpp
+    tests/test_texttoken_rate.cpp
+    tests/test_pose_detector.cpp
+    tests/test_video_outputs.cpp
+    tests/test_aux_inputs.cpp
+    tests/test_audio_processor.cpp
+    tests/test_classifier_routing.cpp
+    tests/test_image_outputs.cpp
+    OnnxModels/Resnet.cpp
+    OnnxModels/ENet.cpp
+    OnnxModels/SequenceProcessor.cpp
+    OnnxModels/TextToken.cpp
+    OnnxModels/PoseDetector.cpp
+    OnnxModels/PoseDetector_draw.cpp
+    OnnxModels/PoseDetector_detect.cpp
+    OnnxModels/PoseDetector_landmark.cpp
+    OnnxModels/PoseDetector_tracking.cpp
+    OnnxModels/VideoProcessor.cpp
+    OnnxModels/GeometryProcessor.cpp
+    OnnxModels/ImageGenerator.cpp
+    OnnxModels/AudioAnalyzer.cpp
+    OnnxModels/AudioProcessor.cpp
+    OnnxModels/ImageProcessor.cpp
+  )
+  target_include_directories(score_addon_onnx_node_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  target_compile_features(score_addon_onnx_node_tests PRIVATE cxx_std_23)
+  target_compile_definitions(score_addon_onnx_node_tests PRIVATE
+    SCORE_ONNX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+  target_link_libraries(score_addon_onnx_node_tests PRIVATE
+    Catch2::Catch2WithMain
+    score_plugin_avnd
+    onnxruntime::onnxruntime
+    score_onnx_ctx_overlay
+    score_onnx_imageops
+  )
+  if(TARGET Boost::boost)
+    target_link_libraries(score_addon_onnx_node_tests PRIVATE Boost::boost)
+  endif()
+  add_test(NAME score_addon_onnx_node_tests COMMAND score_addon_onnx_node_tests)
+  set_tests_properties(score_addon_onnx_node_tests PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED")
+
   # Manual smoke harness for the FastVLM pipeline: needs real model files on
   # disk (pass a FastVLM-*-ONNX snapshot directory), so it is built with the
   # tests but not registered with ctest. Compiles the helper on its own, so it
