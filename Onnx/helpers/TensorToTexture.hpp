@@ -27,6 +27,8 @@ enum class WriteMode : uint8_t
   Denormalize,     // (x+1)*127.5            — [-1,1] outputs
   Passthrough,     // clamp(x,0,255)         — already-[0,255] outputs
   Half255,         // clamp(0.5+255*x,0,255) — PyTorchGAN
+  AutoRange,       // DirectClamp if the frame is within [0,1], else MinMax
+  Sigmoid,         // 255/(1+exp(-x))        — logit outputs (DexiNed)
 };
 
 // Resolved geometry of an output tensor (channel position from the shape).
@@ -68,7 +70,9 @@ const float* toFloat(
 // tensor has a 4th channel). channels==1 is broadcast to gray RGB.
 void writeRgb(const float* data, const OutSpec& s, WriteMode m, uint8_t* dst_rgba8);
 
-// Single-channel (channel 0) tensor -> R8 destination (1 byte/pixel).
+// Single-channel tensor -> R8 destination (1 byte/pixel). A 2-channel
+// (background / foreground) output gives its foreground: channel 1 when it is
+// already a probability, else the softmax of the two logits.
 void writeMask(const float* data, const OutSpec& s, WriteMode m, uint8_t* dst_r8);
 
 // Single-channel tensor -> R32F destination, raw values (precision-preserving;
