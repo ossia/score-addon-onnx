@@ -213,6 +213,7 @@ try
   {
     det_ctx.reset();
     m_last_det_model = std::string(inputs.det_model.file.filename);
+    m_yolox_range = {};
     reinit = true;
   }
   if(inputs.reid_model.file.filename != m_last_reid_model)
@@ -336,7 +337,8 @@ try
     if(!from_tracking)
     {
       auto dets = runDetector(
-          m_detector_role, src, role.domain, -2, nullptr, detThreshold());
+          m_detector_role, src, role.domain, detectorClass(), nullptr,
+          detThreshold());
       if(dets.empty())
       {
         holdOrPassthrough(src);
