@@ -24,8 +24,9 @@ public:
   halp_meta(author, "Fast VLM authors, Onnxruntime");
   halp_meta(
       description,
-      "Vision Language Model (FastVLM) for image captioning and visual "
-      "question answering.");
+      "Vision Language Model for image captioning and visual question "
+      "answering: FastVLM, SmolVLM and Gemma 3 onnx-community exports "
+      "(vision encoder, token embeddings, merged decoder).");
   halp_meta(uuid, "3a3b4824-2b39-4cc0-9b6c-6c030de40dc4");
 
   struct

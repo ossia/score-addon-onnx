@@ -74,14 +74,32 @@ inline std::optional<int64_t> imageTokenId(const std::filesystem::path& dir)
   return std::nullopt;
 }
 
-// The placeholder text in the prompt: processor_config.json's image_token.
-inline std::optional<std::string> imageToken(const std::filesystem::path& dir)
+// A string value, or nullopt.
+inline std::optional<std::string> text(const nlohmann::json& obj, const char* key)
 {
-  const auto p = read(dir / "processor_config.json");
-  if(p.is_object())
-    if(const auto it = p.find("image_token"); it != p.end() && it->is_string())
+  if(obj.is_object())
+    if(const auto it = obj.find(key); it != obj.end() && it->is_string())
       return it->get<std::string>();
   return std::nullopt;
+}
+
+// A positive number, or nullopt.
+inline std::optional<double> number(const nlohmann::json& obj, const char* key)
+{
+  if(obj.is_object())
+    if(const auto it = obj.find(key); it != obj.end() && it->is_number())
+      if(const double v = it->get<double>(); v > 0)
+        return v;
+  return std::nullopt;
+}
+
+// The text of one image token in the prompt: processor_config.json's
+// image_token (LLaVA), else tokenizer_config.json's (gemma3).
+inline std::optional<std::string> imageToken(const std::filesystem::path& dir)
+{
+  if(auto t = text(read(dir / "processor_config.json"), "image_token"))
+    return t;
+  return text(read(dir / "tokenizer_config.json"), "image_token");
 }
 
 // SentencePiece tokenizers (gemma) mark spaces with U+2581 and their
