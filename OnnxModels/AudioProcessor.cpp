@@ -189,10 +189,15 @@ void AudioProcessor::resolveIO()
   // streaming models (recurrent denoise) run inline for low latency.
   async_model = inputs.model.file.bytes.size() > 32u * 1024 * 1024 || block > 48000;
   const int backlog = async_model ? 4 : 0;
-  audio_in.prepare(in_shape, host_rate, model_rate, block, /*hop*/ block, hc,
+  lastOverlap = inputs.overlap.value;
+  const int64_t hop = lastOverlap == AudioOverlap::Half            ? block / 2
+                      : lastOverlap == AudioOverlap::ThreeQuarters ? block / 4
+                                                                   : block;
+  audio_in.prepare(in_shape, host_rate, model_rate, block, hop, hc,
                    max_frames, backlog);
   audio_out.prepare(out_shape.channels, model_rate, host_rate, block,
                     max_frames, backlog);
+  audio_out.prepareOverlap(block, hop);
   staged.reserve((std::size_t)out_shape.channels * block + 16);
   out_planar.reserve((std::size_t)out_shape.channels * block + 16);
 }
@@ -219,8 +224,10 @@ try
     reloadModel();
   if(spec.inputs.empty() || spec.outputs.empty())
     return;
-  if(inputs.model_rate.value != lastRateOverride && !inferenceInProgress)
-    resolveIO(); // re-prepares the resamplers for the new rate
+  if((inputs.model_rate.value != lastRateOverride
+      || inputs.overlap.value != lastOverlap)
+     && !inferenceInProgress)
+    resolveIO(); // re-prepares the resamplers and the block hop
 
   if(inputs.reset.value)
   {
@@ -366,7 +373,7 @@ void AudioProcessor::dispatchInfer(int64_t n, bool force_async)
                                    out_scratch);
     const auto st = selectStem(f, cnt, osh, out_shape.channels, inputs.param1.value);
     out_planar.assign(st.data, st.data + st.channels * st.frames);
-    audio_out.push(out_planar.data(), st.channels, st.frames);
+    audio_out.pushOverlap(out_planar.data(), st.channels, st.frames);
   }
 
   // Feed recurrent outputs back into state inputs.
@@ -506,7 +513,7 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
       self.inferenceInProgress = false;
       if(gen != self.gen)
         return; // Reset while it ran: keep the zeroed states, drop the block
-      self.audio_out.push(planar.data(), oc, on);
+      self.audio_out.pushOverlap(planar.data(), oc, on);
       for(auto& ns : new_states)
         for(auto& s : self.states)
           // Size guard: if the model was swapped while this job was in flight,

@@ -422,6 +422,13 @@ struct WaveformOutput
   std::vector<AudioRing> rings;         // one per channel (host rate)
   std::vector<std::vector<float>> rs_scratch;
 
+  // Overlap-add, when the input takes a block every hop < block samples.
+  int64_t ola_block = 0;
+  int64_t ola_hop = 0;
+  std::vector<float> ola_window; // Hann, scaled so the overlaps sum to 1
+  std::vector<std::vector<float>> ola_acc; // one block per channel
+  std::vector<float> ola_emit;             // planar [C, hop]
+
   void prepare(
       int chans, double in_rate, double out_rate, int64_t model_block,
       std::size_t max_host_frames, int backlog_blocks = 0)
@@ -455,6 +462,59 @@ struct WaveformOutput
       r.reset();
     for(auto& rg : rings)
       rg.clear();
+    for(auto& a : ola_acc)
+      std::fill(a.begin(), a.end(), 0.f);
+  }
+
+  // Frames of `block` samples every `hop` (block a multiple of 2 * hop): a
+  // periodic Hann window sums to block / (2 * hop) over the overlaps, so it
+  // is scaled by the inverse and a model that returns its input gives the
+  // input back. hop >= block turns overlap-add off.
+  void prepareOverlap(int64_t block, int64_t hop)
+  {
+    if(hop <= 0 || hop >= block)
+    {
+      ola_block = ola_hop = 0;
+      ola_acc.clear();
+      return;
+    }
+    ola_block = block;
+    ola_hop = hop;
+    const double gain = 2.0 * (double)hop / (double)block;
+    ola_window.resize((std::size_t)block);
+    for(int64_t i = 0; i < block; ++i)
+      ola_window[i] = (float)(gain * 0.5
+                              * (1.0 - std::cos(2.0 * 3.14159265358979323846
+                                                * (double)i / (double)block)));
+    ola_acc.assign(channels, std::vector<float>((std::size_t)block, 0.f));
+    ola_emit.assign((std::size_t)channels * hop, 0.f);
+  }
+
+  bool overlapping() const noexcept { return ola_block > 0; }
+
+  // Adds a block-long model frame into the overlap and pushes the `hop`
+  // samples it completes. A frame of another length (the model does not
+  // return what it was given) is pushed as is.
+  void pushOverlap(const float* planar, int chans, int64_t n)
+  {
+    if(!overlapping() || n != ola_block)
+    {
+      push(planar, chans, n);
+      return;
+    }
+    const int nc = std::min(chans, (int)ola_acc.size());
+    const std::size_t hop = (std::size_t)ola_hop;
+    for(int c = 0; c < nc; ++c)
+    {
+      auto& acc = ola_acc[c];
+      const float* in = planar + (std::size_t)c * n;
+      for(int64_t i = 0; i < n; ++i)
+        acc[i] += ola_window[i] * in[i];
+      std::copy_n(acc.begin(), hop, ola_emit.begin() + c * hop);
+      std::copy(acc.begin() + hop, acc.end(), acc.begin());
+      std::fill(acc.end() - hop, acc.end(), 0.f);
+    }
+    push(ola_emit.data(), nc, (int64_t)hop);
   }
 
   // Push a model-rate planar block ([c0..][c1..]) of `n` frames per channel.

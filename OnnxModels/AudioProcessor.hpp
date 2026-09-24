@@ -61,6 +61,15 @@ struct AudioInferJob
   double model_rate = 48000.0;
 };
 
+// Frame-based streaming models (DTLN-style enhancement) take a block every
+// hop samples and their outputs are overlap-added.
+enum class AudioOverlap
+{
+  None,         // a new block every block (hop = block)
+  Half,         // hop = block / 2
+  ThreeQuarters // hop = block / 4
+};
+
 struct AudioProcessor : OnnxObject
 {
 public:
@@ -90,6 +99,14 @@ public:
     {
       halp_meta(description, "Sample rate the model runs at; 0 = auto");
     } model_rate;
+    struct : halp::enum_t<AudioOverlap, "Overlap">
+    {
+      halp_meta(
+          description,
+          "Run the model on overlapping blocks and overlap-add its outputs "
+          "(Hann window); for models that return a block as long as their "
+          "input");
+    } overlap;
   } inputs;
 
   struct
@@ -135,6 +152,7 @@ private:
   int wave_out_index = -1;
   std::vector<int> wave_out_indices; // separation stems (Param 1 selects)
   int lastRateOverride = 0;
+  AudioOverlap lastOverlap{};
   std::vector<Onnx::AuxPlan> aux; // inputs other than the waveform and states:
                                   // scalars take Params 2..4
   std::vector<std::vector<uint8_t>> aux_store;
