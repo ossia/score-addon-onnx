@@ -19,6 +19,7 @@
 
 #include <Onnx/helpers/TensorType.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -297,7 +298,7 @@ struct WaveformInput
   void prepare(
       const WaveformShape& s, double in_rate, double out_rate,
       int64_t fixed_block, int64_t hop_size, int host_channels,
-      std::size_t max_host_frames)
+      std::size_t max_host_frames, int backlog_blocks = 0)
   {
     shape = s;
     host_rate = in_rate;
@@ -319,7 +320,9 @@ struct WaveformInput
     const double ratio = (in_rate > 0) ? out_rate / in_rate : 1.0;
     const std::size_t per_block
         = (std::size_t)std::ceil((double)max_host_frames * ratio) + 2;
-    const std::size_t cap = (std::size_t)block + per_block + 2;
+    // backlog_blocks: extra whole blocks kept while an async job runs.
+    const std::size_t cap
+        = (std::size_t)block * (1 + std::max(backlog_blocks, 0)) + per_block + 2;
 
     rings.assign(mc, {});
     for(auto& rg : rings)
@@ -405,7 +408,7 @@ struct WaveformOutput
 
   void prepare(
       int chans, double in_rate, double out_rate, int64_t model_block,
-      std::size_t max_host_frames)
+      std::size_t max_host_frames, int backlog_blocks = 0)
   {
     channels = chans > 0 ? chans : 1;
     model_rate = in_rate;
@@ -417,7 +420,8 @@ struct WaveformOutput
     const double ratio = (in_rate > 0) ? out_rate / in_rate : 1.0;
     const std::size_t per_block
         = (std::size_t)std::ceil((double)(model_block) * ratio) + 2;
-    const std::size_t cap = per_block + max_host_frames + 2;
+    const std::size_t cap
+        = per_block * (1 + std::max(backlog_blocks, 0)) + max_host_frames + 2;
     rings.assign(channels, {});
     for(auto& rg : rings)
       rg.prepare(cap);
