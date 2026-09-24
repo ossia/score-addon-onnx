@@ -33,7 +33,8 @@ try
     try
     {
       this->ctx
-          = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
+          = std::make_unique<Onnx::OnnxRunContext>(
+          this->inputs.model.file.bytes, this->inputs.model.file.filename);
       lastModelPath = this->inputs.model.file.filename;
     }
     catch (...)

@@ -246,20 +246,20 @@ try
     if(have_landmark && !this->ctx)
     {
       this->ctx = std::make_unique<Onnx::OnnxRunContext>(
-          this->inputs.model.file.bytes);
+          this->inputs.model.file.bytes, this->inputs.model.file.filename);
       m_landmark_role = Onnx::classify(toModelIO(this->ctx->readModelSpec()));
     }
     if(have_det && !this->det_ctx)
     {
       this->det_ctx = std::make_unique<Onnx::OnnxRunContext>(
-          this->inputs.det_model.file.bytes);
+          this->inputs.det_model.file.bytes, this->inputs.det_model.file.filename);
       m_detector_role
           = Onnx::classify(toModelIO(this->det_ctx->readModelSpec()));
     }
     if(have_reid && !this->reid_ctx)
     {
       this->reid_ctx = std::make_unique<Onnx::OnnxRunContext>(
-          this->inputs.reid_model.file.bytes);
+          this->inputs.reid_model.file.bytes, this->inputs.reid_model.file.filename);
       m_reid_spec
           = Onnx::classifyReid(toModelIO(this->reid_ctx->readModelSpec()));
     }

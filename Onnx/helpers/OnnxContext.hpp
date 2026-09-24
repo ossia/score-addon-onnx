@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -292,10 +293,14 @@ struct OnnxRunContext
 
   Ort::AllocatorWithDefaultOptions allocator;
 
-  // bytes is not the filename, it is the raw model binary data
-  explicit OnnxRunContext(std::string_view bytes)
+  // bytes is not the filename, it is the raw model binary data.
+  // model_path is the file the bytes were read from, if known: a session built
+  // from a buffer has no base directory, so without it the external data of a
+  // model (model.onnx_data next to model.onnx) is looked up in the process's
+  // working directory and not found.
+  explicit OnnxRunContext(std::string_view bytes, std::string_view model_path = {})
       : env(make_env("ossia"))
-      , session_options(create_session_options(opts))
+      , session_options(withModelFolder(create_session_options(opts), model_path))
       , session(env, bytes.data(), bytes.size(), session_options)
   {
     // The session (and therefore its I/O spec) is immutable for the context's
@@ -311,6 +316,21 @@ struct OnnxRunContext
   const ModelSpec& readModelSpec() const noexcept { return m_spec; }
 
 private:
+  static Ort::SessionOptions
+  withModelFolder(Ort::SessionOptions so, std::string_view model_path)
+  {
+    if(!model_path.empty())
+    {
+      const auto folder = std::filesystem::path(model_path).parent_path().string();
+      if(!folder.empty())
+        // kOrtSessionOptionsModelExternalInitializersFileFolderPath, spelled out
+        // so that older onnxruntime headers without the constant still build.
+        so.AddConfigEntry(
+            "session.model_external_initializers_file_folder_path", folder.c_str());
+    }
+    return so;
+  }
+
   ModelSpec buildModelSpec()
   {
     ONNX_PROF_SCOPE(ReadSpec);
