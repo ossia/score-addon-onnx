@@ -122,6 +122,24 @@ TEST_CASE("2-class outputs give the foreground", "[onnx][image]")
   CHECK(n[1] == 204);
 }
 
+// A probability a hair above 1 (fp16 rounding) flipped the whole frame to the
+// logits path: softmax(fg - bg) of probabilities, a different mask each frame.
+TEST_CASE("2-class probabilities with rounding stay probabilities", "[onnx][image]")
+{
+  std::vector<float> probs{0.f, 0.5f, 1.f, 0.2f, 0.9f, 1.0002f, 0.5f, -1e-4f, 0.8f, 0.1f};
+  auto p = mask(probs, {1, 2, 1, 5}, WriteMode::DirectClamp);
+  CHECK(p == std::vector<uint8_t>{255, 127, 0, 204, 25});
+}
+
+// AutoRange: a [0,1] matte with a tiny negative dip is not stretched.
+TEST_CASE("Auto mask mapping ignores fp16 rounding", "[onnx][image]")
+{
+  std::vector<float> matte(16, 0.f);
+  matte[5] = 0.3f;
+  matte[6] = -0.01f;
+  CHECK(mask(matte, {1, 1, 4, 4}, WriteMode::AutoRange)[5] == 76);
+}
+
 TEST_CASE("PP-HumanSeg: the person is the mask", "[onnx][image]")
 {
   const std::string model = "/mnt/sdd1/models/pinto/196__human_segmentation_pphumanseg_2021oct.onnx";

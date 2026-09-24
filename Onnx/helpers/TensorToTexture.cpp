@@ -92,11 +92,13 @@ struct Fetch
 };
 
 // The offset and scale of the range-based modes: MinMaxNormalize always
-// stretches [lo,hi]; AutoRange keeps a frame that is already within [0,1].
+// stretches [lo,hi]; AutoRange keeps a frame that is already within [0,1],
+// give or take the rounding of an fp16 export: a -0.01 in one frame must not
+// switch the stretch on for that frame only (flicker).
 template <WriteMode M>
 inline void rangeParams(float lo, float hi, float& mn, float& inv_range) noexcept
 {
-  if(M == WriteMode::AutoRange && lo >= 0.f && hi <= 1.f)
+  if(M == WriteMode::AutoRange && lo >= -0.02f && hi <= 1.02f)
   {
     mn = 0.f;
     inv_range = 1.f;
@@ -143,6 +145,9 @@ void writeRgbImpl(const float* data, const OutSpec& s, uint8_t* dst)
 
 // A 2-channel (background, foreground) output: its foreground value.
 // Probabilities are taken as they are; logits go through the 2-way softmax.
+// Values within 0.05 of [0,1] are still probabilities: fp16 exports emit
+// 1.0002 or -1e-4, and one such pixel used to turn the whole frame into
+// softmax(fg - bg) of probabilities (a mask that flickered in video).
 struct Foreground
 {
   const float* data;
@@ -155,7 +160,7 @@ struct Foreground
     for(int64_t p = 0; p < HW && !f.logits; ++p)
     {
       const float v = f.channel(1, p);
-      f.logits = !(v >= 0.f && v <= 1.f);
+      f.logits = !(v >= -0.05f && v <= 1.05f);
     }
     return f;
   }
