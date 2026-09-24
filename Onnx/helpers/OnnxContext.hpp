@@ -238,6 +238,9 @@ catch (...)
 // session initialization ("Tensor type mismatch. T != MLFloat16" from
 // tensor.h:210, a float-only fusion kernel touching an fp16 tensor). Basic
 // optimizations initialize and run those models fine, so retry with them.
+// The first attempt is silenced, or ORT logs that recovered failure as an
+// error; the retry keeps the caller's options (provider, threads) and logs as
+// usual, so a model that fails both ways is still reported.
 template <typename PathString>
 inline std::unique_ptr<Ort::Session> create_session_with_fallback(
     Ort::Env& env,
@@ -246,19 +249,22 @@ inline std::unique_ptr<Ort::Session> create_session_with_fallback(
 {
   try
   {
-    return std::make_unique<Ort::Session>(env, path.data(), sessionOptions);
+    auto quiet = sessionOptions.Clone();
+    quiet.SetLogSeverityLevel(ORT_LOGGING_LEVEL_FATAL);
+    return std::make_unique<Ort::Session>(env, path.data(), quiet);
   }
   catch (const Ort::Exception& e)
   {
-    std::fprintf(
-        stderr,
-        "Onnxruntime: session init failed (%s); retrying with basic graph "
-        "optimizations\n",
-        e.what());
-    auto fallback = create_session_options(Options{});
+    auto fallback = sessionOptions.Clone();
     fallback.SetGraphOptimizationLevel(
         GraphOptimizationLevel::ORT_ENABLE_BASIC);
-    return std::make_unique<Ort::Session>(env, path.data(), fallback);
+    auto session = std::make_unique<Ort::Session>(env, path.data(), fallback);
+    std::fprintf(
+        stderr,
+        "Onnxruntime: loaded with basic graph optimizations (extended failed: "
+        "%s)\n",
+        e.what());
+    return session;
   }
 }
 
