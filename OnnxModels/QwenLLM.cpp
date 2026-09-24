@@ -54,18 +54,23 @@ void QwenLLMNode::request_inference()
   accumulated_response.clear();
   partial_buffer.clear();
   ready_partials.clear();
+  think_filter.reset();
+  filter_thinking = inputs.thinking.value != ThinkingMode::Show;
   total_tokens_generated = 0;
   generation_start_time = std::chrono::steady_clock::now();
 
-  token_stream = std::make_shared<TokenStream>();
-  worker.request(
-      prompt,
-      inputs.temperature.value,
-      inputs.topP.value,
-      inputs.topK.value,
-      inputs.maxTokens.value,
-      llm,
-      token_stream);
+  token_stream = std::make_shared<LlmTokenStream>();
+  auto job = std::make_unique<LlmJob>();
+  job->kind = LlmJob::Kind::Generate;
+  job->prompt = prompt;
+  job->temperature = inputs.temperature.value;
+  job->topP = inputs.topP.value;
+  job->topK = inputs.topK.value;
+  job->maxTokens = inputs.maxTokens.value;
+  job->thinking = inputs.thinking.value != ThinkingMode::Off;
+  job->llm = llm;
+  job->stream = token_stream;
+  worker.request(std::move(job));
 }
 
 // Cuts the growing reply into segments according to the Partial mode:
@@ -89,6 +94,52 @@ void QwenLLMNode::segmentPartials(std::string_view delta)
   }
   for (auto& s : segments)
     ready_partials.push_back(std::move(s));
+}
+
+void QwenLLMNode::appendGenerated(std::string_view delta)
+{
+  if (filter_thinking)
+  {
+    const std::string visible = think_filter.feed(delta);
+    accumulated_response += visible;
+    segmentPartials(visible);
+  }
+  else
+  {
+    accumulated_response += delta;
+    segmentPartials(delta);
+  }
+}
+
+// The tokens the worker generated since the last tick. The worker only holds
+// the lock to append one token: when it does, they are taken next tick
+// rather than waited for.
+void QwenLLMNode::drain_stream()
+{
+  if (!token_stream)
+    return;
+  std::vector<std::string> chunk;
+  {
+    std::unique_lock lock{token_stream->mutex, std::try_to_lock};
+    if (!lock.owns_lock())
+      return;
+    chunk.swap(token_stream->pending);
+  }
+  if (chunk.empty())
+    return;
+
+  std::string delta;
+  for (auto& c : chunk)
+    delta += c;
+  total_tokens_generated += chunk.size();
+  appendGenerated(delta);
+
+  using namespace std::chrono;
+  const auto elapsed
+      = duration_cast<duration<float>>(steady_clock::now() - generation_start_time)
+            .count();
+  if (elapsed > 0.f)
+    outputs.tokensPerSecond.value = total_tokens_generated / elapsed;
 }
 
 void QwenLLMNode::operator()()
@@ -141,19 +192,9 @@ try
     }
     if (!chunk.empty())
     {
-      std::string delta;
-      for (auto& c : chunk)
-        delta += c;
-      total_tokens_generated += chunk.size();
-      accumulated_response += delta;
-      segmentPartials(delta);
-
-      using namespace std::chrono;
-      const auto elapsed = duration_cast<duration<float>>(
-                               steady_clock::now() - generation_start_time)
-                               .count();
-      if (elapsed > 0.f)
-        outputs.tokensPerSecond.value = total_tokens_generated / elapsed;
+      must_infer = false;
+      restart = false;
+      request_inference();
     }
   }
 
@@ -178,14 +219,7 @@ catch (...)
   inference_in_progress = false;
 }
 
-std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(
-    std::string prompt,
-    float temperature,
-    float topP,
-    int topK,
-    int maxTokens,
-    std::shared_ptr<Onnx::QwenLLMInference> llm,
-    std::shared_ptr<TokenStream> stream)
+std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(std::unique_ptr<LlmJob> job)
 {
   if (!llm || prompt.empty() || !stream)
   {
@@ -209,7 +243,7 @@ std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(
           stream->pending.push_back(delta);
           return true;
         },
-        maxTokens, temperature, topP, topK);
+        job->maxTokens, job->temperature, job->topP, job->topK, job->thinking);
 
     return [](QwenLLMNode& node)
     {
@@ -224,11 +258,14 @@ std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(
           chunk.swap(node.token_stream->pending);
         }
         for (auto& c : chunk)
-        {
-          node.accumulated_response += c;
-          node.segmentPartials(c);
-        }
+          node.appendGenerated(c);
         node.total_tokens_generated += chunk.size();
+      }
+      if (node.filter_thinking)
+      {
+        const std::string rest = node.think_filter.finish();
+        node.accumulated_response += rest;
+        node.segmentPartials(rest);
       }
       if (!node.partial_buffer.empty())
       {
