@@ -1,5 +1,6 @@
 #include "QwenLLM.hpp"
 
+#include <Onnx/helpers/HfConfig.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <cmath>
 #include <cstdio>
@@ -18,64 +19,6 @@
 
 namespace Onnx
 {
-
-// Reads eos_token_id (a number or a list of numbers) from a HF-style JSON
-// config next to the tokenizer; returns an empty vector when absent.
-static std::vector<int64_t> readStopTokens(const std::filesystem::path& file)
-{
-  std::ifstream in(file);
-  if (!in)
-    return {};
-  std::stringstream buf;
-  buf << in.rdbuf();
-
-  const auto json
-      = nlohmann::json::parse(buf.str(), nullptr, /*allow_exceptions=*/false);
-  if (json.is_discarded() || !json.is_object())
-    return {};
-
-  const auto it = json.find("eos_token_id");
-  if (it == json.end())
-    return {};
-
-  std::vector<int64_t> ids;
-  if (it->is_number_integer())
-    ids.push_back(it->get<int64_t>());
-  else if (it->is_array())
-    for (const auto& v : *it)
-      if (v.is_number_integer())
-        ids.push_back(v.get<int64_t>());
-  return ids;
-}
-
-// Reasoning models declare <think> and </think> as added tokens in
-// tokenizer.json.
-static bool declaresThinkTokens(const std::filesystem::path& file)
-{
-  std::ifstream in(file);
-  if (!in)
-    return false;
-  std::stringstream buf;
-  buf << in.rdbuf();
-
-  const auto json
-      = nlohmann::json::parse(buf.str(), nullptr, /*allow_exceptions=*/false);
-  if (json.is_discarded() || !json.is_object())
-    return false;
-  const auto it = json.find("added_tokens");
-  if (it == json.end() || !it->is_array())
-    return false;
-  bool open = false, close = false;
-  for (const auto& t : *it)
-  {
-    if (!t.is_object() || !t.contains("content") || !t["content"].is_string())
-      continue;
-    const auto& c = t["content"].get_ref<const std::string&>();
-    open |= c == "<think>";
-    close |= c == "</think>";
-  }
-  return open && close;
-}
 
 static std::size_t qwenKvElementSize(ONNXTensorElementDataType t)
 {
@@ -133,12 +76,11 @@ QwenLLMInference::QwenLLMInference(
   // Without either, keep the Qwen ChatML defaults the member initializes to.
   {
     const std::filesystem::path tokDir{std::string(tokenizerModelPath)};
-    auto ids = readStopTokens(tokDir / "generation_config.json");
-    if (ids.empty())
-      ids = readStopTokens(tokDir / "config.json");
-    if (!ids.empty())
+    if (auto ids = HfConfig::stopTokens(tokDir); !ids.empty())
       stopTokenIds = std::move(ids);
-    thinkingModel = declaresThinkTokens(tokDir / "tokenizer.json");
+    // Reasoning models declare <think> and </think> as added tokens.
+    thinkingModel
+        = HfConfig::addsTokens(tokDir / "tokenizer.json", "<think>", "</think>");
   }
 
   // Get input/output names and inspect shapes

@@ -9,11 +9,15 @@
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
+#include <Onnx/helpers/HfConfig.hpp>
 #include <Onnx/helpers/Images.hpp>
 #include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <Onnx/helpers/Utilities.hpp>
 #include <cmath>
+
+#include <nlohmann/json.hpp>
+#include <ortx_utils.h>
 
 #include <algorithm>
 #include <array>
@@ -27,17 +31,7 @@
 
 namespace Onnx
 {
-struct FastVLMTokenizerConstants
-{
-  static constexpr int BOS_TOKEN_ID = 151643;
-  static constexpr int EOS_TOKEN_ID = 151645;
-  static constexpr int IMAGE_TOKEN_INDEX
-      = 151646; // <image> token from tokenizer config
-  static constexpr int MAX_LENGTH = 8192;
-
-  // String tokens
-  static inline const std::string DEFAULT_IMAGE_TOKEN = "<image>";
-};
+static constexpr int MAX_LENGTH = 8192;
 
 static Onnx::FloatTensor preprocessImageForFastVLM(
     const Onnx::ImageData& image,
@@ -168,6 +162,18 @@ FastVLMInference::FastVLMInference(
               OrtxGetLastErrorMessage()));
     }
 
+    // The image placeholder, its id and the stop tokens are the model's own;
+    // without the files, FastVLM's values stay.
+    {
+      const std::filesystem::path tokDir{std::string(tokenizerModelPath)};
+      if (auto id = HfConfig::imageTokenId(tokDir))
+        imageTokenId = *id;
+      if (auto t = HfConfig::imageToken(tokDir))
+        imageToken = std::move(*t);
+      if (auto ids = HfConfig::stopTokens(tokDir); !ids.empty())
+        stopTokenIds = std::move(ids);
+    }
+
     // Cache decoder I/O names for hot path optimization
     decoderInputNames.reserve(decoderSession->GetInputCount());
     decoderOutputNames.reserve(decoderSession->GetOutputCount());
@@ -188,17 +194,79 @@ FastVLMInference::FastVLMInference(
       decoderOutputNamePtrs.push_back(decoderOutputNames.back().c_str());
     }
 
-    // Discover the decoder graph properties this export variant was built
-    // with. Inputs are inputs_embeds, attention_mask, position_ids, then
-    // (past_key_values.N.key, past_key_values.N.value) per layer.
+    // Bind every decoder input by name; the layer count is the number of
+    // past_key_values.N.key inputs.
     const std::size_t nIn = decoderSession->GetInputCount();
-    numLayers = nIn >= 3 ? int((nIn - 3) / 2) : 0;
+    auto layerOf = [](std::string_view name, std::string_view prefix,
+                      std::string_view suffix) -> int
+    {
+      if (!name.starts_with(prefix) || !name.ends_with(suffix)
+          || name.size() <= prefix.size() + suffix.size())
+        return -1;
+      const auto digits = name.substr(
+          prefix.size(), name.size() - prefix.size() - suffix.size());
+      if (!std::all_of(digits.begin(), digits.end(), [](char c) {
+            return c >= '0' && c <= '9';
+          }))
+        return -1;
+      return std::stoi(std::string(digits));
+    };
+    decoderSlots.clear();
+    numLayers = 0;
+    std::string unknown;
+    for (const auto& name : decoderInputNames)
+    {
+      DecoderSlot slot;
+      if (name == "inputs_embeds")
+        slot.role = DecoderInput::Embeds;
+      else if (name == "attention_mask")
+        slot.role = DecoderInput::Mask;
+      else if (name == "position_ids")
+        slot.role = DecoderInput::Positions;
+      else if (name == "num_logits_to_keep" || name == "logits_to_keep")
+        slot.role = DecoderInput::LogitsToKeep;
+      else if (int l = layerOf(name, "past_key_values.", ".key"); l >= 0)
+        slot = {DecoderInput::Key, l};
+      else if (int l = layerOf(name, "past_key_values.", ".value"); l >= 0)
+        slot = {DecoderInput::Value, l};
+      else
+      {
+        unknown += (unknown.empty() ? "" : ", ") + name;
+        continue;
+      }
+      numLayers = std::max(numLayers, slot.layer + 1);
+      decoderSlots.push_back(slot);
+    }
+    if (!unknown.empty())
+      throw std::runtime_error(
+          fmt::format("Unsupported decoder inputs: {}", unknown));
     if (numLayers <= 0)
       throw std::runtime_error(
           fmt::format(
-              "Unexpected decoder input count: {} (not a merged FastVLM "
-              "decoder?)",
+              "Unexpected decoder inputs ({}): no past_key_values (not a "
+              "merged decoder?)",
               nIn));
+
+    presentKeyOutput.assign(numLayers, -1);
+    presentValueOutput.assign(numLayers, -1);
+    logitsOutput = -1;
+    for (int i = 0; i < (int)decoderOutputNames.size(); ++i)
+    {
+      const auto& name = decoderOutputNames[i];
+      if (name == "logits")
+        logitsOutput = i;
+      else if (int l = layerOf(name, "present.", ".key"); l >= 0 && l < numLayers)
+        presentKeyOutput[l] = i;
+      else if (int l = layerOf(name, "present.", ".value"); l >= 0 && l < numLayers)
+        presentValueOutput[l] = i;
+    }
+    if (logitsOutput < 0)
+      throw std::runtime_error("The decoder has no logits output");
+    for (int l = 0; l < numLayers; ++l)
+      if (presentKeyOutput[l] < 0 || presentValueOutput[l] < 0)
+        throw std::runtime_error(
+            fmt::format("The decoder has no present.{} key/value output", l));
+
     keyCache.assign(numLayers, {});
     valueCache.assign(numLayers, {});
     cacheShapes.assign(numLayers, {});
@@ -285,31 +353,14 @@ std::string FastVLMInference::generateResponse(
     auto multimodalEmbeddings
         = createMultimodalEmbeddings(tokenIds, imageFeatures);
 
-    maxTokens = std::clamp(maxTokens, 1, FastVLMTokenizerConstants::MAX_LENGTH);
+    maxTokens = std::clamp(maxTokens, 1, MAX_LENGTH);
 
     // Generate tokens using our working ONNX decoder with temperature sampling
     auto generatedTokens
         = generateWithONNXDecoder(multimodalEmbeddings, maxTokens, temperature);
 
-    // Step 6: Decode the generated tokens
-    std::string response = decodeTokens(generatedTokens);
-
-    // Extract just the assistant's response from the full sequence
-    size_t assistantPos = response.find("<|im_start|>assistant\n");
-    if (assistantPos != std::string::npos)
-    {
-      // Skip "<|im_start|>assistant\n"
-      response = response.substr(assistantPos + 22);
-
-      // Remove any trailing tokens
-      size_t endPos = response.find("<|im_end|>");
-      if (endPos != std::string::npos)
-      {
-        response = response.substr(0, endPos);
-      }
-    }
-
-    return response;
+    // Only the generated tokens are decoded, without the stop token.
+    return decodeTokens(generatedTokens);
   }
   catch (const std::exception& e)
   {
@@ -448,92 +499,53 @@ std::string FastVLMInference::decodeTokens(std::span<int64_t> tokens) const
 }
 
 std::vector<int64_t>
+FastVLMInference::tokenizeText(const std::string& text) const
+{
+  const char* inputTexts[] = {text.c_str()};
+  OrtxTokenId2DArray* tokenArray = nullptr;
+  if (OrtxTokenize(tokenizer, inputTexts, 1, &tokenArray) != kOrtxOK)
+    throw std::runtime_error(
+        fmt::format("Tokenization failed: {}", OrtxGetLastErrorMessage()));
+
+  const extTokenId_t* tokenData = nullptr;
+  size_t tokenCount = 0;
+  if (OrtxTokenId2DArrayGetItem(tokenArray, 0, &tokenData, &tokenCount)
+      != kOrtxOK)
+  {
+    OrtxDispose((OrtxObject**)&tokenArray);
+    throw std::runtime_error(
+        fmt::format("Failed to get tokens: {}", OrtxGetLastErrorMessage()));
+  }
+  std::vector<int64_t> out(tokenData, tokenData + tokenCount);
+  OrtxDispose((OrtxObject**)&tokenArray);
+  return out;
+}
+
+// The text between image placeholders is tokenized on its own, and each
+// placeholder becomes the image token id, which is not in the vocabulary
+// (FastVLM) or not tokenized as a single piece by every tokenizer.
+std::vector<int64_t>
 FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
 {
   try
   {
-    // Split the prompt by <image> tokens, similar to Python's tokenizer_image_token
-    std::vector<std::string> chunks;
-    size_t pos = 0;
-
-    while (pos < prompt.length())
-    {
-      size_t imagePos
-          = prompt.find(FastVLMTokenizerConstants::DEFAULT_IMAGE_TOKEN, pos);
-      if (imagePos == std::string::npos)
-      {
-        // No more image tokens, add the rest
-        chunks.push_back(prompt.substr(pos));
-        break;
-      }
-
-      // Add text before image token
-      if (imagePos > pos)
-      {
-        chunks.push_back(prompt.substr(pos, imagePos - pos));
-      }
-
-      // Add empty string to mark where image token was
-      chunks.push_back("");
-
-      pos = imagePos + FastVLMTokenizerConstants::DEFAULT_IMAGE_TOKEN.length();
-    }
-
     std::vector<int64_t> finalTokens;
-
-    for (size_t i = 0; i < chunks.size(); ++i)
+    size_t pos = 0;
+    while (pos < prompt.size())
     {
-      if (i > 0 && i % 2 == 1)
+      const size_t imagePos = prompt.find(imageToken, pos);
+      const size_t end
+          = imagePos == std::string::npos ? prompt.size() : imagePos;
+      if (end > pos)
       {
-        // This is where an image token was, insert IMAGE_TOKEN_INDEX
-        finalTokens.push_back(FastVLMTokenizerConstants::IMAGE_TOKEN_INDEX);
+        auto ids = tokenizeText(prompt.substr(pos, end - pos));
+        finalTokens.insert(finalTokens.end(), ids.begin(), ids.end());
       }
-      else if (!chunks[i].empty())
-      {
-        // Tokenize text chunk using Ortx
-        const char* inputTexts[] = {chunks[i].c_str()};
-        OrtxTokenId2DArray* tokenArray = nullptr;
-
-        extError_t result
-            = OrtxTokenize(tokenizer, inputTexts, 1, &tokenArray);
-        if (result != kOrtxOK)
-        {
-          throw std::runtime_error(
-              fmt::format(
-                  "Tokenization failed: {}", OrtxGetLastErrorMessage()));
-        }
-
-        // Get tokens from the first sequence
-        const extTokenId_t* tokenData = nullptr;
-        size_t tokenCount = 0;
-        result = OrtxTokenId2DArrayGetItem(
-            tokenArray, 0, &tokenData, &tokenCount);
-        if (result != kOrtxOK)
-        {
-          OrtxDispose((OrtxObject**)&tokenArray);
-          throw std::runtime_error(
-              fmt::format(
-                  "Failed to get tokens: {}", OrtxGetLastErrorMessage()));
-        }
-
-        // Handle BOS token - only add at the very beginning
-        size_t startIdx = 0;
-        if (i == 0 && tokenCount > 0
-            && tokenData[0] == FastVLMTokenizerConstants::BOS_TOKEN_ID)
-        {
-          finalTokens.push_back(static_cast<int64_t>(tokenData[0]));
-          startIdx = 1;
-        }
-
-        for (size_t j = startIdx; j < tokenCount; ++j)
-        {
-          finalTokens.push_back(static_cast<int64_t>(tokenData[j]));
-        }
-
-        OrtxDispose((OrtxObject**)&tokenArray);
-      }
+      if (imagePos == std::string::npos)
+        break;
+      finalTokens.push_back(imageTokenId);
+      pos = imagePos + imageToken.size();
     }
-
     return finalTokens;
   }
   catch (const std::exception& e)
@@ -546,13 +558,40 @@ FastVLMInference::tokenizeImagePrompt(const std::string& prompt) const
 std::string
 FastVLMInference::createPromptTemplate(std::string_view userPrompt) const
 {
+  const std::string content = imageToken + "\n" + std::string(userPrompt);
+  const std::string messages
+      = nlohmann::json::array({{{"role", "user"}, {"content", content}}})
+            .dump();
+
+  OrtxTensorResult* result{};
+  if (OrtxApplyChatTemplate(
+          tokenizer, nullptr, messages.c_str(), nullptr, &result,
+          /*add_generation_prompt=*/true, /*tokenize=*/false)
+      == kOrtxOK)
+  {
+    std::string text;
+    OrtxTensor* tensor{};
+    if (OrtxTensorResultGetAt(result, 0, &tensor) == kOrtxOK)
+    {
+      const char* data{};
+      if (OrtxGetTensorData(
+              tensor, reinterpret_cast<const void**>(&data), nullptr, nullptr)
+              == kOrtxOK
+          && data)
+        text = data;
+    }
+    OrtxDispose((OrtxObject**)&result);
+    if (!text.empty())
+      return text;
+  }
+
   return fmt::format(
       "<|im_start|>system\n"
       "You are a helpful assistant.<|im_end|>\n"
       "<|im_start|>user\n"
-      "<image>\n{}<|im_end|>\n"
+      "{}<|im_end|>\n"
       "<|im_start|>assistant\n",
-      userPrompt);
+      content);
 }
 
 std::vector<float> FastVLMInference::createMultimodalEmbeddings(
@@ -582,7 +621,7 @@ std::vector<float> FastVLMInference::createMultimodalEmbeddings(
 
     for (int64_t id : tokenIds)
     {
-      if (id == FastVLMTokenizerConstants::IMAGE_TOKEN_INDEX)
+      if (id == imageTokenId)
       {
         flushSegment();
         multimodalEmbeddings.insert(
@@ -684,38 +723,61 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
           kvType);
     };
 
-    // Create initial tensors using helper functions
-    auto embedsTensor = createEmbedsTensor(embeddings, seqLen);
-    auto attentionTensor = createAttentionTensor(seqLen);
-
-    reusablePositionIds.resize(seqLen);
-    std::iota(reusablePositionIds.begin(), reusablePositionIds.end(), 0);
-    auto positionTensor = createPositionTensor();
-
-    // Prepare inputs vector with the three main inputs
-    std::vector<Ort::Value> inputs;
-    inputs.push_back(std::move(embedsTensor));
-    inputs.push_back(std::move(attentionTensor));
-    inputs.push_back(std::move(positionTensor));
-
-    // Create empty KV cache tensors for every layer
+    // One decoder step: `embeds` holds `n` new positions starting at
+    // `firstPos`, after `firstPos` cached ones (none on the first step).
     std::vector<std::byte> emptyCache;
-    std::vector<int64_t> emptyCacheShape = {1, kvHeads, 0, headDim};
-    for (int layer = 0; layer < numLayers; ++layer)
+    const std::vector<int64_t> emptyCacheShape = {1, kvHeads, 0, headDim};
+    int64_t logitsToKeep = 1;
+    std::vector<Ort::Value> inputs;
+    auto runStep = [&](std::span<float> embeds, size_t n, int64_t firstPos)
     {
-      inputs.push_back(createKVCacheTensor(emptyCache, emptyCacheShape));
-      inputs.push_back(createKVCacheTensor(emptyCache, emptyCacheShape));
-    }
+      const bool first = firstPos == 0;
+      inputs.clear();
+      for (const auto& slot : decoderSlots)
+      {
+        switch (slot.role)
+        {
+          case DecoderInput::Embeds:
+            inputs.push_back(createEmbedsTensor(embeds, n));
+            break;
+          case DecoderInput::Mask:
+            inputs.push_back(createAttentionTensor(firstPos + n));
+            break;
+          case DecoderInput::Positions:
+            reusablePositionIds.resize(n);
+            std::iota(
+                reusablePositionIds.begin(), reusablePositionIds.end(),
+                firstPos);
+            inputs.push_back(createPositionTensor());
+            break;
+          case DecoderInput::LogitsToKeep:
+            inputs.push_back(Ort::Value::CreateTensor<int64_t>(
+                memoryInfo, &logitsToKeep, 1, nullptr, 0));
+            break;
+          case DecoderInput::Key:
+            inputs.push_back(
+                first ? createKVCacheTensor(emptyCache, emptyCacheShape)
+                      : createKVCacheTensor(
+                          keyCache[slot.layer], cacheShapes[slot.layer]));
+            break;
+          case DecoderInput::Value:
+            inputs.push_back(
+                first ? createKVCacheTensor(emptyCache, emptyCacheShape)
+                      : createKVCacheTensor(
+                          valueCache[slot.layer], cacheShapes[slot.layer]));
+            break;
+        }
+      }
+      return decoderSession->Run(
+          Ort::RunOptions{nullptr},
+          decoderInputNamePtrs.data(),
+          inputs.data(),
+          inputs.size(),
+          decoderOutputNamePtrs.data(),
+          decoderOutputNamePtrs.size());
+    };
 
-    // Run the decoder
-    auto outputs = decoderSession->Run(
-        Ort::RunOptions{nullptr},
-        decoderInputNamePtrs.data(),
-        inputs.data(),
-        std::min(inputs.size(), decoderInputNamePtrs.size()),
-        decoderOutputNamePtrs.data(),
-        decoderOutputNamePtrs.size());
-
+    auto outputs = runStep(embeddings, seqLen, 0);
     if (outputs.empty())
     {
       return {};
@@ -804,7 +866,7 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
     {
       for (int layer = 0; layer < numLayers; ++layer)
       {
-        auto& keyTensor = outs[1 + layer * 2]; // present.{layer}.key
+        auto& keyTensor = outs[presentKeyOutput[layer]];
         const auto keyInfo = keyTensor.GetTensorTypeAndShapeInfo();
         const auto keyShape = keyInfo.GetShape();
         const std::size_t bytes = keyInfo.GetElementCount() * kvElemSize;
@@ -814,23 +876,27 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
         keyCache[layer].assign(keyData, keyData + bytes);
         cacheShapes[layer].assign(keyShape.begin(), keyShape.end());
 
-        auto& valueTensor = outs[1 + layer * 2 + 1]; // present.{layer}.value
+        auto& valueTensor = outs[presentValueOutput[layer]];
+        const std::size_t valueBytes
+            = valueTensor.GetTensorTypeAndShapeInfo().GetElementCount()
+              * kvElemSize;
         const auto* valueData
             = static_cast<const std::byte*>(valueTensor.GetTensorRawData());
-        valueCache[layer].assign(valueData, valueData + bytes);
+        valueCache[layer].assign(valueData, valueData + valueBytes);
       }
     };
-
-    auto [bestToken, maxLogit] = sampleToken(outputs[0]);
-
-    // Store the generated tokens
-    std::vector<int64_t> generatedTokens = {bestToken};
-
-    // Check for EOS token
-    if (bestToken == FastVLMTokenizerConstants::EOS_TOKEN_ID)
+    auto isStop = [this](int64_t token)
     {
+      return std::find(stopTokenIds.begin(), stopTokenIds.end(), token)
+             != stopTokenIds.end();
+    };
+
+    auto [bestToken, maxLogit] = sampleToken(outputs[logitsOutput]);
+
+    std::vector<int64_t> generatedTokens;
+    if (isStop(bestToken))
       return generatedTokens;
-    }
+    generatedTokens.push_back(bestToken);
 
     // Store KV cache from first generation step
     storeKVCache(outputs);
@@ -841,48 +907,16 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
       // Get embedding for the new token
       auto tokenEmbedding = runEmbedTokens({&bestToken, 1});
 
-      // Create inputs for next step using helper functions
-      std::vector<Ort::Value>& nextInputs = inputs;
-      nextInputs.clear();
-
-      nextInputs.push_back(createEmbedsTensor(tokenEmbedding, 1));
-
-      size_t currentSeqLen = seqLen + step;
-      nextInputs.push_back(createAttentionTensor(currentSeqLen));
-
-      reusablePositionIds.clear();
-      reusablePositionIds.push_back(static_cast<int64_t>(seqLen + step - 1));
-      nextInputs.push_back(createPositionTensor());
-
-      // Add KV cache from previous step
-      for (int layer = 0; layer < numLayers; ++layer)
-      {
-        nextInputs.push_back(
-            createKVCacheTensor(keyCache[layer], cacheShapes[layer]));
-        nextInputs.push_back(
-            createKVCacheTensor(valueCache[layer], cacheShapes[layer]));
-      }
-
-      // Run decoder for next token
-      auto nextOutputs = decoderSession->Run(
-          Ort::RunOptions{nullptr},
-          decoderInputNamePtrs.data(),
-          nextInputs.data(),
-          std::min(nextInputs.size(), decoderInputNamePtrs.size()),
-          decoderOutputNamePtrs.data(),
-          decoderOutputNamePtrs.size());
+      auto nextOutputs = runStep(
+          tokenEmbedding, 1, static_cast<int64_t>(seqLen + step - 1));
 
       // Get next token from logits using temperature sampling
-      auto [nextBestToken, nextMaxLogit] = sampleToken(nextOutputs[0]);
+      auto [nextBestToken, nextMaxLogit]
+          = sampleToken(nextOutputs[logitsOutput]);
       bestToken = nextBestToken;
-
-      generatedTokens.push_back(bestToken);
-
-      // Check for EOS token
-      if (bestToken == FastVLMTokenizerConstants::EOS_TOKEN_ID)
-      {
+      if (isStop(bestToken))
         break;
-      }
+      generatedTokens.push_back(bestToken);
 
       // Update KV cache for next iteration
       storeKVCache(nextOutputs);

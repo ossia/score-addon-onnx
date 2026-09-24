@@ -45,7 +45,11 @@ private:
   std::vector<float> runEmbedTokens(std::span<int64_t> tokenIds);
   std::string decodeTokens(std::span<int64_t> tokens) const;
 
+  // The model's own chat template (tokenizer_config.json /
+  // chat_template.jinja) applied to one user message with the image
+  // placeholder in front; Qwen2 ChatML when it ships none.
   std::string createPromptTemplate(std::string_view userPrompt) const;
+  std::vector<int64_t> tokenizeText(const std::string& text) const;
 
   std::vector<float> createMultimodalEmbeddings(
       std::span<int64_t> tokenIds,
@@ -66,6 +70,43 @@ private:
   OrtxTokenizer* tokenizer{};
 
   boost::container::vector<float> tensorValues;
+
+  // From the files next to the tokenizer (config.json,
+  // generation_config.json, processor_config.json); the defaults are
+  // FastVLM's (LLaVA-Qwen2) values.
+  std::string imageToken{"<image>"};
+  int64_t imageTokenId{151646}; // a sentinel past the vocabulary
+  std::vector<int64_t> stopTokenIds{151645};
+
+public:
+  const std::string& imagePlaceholder() const noexcept { return imageToken; }
+  int64_t imagePlaceholderId() const noexcept { return imageTokenId; }
+  std::span<const int64_t> stopTokens() const noexcept { return stopTokenIds; }
+  std::string promptFor(std::string_view userPrompt) const
+  {
+    return createPromptTemplate(userPrompt);
+  }
+
+private:
+  // Every decoder input is bound by name: exports differ in which of
+  // position_ids / num_logits_to_keep they have, and in their order.
+  enum class DecoderInput : uint8_t
+  {
+    Embeds,       // inputs_embeds
+    Mask,         // attention_mask
+    Positions,    // position_ids
+    LogitsToKeep, // num_logits_to_keep
+    Key,          // past_key_values.N.key
+    Value,        // past_key_values.N.value
+  };
+  struct DecoderSlot
+  {
+    DecoderInput role{};
+    int layer = -1;
+  };
+  std::vector<DecoderSlot> decoderSlots;
+  int logitsOutput = 0;
+  std::vector<int> presentKeyOutput, presentValueOutput; // per layer
 
   // Decoder graph properties discovered at load time.
   int numLayers{};

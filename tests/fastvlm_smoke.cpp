@@ -86,6 +86,26 @@ int main(int argc, char** argv)
       Onnx::FastVLMInference vlm(vision, embed, decoder, tokenizer.string());
       auto t1 = clk::now();
 
+      // BUG-LEDGER F1: the ids and the template come from the model's files.
+      // For FastVLM they must equal the values that used to be hard-coded.
+      if (root.filename().string().starts_with("FastVLM"))
+      {
+        const bool ids = vlm.imagePlaceholder() == "<image>"
+                         && vlm.imagePlaceholderId() == 151646
+                         && vlm.stopTokens().size() == 1
+                         && vlm.stopTokens()[0] == 151645;
+        const bool tmpl
+            = vlm.promptFor("Q?")
+              == "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+                 "<|im_start|>user\n<image>\nQ?<|im_end|>\n"
+                 "<|im_start|>assistant\n";
+        std::printf(
+            "    config ids %s, chat template %s\n", ids ? "ok" : "DIFFER",
+            tmpl ? "ok" : "DIFFERS");
+        if (!ids || !tmpl)
+          ++failures;
+      }
+
       std::string response
           = vlm.generateResponse(image, "What colors do you see?", 0.f);
       auto t2 = clk::now();
