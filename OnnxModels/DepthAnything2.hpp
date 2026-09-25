@@ -19,7 +19,7 @@ struct DepthAnythingV2 : OnnxObject
 {
 public:
   halp_meta(name, "Depth Anything v2");
-  halp_meta(c_name, "emotionnet");
+  halp_meta(c_name, "depthanything2");
   halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "Depth Anything authors, Onnxruntime");
   halp_meta(description, "Estimate depth from an RGB image.");

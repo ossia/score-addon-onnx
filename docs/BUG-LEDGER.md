@@ -216,7 +216,7 @@ Status: `open` unless noted.
   - The PAF link topology in `Trt.hpp:62-91` is wrong for NVIDIA trt_pose. It should be link k = channels (2k+1, 2k) with the official skeleton. On a test image this took keypoints from 8 to 15; a patched header is in the scratchpad.
   - The threshold sliders' maximums are too low (0.05 / 0.01, vs trt_pose's 0.1 / 0.1).
 - **Depth Anything v2:**
-  - `c_name "emotionnet"` (hpp:22).
+  - `c_name "emotionnet"` (hpp:22): **fixed**, now `depthanything2` like its CMake registration.
   - The ×16 output scale is fixed and saturates ViT-B.
   - Knob/shape mismatch.
 - **Image-to-Image GAN:**
