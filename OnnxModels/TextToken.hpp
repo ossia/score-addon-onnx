@@ -66,8 +66,54 @@ struct TokenAuxPlan
 // heap-allocated and recycled through the lock-free JobPool (only the
 // unique_ptr crosses the queue; recycled vectors keep their capacity, so the
 // steady-state request path does not allocate). See OnnxModels/JobPool.hpp.
+struct TtsUtterance
+{
+  std::vector<float> samples;
+  int channels = 0;
+  std::size_t frames = 0;
+  std::size_t pos = 0;
+};
+
+// What the node's model resolves to: the session, the token input and the
+// aux plans, the output routing and rate, the voices of a style TTS. Built by
+// a worker job (the session and a sibling voices.bin are read from disk
+// there), never on the audio thread; the audio thread swaps it in and hands
+// the old one back to the worker to be freed.
+struct TokenPipeline
+{
+  std::string path;
+  double host_rate = 48000.0;
+  std::shared_ptr<Onnx::OnnxRunContext> ctx;
+  Onnx::ModelSpec spec;
+  Onnx::ModelArchetype arch;
+  bool refused = false; // autoregressive, or inputs it cannot build: no-op
+
+  int token_index = -1;
+  int wave_out_index = -1;
+  bool produces_audio = false;
+  Onnx::TokenInput token_in;
+  Onnx::WaveformShape out_shape;
+  double model_rate = 22050.0;
+  std::vector<TokenAuxPlan> aux;
+  int style_rows = 1, style_dim = 0;
+  std::vector<float> sibling_voices; // voices.bin next to the model
+};
+
 struct TokenInferJob
 {
+  // Infer runs the model; Build makes a pipeline for `build_path`; Dispose
+  // frees `pipeline` and `utterance` here, off the audio thread.
+  enum class Kind : uint8_t
+  {
+    Infer,
+    Build,
+    Dispose
+  } kind = Kind::Infer;
+  std::string build_path;
+  double build_host_rate = 48000.0;
+  std::shared_ptr<TokenPipeline> pipeline;
+  TtsUtterance utterance;
+
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   std::vector<int64_t> tokens;      // assembled int64 token ids
   std::vector<int64_t> token_shape; // [1,L] or [L]
@@ -89,14 +135,6 @@ struct TokenInferJob
 // A synthesised utterance at host rate, planar [channel][frame], played once.
 // It is built whole on the worker and swapped in, so it has no size limit and
 // playing it does not allocate.
-struct TtsUtterance
-{
-  std::vector<float> samples;
-  int channels = 0;
-  std::size_t frames = 0;
-  std::size_t pos = 0;
-};
-
 struct TextToken : OnnxObject
 {
 public:
@@ -159,55 +197,28 @@ public:
   } worker;
 
 private:
-  std::shared_ptr<Onnx::OnnxRunContext> ctx;
-  Onnx::ModelSpec spec;
-  Onnx::ModelArchetype arch;
-  std::string lastModelPath;
+  std::shared_ptr<TokenPipeline> pipe;
+  bool building = false;
+  std::string requested; // the file the last build was for
   bool inferenceInProgress = false;
-  bool refused = false; // autoregressive -> permanently no-op this model
 
-  // Host audio config (from prepare()).
   double host_rate = 48000.0;
   std::size_t max_frames = 4096;
 
-  // Resolved model I/O.
-  int token_index = -1;
-  int wave_out_index = -1;
-  bool produces_audio = false;
-  Onnx::TokenInput token_in;
-  Onnx::WaveformShape out_shape;
-  double model_rate = 22050.0;
-  std::vector<TokenAuxPlan> aux;
-
   TtsUtterance utterance; // the one playing
   std::vector<int64_t> token_buf; // assembled int64 token ids
-  // Dispatch state. The model runs when the ids change or on Reset, once per
-  // request: last_tokens is committed on dispatch, a request made while a job
-  // is in flight waits for it (latest wins), and each request bumps gen so a
-  // result it superseded is dropped.
   std::vector<int> last_tokens;
   bool pending = false;
   uint32_t gen = 0;
 
-  // Style-conditioned TTS: `style_rows` rows of `style_dim` floats per voice
-  // (Kokoro: 511 rows, indexed by the token count; Kitten: 1).
-  int style_rows = 1, style_dim = 0;
-  std::vector<float> sibling_voices; // voices.bin next to the model
   std::vector<float> style_buf;
   bool styleFor(int64_t token_count);
 
-  // Per-input owned backing buffers so each Ort::Value references a distinct,
-  // alive store for the whole infer() call (reused across frames).
-  std::vector<std::vector<int64_t>> aux_int_bufs;
-  std::vector<std::vector<float>> aux_flt_bufs;
-  std::vector<std::vector<uint8_t>> int_narrow_bufs; // int32/bool/... copies
-  std::vector<float> out_scratch; // dtype->float for the audio output
-
-  void reloadModel();
-  void resolveIO();
+  void requestBuild();
+  void install(std::shared_ptr<TokenPipeline> p);
+  void dispose(std::shared_ptr<TokenPipeline> p, TtsUtterance u);
   float paramValue(int idx) const;
-  void run();
-  void dispatchInfer(int64_t token_len, bool force_async);
+  void dispatchInfer(int64_t token_len);
   void playUtterance(int frames);
 };
 

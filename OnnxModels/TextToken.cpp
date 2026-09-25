@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <span>
+#include <stdexcept>
 #include <utility>
 
 namespace OnnxModels
@@ -225,46 +226,53 @@ void TextToken::prepare(halp::setup info)
 {
   host_rate = info.rate > 0 ? info.rate : 48000.0;
   max_frames = info.frames > 0 ? (std::size_t)info.frames : 4096;
-  // Force re-resolution of the audio pipeline against the new host config.
-  lastModelPath.clear();
-  ctx.reset();
+  // The utterances are resampled to host_rate in the jobs: nothing to rebuild.
 }
 
-void TextToken::reloadModel()
+static void resolveTokenIO(TokenPipeline& P);
+
+// Worker side of a model change: the session (from the file, since the
+// port's mapping may be gone by now), the routing, the voices.
+static std::shared_ptr<TokenPipeline>
+makeTokenPipeline(const std::string& path, double host_rate)
 {
-  ctx = std::make_shared<Onnx::OnnxRunContext>(
-      inputs.model.file.bytes, inputs.model.file.filename);
-  spec = ctx->readModelSpec();
-  const auto io = toArchIO(spec);
-  arch = Onnx::classifyModel(io);
+  auto pp = std::make_shared<TokenPipeline>();
+  auto& P = *pp;
+  P.path = path;
+  P.host_rate = host_rate;
+  {
+    std::ifstream f(path, std::ios::binary);
+    if(!f)
+      throw std::runtime_error("cannot read the file");
+    const std::string bytes{std::istreambuf_iterator<char>(f), {}};
+    P.ctx = std::make_shared<Onnx::OnnxRunContext>(bytes, path);
+  }
+  P.spec = P.ctx->readModelSpec();
+  const auto io = toArchIO(P.spec);
+  P.arch = Onnx::classifyModel(io);
 
   // REFUSE autoregressive decode loops (KV-cache / past_* inputs, or a state
   // carried from an output back to an input: Tacotron2's decoder_iter,
   // pocket-tts): a single forward cannot drive their per-token decode.
-  refused = Onnx::isAutoregressive(io) || arch.stateful;
+  P.refused = Onnx::isAutoregressive(io) || P.arch.stateful;
 
-  lastModelPath = inputs.model.file.filename;
-  last_tokens.clear();
-  pending = false;
-  ++gen; // a job still running on the previous model is dropped
-  utterance.pos = utterance.frames;
-  if(!refused)
-    resolveIO();
+  if(!P.refused)
+    resolveTokenIO(P);
 
   // A style-conditioned TTS reads its voices; which shape they have is in the
   // metadata (style_dim "1,256" or "511,1,256").
-  style_rows = 1;
-  style_dim = 0;
-  sibling_voices.clear();
-  for(const auto& p : aux)
+  P.style_rows = 1;
+  P.style_dim = 0;
+  P.sibling_voices.clear();
+  for(const auto& p : P.aux)
     if(p.role == AuxRole::Style)
-      style_dim = (int)flatPositive(p.shape);
-  if(style_dim > 0)
+      P.style_dim = (int)flatPositive(p.shape);
+  if(P.style_dim > 0)
   {
     try
     {
       Ort::AllocatorWithDefaultOptions alloc;
-      auto meta = ctx->session.GetModelMetadata();
+      auto meta = P.ctx->session.GetModelMetadata();
       if(auto v = meta.LookupCustomMetadataMapAllocated("style_dim", alloc))
       {
         std::vector<int> dims;
@@ -277,13 +285,12 @@ void TextToken::reloadModel()
             break;
         }
         if(dims.size() == 3 && dims[0] > 0)
-          style_rows = dims[0];
+          P.style_rows = dims[0];
       }
     }
     catch(...)
     {
     }
-    const std::string path{inputs.model.file.filename};
     const auto slash = path.find_last_of("/\\");
     std::ifstream f(
         (slash == std::string::npos ? std::string{} : path.substr(0, slash + 1))
@@ -292,45 +299,46 @@ void TextToken::reloadModel()
     if(f)
     {
       const std::string raw{std::istreambuf_iterator<char>(f), {}};
-      sibling_voices.resize(raw.size() / sizeof(float));
-      std::memcpy(sibling_voices.data(), raw.data(), sibling_voices.size() * sizeof(float));
+      P.sibling_voices.resize(raw.size() / sizeof(float));
+      std::memcpy(P.sibling_voices.data(), raw.data(), P.sibling_voices.size() * sizeof(float));
     }
   }
 
   // Nor a model with an input the node cannot synthesise: it only makes
   // scalars, small vectors and token-shaped masks, not a [.,.,288] encoder
   // output (moonshine) or Tacotron's memory.
-  if(!refused)
-    for(int i = 0; i < (int)spec.inputs.size(); ++i)
-      if(i != token_index && spec.inputs[i].shape.size() >= 3)
+  if(!P.refused)
+    for(int i = 0; i < (int)P.spec.inputs.size(); ++i)
+      if(i != P.token_index && P.spec.inputs[i].shape.size() >= 3)
       {
-        refused = true;
+        P.refused = true;
         break;
       }
-  if(refused)
+  if(P.refused)
     std::fprintf(
         stderr,
         "Text Token Processor: %s is an autoregressive decoder or needs inputs "
         "this node cannot build; not run\n",
-        std::string(inputs.model.file.filename).c_str());
+        path.c_str());
+  return pp;
 }
 
 // Find the token input, the output to route (waveform -> audio, else -> data),
 // classify every non-token input into an aux plan, and map the 4 Params onto
 // the scale / speaker / length aux roles.
-void TextToken::resolveIO()
+static void resolveTokenIO(TokenPipeline& P)
 {
-  token_index = -1;
-  wave_out_index = -1;
-  aux.clear();
+  P.token_index = -1;
+  P.wave_out_index = -1;
+  P.aux.clear();
 
   // Primary token input: prefer a TokenSeq archetype, else the first int input,
   // else input 0.
-  for(int i = 0; i < (int)arch.inputs.size(); ++i)
+  for(int i = 0; i < (int)P.arch.inputs.size(); ++i)
   {
-    if(arch.inputs[i].arch == PortArchetype::TokenSeq)
+    if(P.arch.inputs[i].arch == PortArchetype::TokenSeq)
     {
-      token_index = i;
+      P.token_index = i;
       break;
     }
   }
@@ -338,45 +346,45 @@ void TextToken::resolveIO()
   // (lengths / sid). This catches dynamic-length token inputs ([1,-1]) that
   // classifyPort tags Latent because their flat size collapses to 1 — a real
   // and common VITS/Piper export (see docs/texttoken-PLAN.md, classifier gap).
-  if(token_index < 0)
+  if(P.token_index < 0)
   {
-    for(int i = 0; i < (int)spec.inputs.size(); ++i)
+    for(int i = 0; i < (int)P.spec.inputs.size(); ++i)
     {
       // A bool tensor is a mask, never the ids.
-      if(!isIntDtype(spec.inputs[i].elem_type)
-         || spec.inputs[i].elem_type == TensorElemType::Bool)
+      if(!isIntDtype(P.spec.inputs[i].elem_type)
+         || P.spec.inputs[i].elem_type == TensorElemType::Bool)
         continue;
-      if(spec.inputs[i].shape.size() > 2)
+      if(P.spec.inputs[i].shape.size() > 2)
         continue;
       const auto r = Onnx::classifyAux(
-          spec.inputs[i].name, spec.inputs[i].shape, spec.inputs[i].elem_type);
+          P.spec.inputs[i].name, P.spec.inputs[i].shape, P.spec.inputs[i].elem_type);
       if(r == AuxRole::InputLength || r == AuxRole::SpeakerId
          || r == AuxRole::Mask || r == AuxRole::TokenTypes)
         continue; // these are aux inputs, not the token sequence
-      token_index = i;
+      P.token_index = i;
       break;
     }
   }
-  if(token_index < 0)
-    token_index = 0;
+  if(P.token_index < 0)
+    P.token_index = 0;
 
-  token_in = Onnx::TokenInput::fromInputShape(spec.inputs[token_index].shape);
+  P.token_in = Onnx::TokenInput::fromInputShape(P.spec.inputs[P.token_index].shape);
 
   // Aux plans for every other input.
   int next_param = 0; // Param 1..4 round-robin for unmapped scale-like roles
   auto takeParam = [&]() -> int
   { return (next_param < 4) ? next_param++ : -1; };
 
-  for(int i = 0; i < (int)spec.inputs.size(); ++i)
+  for(int i = 0; i < (int)P.spec.inputs.size(); ++i)
   {
-    if(i == token_index)
+    if(i == P.token_index)
       continue;
     TokenAuxPlan p;
     p.model_index = i;
-    p.dtype = spec.inputs[i].elem_type;
-    p.shape = resolveShape(spec.inputs[i].shape);
+    p.dtype = P.spec.inputs[i].elem_type;
+    p.shape = resolveShape(P.spec.inputs[i].shape);
     p.role = Onnx::classifyAux(
-        spec.inputs[i].name, spec.inputs[i].shape, p.dtype);
+        P.spec.inputs[i].name, P.spec.inputs[i].shape, p.dtype);
 
     switch(p.role)
     {
@@ -414,31 +422,31 @@ void TextToken::resolveIO()
         p.param_index = -1;
         break;
     }
-    aux.push_back(std::move(p));
+    P.aux.push_back(std::move(p));
   }
 
   // Output routing: honour an explicit task override; else classify output 0.
-  produces_audio = false;
-  wave_out_index = 0;
-  for(int o = 0; o < (int)spec.outputs.size(); ++o)
+  P.produces_audio = false;
+  P.wave_out_index = 0;
+  for(int o = 0; o < (int)P.spec.outputs.size(); ++o)
   {
     const auto r = Onnx::classifyTokenOutput(
-        spec.outputs[o].name, spec.outputs[o].shape, spec.outputs[o].elem_type);
+        P.spec.outputs[o].name, P.spec.outputs[o].shape, P.spec.outputs[o].elem_type);
     if(r == TokenOutputRole::Waveform)
     {
-      produces_audio = true;
-      wave_out_index = o;
+      P.produces_audio = true;
+      P.wave_out_index = o;
       break;
     }
   }
 
-  if(produces_audio)
+  if(P.produces_audio)
   {
-    out_shape
-        = Onnx::WaveformShape::fromInputShape(spec.outputs[wave_out_index].shape);
-    if(out_shape.channels < 1)
-      out_shape.channels = 1;
-    model_rate = ttsRate(ctx->session, inputs.model.file.filename, arch);
+    P.out_shape
+        = Onnx::WaveformShape::fromInputShape(P.spec.outputs[P.wave_out_index].shape);
+    if(P.out_shape.channels < 1)
+      P.out_shape.channels = 1;
+    P.model_rate = ttsRate(P.ctx->session, P.path, P.arch);
   }
 }
 
@@ -454,25 +462,66 @@ float TextToken::paramValue(int idx) const
   }
 }
 
+void TextToken::requestBuild()
+{
+  building = true;
+  requested = std::string(inputs.model.file.filename);
+  auto job = JobPool<TokenInferJob>::instance().acquire();
+  job->kind = TokenInferJob::Kind::Build;
+  job->build_path = requested;
+  job->build_host_rate = host_rate;
+  worker.request(std::move(job));
+}
+
+// On the audio thread: the new model replaces the running one, which goes
+// back to the worker to be freed, with the utterance it was playing.
+void TextToken::install(std::shared_ptr<TokenPipeline> p)
+{
+  std::swap(pipe, p);
+  last_tokens.clear();
+  pending = false;
+  ++gen; // a job still running on the previous model is dropped
+  inferenceInProgress = false;
+  TtsUtterance old;
+  std::swap(old, utterance);
+  dispose(std::move(p), std::move(old));
+}
+
+void TextToken::dispose(std::shared_ptr<TokenPipeline> p, TtsUtterance u)
+{
+  if(!p && u.samples.empty())
+    return;
+  auto job = JobPool<TokenInferJob>::instance().acquire();
+  job->kind = TokenInferJob::Kind::Dispose;
+  job->pipeline = std::move(p);
+  job->utterance = std::move(u);
+  worker.request(std::move(job));
+}
+
 void TextToken::operator()(int frames)
 try
 {
-  if(!available)
-    return;
-  if(inputs.model.current_model_invalid)
-    return;
-  if(inputs.model.file.bytes.empty())
-    return;
-
-  if(!ctx || lastModelPath != inputs.model.file.filename)
+  auto silence = [&] {
+    for(int c = 0; c < outputs.audio.channels; ++c)
+      std::fill_n(outputs.audio.samples[c], frames, 0.f);
+  };
+  if(!available || inputs.model.current_model_invalid
+     || inputs.model.file.bytes.empty())
   {
-    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
-      return;
+    silence();
+    return;
   }
-  if(refused) // autoregressive: documented no-op
+
+  // A new file: its pipeline is built on the worker.
+  if(!building && (!pipe || pipe->path != inputs.model.file.filename)
+     && requested != inputs.model.file.filename)
+    requestBuild();
+  if(!pipe || pipe->refused || pipe->spec.inputs.empty() || pipe->spec.outputs.empty())
+  {
+    silence();
     return;
-  if(spec.inputs.empty() || spec.outputs.empty())
-    return;
+  }
+  auto& P = *pipe;
 
   // Reset stops the utterance and runs the model again on the current ids.
   const auto& ids = inputs.tokens.value;
@@ -494,27 +543,26 @@ try
     const int64_t explicit_len
         = (inputs.length.value >= 0) ? (int64_t)inputs.length.value : -1;
     const int64_t L = Onnx::buildTokenTensor(
-        ids.data(), ids.size(), token_in, token_buf, explicit_len);
-    last_tokens = ids;
+        ids.data(), ids.size(), P.token_in, token_buf, explicit_len);
+    last_tokens.assign(ids.begin(), ids.end());
     pending = false;
 
     // A style-conditioned TTS without voices would only make noise.
-    if(style_dim > 0 && !styleFor((int64_t)ids.size()))
+    if(P.style_dim > 0 && !styleFor((int64_t)ids.size()))
     {
-      std::fprintf(
-          stderr, "Text Token Processor: %s needs a voices file (Voices port)\n",
-          std::string(inputs.model.file.filename).c_str());
+      failures.failed(name(), P.path, "needs a voices file (Voices port)");
       return;
     }
 
-    // Heavy TTS runs async; lightweight text encoders run inline.
-    const bool heavy = produces_audio
-                       || inputs.model.file.bytes.size() > 32u * 1024 * 1024;
-    dispatchInfer(L, heavy);
+    // Every model runs on the worker: a text encoder's result reaches Data a
+    // tick later, and nothing heavy runs on the audio thread.
+    dispatchInfer(L);
   }
 
-  if(produces_audio)
+  if(P.produces_audio)
     playUtterance(frames);
+  else
+    silence();
 }
 catch(const std::exception& e)
 {
@@ -531,20 +579,21 @@ catch(...)
 // voice; with several rows (Kokoro) the row follows the token count.
 bool TextToken::styleFor(int64_t token_count)
 {
+  const auto& P = *pipe;
   std::span<const float> voices;
   const auto& file = inputs.voices.file.bytes;
   if(file.size() >= sizeof(float))
     voices = {reinterpret_cast<const float*>(file.data()), file.size() / sizeof(float)};
   else
-    voices = sibling_voices;
-  const std::size_t per_voice = (std::size_t)style_rows * style_dim;
-  if(style_dim <= 0 || voices.size() < per_voice)
+    voices = P.sibling_voices;
+  const std::size_t per_voice = (std::size_t)P.style_rows * P.style_dim;
+  if(P.style_dim <= 0 || voices.size() < per_voice)
     return false;
   const int nvoices = (int)(voices.size() / per_voice);
   const int v = std::clamp((int)std::lround(inputs.param4.value), 0, nvoices - 1);
-  const int r = style_rows > 1 ? (int)std::min<int64_t>(token_count, style_rows - 1) : 0;
-  const float* row = voices.data() + (std::size_t)v * per_voice + (std::size_t)r * style_dim;
-  style_buf.assign(row, row + style_dim);
+  const int r = P.style_rows > 1 ? (int)std::min<int64_t>(token_count, P.style_rows - 1) : 0;
+  const float* row = voices.data() + (std::size_t)v * per_voice + (std::size_t)r * P.style_dim;
+  style_buf.assign(row, row + P.style_dim);
   return true;
 }
 
@@ -570,150 +619,41 @@ void TextToken::playUtterance(int frames)
   utterance.pos += n;
 }
 
-void TextToken::dispatchInfer(int64_t token_len, bool force_async)
+void TextToken::dispatchInfer(int64_t token_len)
 {
-  if(force_async)
-  {
-    if(inferenceInProgress)
-      return;
-    inferenceInProgress = true;
-    // Pooled job: lock-free acquire; recycled vectors keep their capacity so
-    // the assignments below don't allocate in steady state.
-    auto job = JobPool<TokenInferJob>::instance().acquire();
-    job->ctx = ctx;
-    job->tokens = token_buf;
-    job->token_shape = token_in.tensorShape((int64_t)token_buf.size());
-    job->token_index = token_index;
-    job->token_len = token_len;
-    job->aux = aux;
-    // The job is recycled: size (not push_back onto) the stale vector.
-    job->aux_values.resize(aux.size());
-    for(std::size_t k = 0; k < aux.size(); ++k)
-      job->aux_values[k] = aux[k].param_index >= 0
-                               ? paramValue(aux[k].param_index)
-                               : aux[k].default_value;
-    job->wave_out_index = wave_out_index;
-    job->data_out_index = 0;
-    job->produces_audio = produces_audio;
-    // Snapshot all three VITS scales so the async Scales path doesn't drop
-    // Params 2/3 (the sync path fills them; TTS is always async, so without
-    // this the packed-scales models would run with length/noise_w hardcoded).
-    job->scales[0] = inputs.param1.value;
-    job->scales[1] = inputs.param2.value;
-    job->scales[2] = inputs.param3.value;
-    job->out_shape = out_shape;
-    job->model_rate = model_rate;
-    job->host_rate = host_rate;
-    job->gen = gen;
-    job->style.assign(style_buf.begin(), style_buf.end());
-    worker.request(std::move(job));
+  if(inferenceInProgress)
     return;
-  }
-
-  // --- synchronous inference (build all model inputs incl. aux scalars) -----
-  const int nin = (int)spec.inputs.size();
-  std::vector<Ort::Value> ins;
-  ins.reserve(nin);
-  aux_int_bufs.assign(nin, {});
-  aux_flt_bufs.assign(nin, {});
-  int_narrow_bufs.resize(nin);
-
-  auto token_shape = token_in.tensorShape((int64_t)token_buf.size());
-
-  for(int i = 0; i < nin; ++i)
-  {
-    if(i == token_index)
-    {
-      ins.emplace_back(intTensor(
-          spec.inputs[i].elem_type, token_buf, token_shape, int_narrow_bufs[i]));
-      continue;
-    }
-    // Find the aux plan for this input.
-    const TokenAuxPlan* plan = nullptr;
-    for(auto& p : aux)
-      if(p.model_index == i)
-      {
-        plan = &p;
-        break;
-      }
-    std::vector<int64_t> sh = plan ? plan->shape : resolveShape(spec.inputs[i].shape);
-    if(plan && tokenShaped(plan->role) && sh.size() == token_shape.size())
-      sh = token_shape;
-    const TensorElemType dt = spec.inputs[i].elem_type;
-    const int64_t cnt = flatPositive(sh);
-
-    if(isIntDtype(dt))
-    {
-      auto& buf = aux_int_bufs[i];
-      buf.assign((std::size_t)cnt, 0);
-      if(plan && plan->role == AuxRole::Mask)
-        std::fill(buf.begin(), buf.end(), 1);
-      else if(plan && plan->role == AuxRole::TokenTypes)
-        ; // zeros
-      else if(plan && plan->role == AuxRole::InputLength)
-        std::fill(buf.begin(), buf.end(), token_len);
-      else if(plan && plan->param_index >= 0)
-        buf[0] = (int64_t)std::lround(paramValue(plan->param_index));
-      else if(plan)
-        buf[0] = (int64_t)std::lround(plan->default_value);
-      ins.emplace_back(intTensor(dt, buf, sh, int_narrow_bufs[i]));
-    }
-    else
-    {
-      auto& buf = aux_flt_bufs[i];
-      buf.assign((std::size_t)cnt, 0.f);
-      if(plan && plan->role == AuxRole::Scales)
-      {
-        // Packed [noise, length, noise_w] from Params 1..3.
-        if(cnt >= 1) buf[0] = inputs.param1.value;
-        if(cnt >= 2) buf[1] = inputs.param2.value;
-        if(cnt >= 3) buf[2] = inputs.param3.value;
-      }
-      else if(plan && plan->role == AuxRole::Style)
-      {
-        std::copy_n(style_buf.begin(), std::min(style_buf.size(), buf.size()), buf.begin());
-      }
-      else if(plan && plan->param_index >= 0)
-      {
-        std::fill(buf.begin(), buf.end(), paramValue(plan->param_index));
-      }
-      else if(plan)
-      {
-        std::fill(buf.begin(), buf.end(), plan->default_value);
-      }
-      ins.emplace_back(Onnx::vec_to_tensor<float>(buf, sh));
-    }
-  }
-
-  const int nout = (int)spec.output_names_char.size();
-  std::vector<Ort::Value> outs;
-  outs.reserve(nout);
-  for(int i = 0; i < nout; ++i)
-    outs.emplace_back(nullptr);
-  ctx->infer(spec, ins, outs);
-  failures.succeeded();
-
-  // Route the chosen output.
-  const int idx = std::clamp(produces_audio ? wave_out_index : 0, 0, nout - 1);
-  auto& res = outs[idx];
-  const auto info = res.GetTensorTypeAndShapeInfo();
-  const auto osh = info.GetShape();
-  const int64_t ocnt = (int64_t)info.GetElementCount();
-  const TensorElemType odt = Onnx::fromOrtElementType(info.GetElementType());
-  const float* f
-      = Onnx::toFloat(res.GetTensorData<uint8_t>(), ocnt, odt, out_scratch);
-
-  if(produces_audio)
-  {
-    const Onnx::WaveformShape os = Onnx::WaveformShape::fromInputShape(osh);
-    const int oc = os.channels > 0 ? os.channels : out_shape.channels;
-    const int64_t on = (oc > 0) ? ocnt / oc : ocnt;
-    utterance = toHostRate(f, oc, on, model_rate, host_rate);
-  }
-  else
-  {
-    outputs.data.value.assign(f, f + ocnt);
-  }
+  const auto& P = *pipe;
+  inferenceInProgress = true;
+  // Pooled job: lock-free acquire; recycled vectors keep their capacity so
+  // the assignments below don't allocate in steady state.
+  auto job = JobPool<TokenInferJob>::instance().acquire();
+  job->kind = TokenInferJob::Kind::Infer;
+  job->ctx = P.ctx;
+  job->tokens = token_buf;
+  job->token_shape = P.token_in.tensorShape((int64_t)token_buf.size());
+  job->token_index = P.token_index;
+  job->token_len = token_len;
+  job->aux = P.aux;
+  // The job is recycled: size (not push_back onto) the stale vector.
+  job->aux_values.resize(P.aux.size());
+  for(std::size_t k = 0; k < P.aux.size(); ++k)
+    job->aux_values[k] = P.aux[k].param_index >= 0
+                             ? paramValue(P.aux[k].param_index)
+                             : P.aux[k].default_value;
+  job->wave_out_index = P.wave_out_index;
+  job->data_out_index = 0;
+  job->produces_audio = P.produces_audio;
+  // Snapshot all three VITS scales for the packed-scales models.
+  job->scales[0] = inputs.param1.value;
+  job->scales[1] = inputs.param2.value;
+  job->scales[2] = inputs.param3.value;
+  job->out_shape = P.out_shape;
+  job->model_rate = P.model_rate;
+  job->host_rate = host_rate;
+  job->gen = gen;
+  job->style.assign(style_buf.begin(), style_buf.end());
+  worker.request(std::move(job));
 }
 
 std::function<void(TextToken&)>
@@ -727,10 +667,53 @@ TextToken::worker::work(std::unique_ptr<TokenInferJob> job)
     ~Recycle()
     {
       if(j)
+      {
         j->ctx.reset(); // don't keep the ORT session alive from the pool
+        j->pipeline.reset();
+        j->utterance = {};
+        j->kind = TokenInferJob::Kind::Infer;
+      }
       JobPool<TokenInferJob>::instance().release(std::move(j));
     }
   } recycle{job};
+
+  if(job && job->kind == TokenInferJob::Kind::Dispose)
+  {
+    // The old session, pipeline and utterance are freed here.
+    job->pipeline.reset();
+    job->utterance = {};
+    return {};
+  }
+  if(job && job->kind == TokenInferJob::Kind::Build)
+  {
+    try
+    {
+      auto p = makeTokenPipeline(job->build_path, job->build_host_rate);
+      return [p = std::move(p)](TextToken& self) mutable
+      {
+        self.building = false;
+        if(p->path != self.inputs.model.file.filename)
+        {
+          self.requested.clear(); // another file was picked meanwhile
+          self.dispose(std::move(p), {});
+          return;
+        }
+        self.failures.succeeded();
+        self.install(std::move(p));
+      };
+    }
+    catch(const std::exception& e)
+    {
+      return [what = std::string(e.what()), path = job->build_path](TextToken& self)
+      {
+        self.building = false;
+        if(path != self.inputs.model.file.filename)
+          return;
+        self.failures.failed(TextToken::name(), path, "cannot load the model: " + what);
+        self.inputs.model.current_model_invalid = true;
+      };
+    }
+  }
 
   if(!job || !job->ctx)
     return [](TextToken& self) { self.inferenceInProgress = false; };
@@ -868,7 +851,11 @@ TextToken::worker::work(std::unique_ptr<TokenInferJob> job)
       self.inferenceInProgress = false;
       self.failures.succeeded();
       if(gen == self.gen)
+      {
         std::swap(self.utterance, u);
+        // The utterance it replaced is freed on the worker.
+        self.dispose(nullptr, std::move(u));
+      }
     };
   }
   catch(const std::exception& e)
