@@ -2,6 +2,7 @@
 // window mode was only resolved on model reload, so switching it later did
 // nothing. RNNoise takes [?,100,42]: Sliding streams 42-value frames into its
 // 100-frame window, Passthrough feeds each payload on its own.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/SequenceProcessor.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -17,8 +18,7 @@ namespace
 {
 std::string seqModel()
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  return std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  return TestPaths::models()
          + "/sequence-processor/rnnoise-rnn.onnx";
 }
 

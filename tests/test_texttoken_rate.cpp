@@ -7,6 +7,7 @@
 //
 // The rate is observed through the audio outlet: the fixtures output 64
 // samples, which the node resamples to the 48 kHz host rate.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/TextToken.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -113,9 +114,8 @@ TEST_CASE("TTS model rate: metadata, then sidecar, then name guess", "[onnx][tex
 
 TEST_CASE("Piper voice plays on the audio outlet", "[onnx][texttoken]")
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
   const std::string model
-      = std::string(env ? env : "/mnt/win2/models/models-presets/models")
+      = TestPaths::models()
         + "/text-token/piper-en_US-amy-low/en_US-amy-low.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);
@@ -146,7 +146,7 @@ TEST_CASE("Int32 and bool inputs get their declared type", "[onnx][texttoken]")
 
 TEST_CASE("ct-transformer punctuation (int32, async) runs", "[onnx][texttoken]")
 {
-  const std::string model = "/mnt/sdd1/models/sherpa/text/"
+  const std::string model = TestPaths::wild() + "/sherpa/text/"
                             "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12/"
                             "model.onnx";
   if(!std::filesystem::exists(model))
@@ -174,7 +174,7 @@ void checkNear(const std::vector<float>& got, std::vector<float> want)
 
 TEST_CASE("BERT: the attention mask follows the tokens", "[onnx][texttoken]")
 {
-  const std::string model = "/mnt/sdd1/models/wild2/"
+  const std::string model = TestPaths::wild() + "/wild2/"
                             "network_intrusion_detection__bert-network-packet-flow-"
                             "header-payload__model.onnx";
   if(!std::filesystem::exists(model))
@@ -190,7 +190,7 @@ TEST_CASE("BERT: the attention mask follows the tokens", "[onnx][texttoken]")
 TEST_CASE("Punctuation: valid_ids and label_lens follow the tokens", "[onnx][texttoken]")
 {
   const std::string model
-      = "/mnt/sdd1/models/sherpa/text/sherpa-onnx-online-punct-en-2024-08-06/model.onnx";
+      = TestPaths::wild() + "/sherpa/text/sherpa-onnx-online-punct-en-2024-08-06/model.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);
   Harness punct{model};
@@ -282,7 +282,7 @@ TEST_CASE("TTS: changes while a job runs coalesce to the latest", "[onnx][textto
 
 TEST_CASE("Async text encoder: a change while busy is not lost", "[onnx][texttoken]")
 {
-  const std::string model = "/mnt/sdd1/models/sherpa/text/"
+  const std::string model = TestPaths::wild() + "/sherpa/text/"
                             "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12/"
                             "model.onnx";
   if(!std::filesystem::exists(model))
@@ -301,9 +301,8 @@ TEST_CASE("Async text encoder: a change while busy is not lost", "[onnx][texttok
 
 TEST_CASE("Piper: a long utterance plays whole", "[onnx][texttoken]")
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
   const std::string model
-      = std::string(env ? env : "/mnt/win2/models/models-presets/models")
+      = TestPaths::models()
         + "/text-token/piper-en_US-amy-low/en_US-amy-low.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);
@@ -337,7 +336,7 @@ TEST_CASE("Piper: a long utterance plays whole", "[onnx][texttoken]")
 // cache (Tacotron2's decoder_iter) were run anyway, fed garbage.
 TEST_CASE("Tacotron2 decoder step is refused", "[onnx][texttoken]")
 {
-  const std::string model = "/mnt/sdd1/models/wild/tacotron2__decoder_iter.onnx";
+  const std::string model = TestPaths::wild() + "/wild/tacotron2__decoder_iter.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);
   QueuedHarness h{model};
@@ -379,8 +378,7 @@ std::vector<int> kittenIds()
 
 TEST_CASE("Kitten: the style comes from voices.bin", "[onnx][texttoken]")
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  const std::string dir = std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  const std::string dir = TestPaths::models()
                           + "/text-token/kitten-nano-en";
   const std::string model = dir + "/kitten-nano-en-v0_1-fp16.onnx";
   if(!std::filesystem::exists(model) || !std::filesystem::exists(dir + "/voices.bin"))

@@ -3,6 +3,7 @@
 // node went silent. It now gets the log-mel spectrogram of the incoming audio,
 // in the style the vocoder expects (HiFi-GAN or Vocos, with the model's
 // metadata), and a Vocos spectrum output is turned back into audio.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/AudioProcessor.hpp>
 
 #include <Onnx/helpers/MelFrontend.hpp>
@@ -158,11 +159,12 @@ std::vector<float> readWav(const std::string& path)
 
 // Log-mel distance between a signal and a vocoder's resynthesis of it, in
 // nats per band, over the frames where the input is not silent, at the
-// output latency that fits best (searched up to 3 s). `offset` pins the
-// latency instead (a misaligned baseline).
+// output latency that fits best (searched up to 3 s). With `unrelated`, the
+// distance one second past that latency instead: the output compared with
+// other speech, the score of audio that has nothing to do with the input.
 double melDistance(
     const std::vector<float>& x, const std::vector<float>& y, double rate,
-    int offset = -1)
+    bool unrelated = false)
 {
   auto logmel = [&](const std::vector<float>& s) {
     Onnx::MelFrontend mel;
@@ -190,18 +192,20 @@ double melDistance(
     }
     return n ? sum / n : 1e9;
   };
-  if(offset >= 0)
-    return distance(offset);
   double best = 1e9;
+  int bestLag = 0;
   for(int lag = 0; lag < (int)(3 * rate / 256); lag++)
-    best = std::min(best, distance(lag));
-  return best;
+    if(const double d = distance(lag); d < best)
+    {
+      best = d;
+      bestLag = lag;
+    }
+  return unrelated ? distance(bestLag + (int)(rate / 256)) : best;
 }
 
 std::string wild(const char* sub)
 {
-  const char* env = std::getenv("ONNX_TEST_WILD_MODELS");
-  return std::string(env ? env : "/mnt/sdd1/models") + "/" + sub;
+  return TestPaths::wild() + "/" + sub;
 }
 }
 
@@ -307,6 +311,7 @@ TEST_CASE("Audio Processor: vocoders resynthesise speech", "[onnx][audio]")
   // hifigan: waveform out; vocos 22 kHz: 80 bins, HiFi-GAN features (Matcha's
   // vocoder); vocos 24 kHz: 100 bins, Vocos features. The Vocos exports return
   // magnitude / cos / sin.
+  int ran = 0;
   for(const char* path :
       {"wild/hifigan__generator_dynamic.onnx",
        "sherpa/tts/matcha-icefall-en_US-ljspeech/vocos-22khz-univ.onnx",
@@ -315,11 +320,11 @@ TEST_CASE("Audio Processor: vocoders resynthesise speech", "[onnx][audio]")
     const auto model = wild(path);
     if(!std::filesystem::exists(model))
       continue;
+    ran++;
     INFO(model);
     const auto out = resynthesise(model, 24000., voice);
     const double d = melDistance(voice, out, 24000.);
-    // Misaligned by the whole latency search: what unrelated audio scores.
-    const double unrelated = melDistance(voice, out, 24000., 0);
+    const double unrelated = melDistance(voice, out, 24000., true);
     CHECK(d < 0.8);
     CHECK(d < 0.4 * unrelated);
     // The other feature style is far worse: Auto picked the right one.
@@ -328,6 +333,8 @@ TEST_CASE("Audio Processor: vocoders resynthesise speech", "[onnx][audio]")
                                 : OnnxModels::AudioMelStyle::Vocos;
     CHECK(melDistance(voice, resynthesise(model, 24000., voice, wrong), 24000.) > 2. * d);
   }
+  if(!ran)
+    SKIP("no vocoder found under " << TestPaths::wild());
 }
 
 TEST_CASE("Audio Processor: an STFT-bin input is refused once", "[onnx][audio]")

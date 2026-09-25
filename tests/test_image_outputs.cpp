@@ -1,5 +1,6 @@
 // Image Processor output decoding (BUG-LEDGER V2, I2, I4): the pixel mappings
 // and the 2-class segmentation outputs.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/ImageProcessor.hpp>
 
 #include <Onnx/helpers/TensorToTexture.hpp>
@@ -142,8 +143,8 @@ TEST_CASE("Auto mask mapping ignores fp16 rounding", "[onnx][image]")
 
 TEST_CASE("PP-HumanSeg: the person is the mask", "[onnx][image]")
 {
-  const std::string model = "/mnt/sdd1/models/pinto/196__human_segmentation_pphumanseg_2021oct.onnx";
-  const std::string img = "/mnt/win2/models/libreonnx/ossia-detection-model-pack/test_images/body.jpg";
+  const std::string model = TestPaths::wild() + "/pinto/196__human_segmentation_pphumanseg_2021oct.onnx";
+  const std::string img = TestPaths::images() + "/body.jpg";
   if(!std::filesystem::exists(model) || !std::filesystem::exists(img))
     SKIP("model or image not found");
   ImageHarness h{img, model};
@@ -156,10 +157,10 @@ TEST_CASE("PP-HumanSeg: the person is the mask", "[onnx][image]")
 
 TEST_CASE("Hand segmentation: the hand is the mask", "[onnx][image]")
 {
-  const std::string model = "/mnt/sdd1/models/wild2/"
+  const std::string model = TestPaths::wild() + "/wild2/"
                             "hand_recognition__hands_segmentation_pytorch__hands_segmentation_pytorch.onnx";
   const std::string img
-      = "/home/jcelerier/projets/oss/ailia-models/hand_recognition/blazehand/person_hand.jpg";
+      = TestPaths::ailia() + "/hand_recognition/blazehand/person_hand.jpg";
   if(!std::filesystem::exists(model) || !std::filesystem::exists(img))
     SKIP("model or image not found");
   ImageHarness h{img, model};
@@ -179,9 +180,9 @@ TEST_CASE("Hand segmentation: the hand is the mask", "[onnx][image]")
 // (RGB + prior mask) threw and was disabled.
 TEST_CASE("Hair segmenter: a 4-channel input gets a zero 4th channel", "[onnx][image]")
 {
-  const std::string model = "/mnt/sdd1/models/pinto/060__hair_segmenter.onnx";
+  const std::string model = TestPaths::wild() + "/pinto/060__hair_segmenter.onnx";
   const std::string img
-      = "/mnt/win2/models/libreonnx/ossia-detection-model-pack/test_images/face.png";
+      = TestPaths::images() + "/face.png";
   if(!std::filesystem::exists(model) || !std::filesystem::exists(img))
     SKIP("model or image not found");
   ImageHarness h{img, model};
@@ -199,9 +200,9 @@ TEST_CASE("Hair segmenter: a 4-channel input gets a zero 4th channel", "[onnx][i
 // classified from `time` as a latent generator and never got its images.
 TEST_CASE("FILM: frame interpolation runs with time on Param 1", "[onnx][image]")
 {
-  const std::string model = "/mnt/sdd1/models/wild/film__film_net.onnx";
+  const std::string model = TestPaths::wild() + "/wild/film__film_net.onnx";
   const std::string img
-      = "/mnt/win2/models/libreonnx/ossia-detection-model-pack/test_images/face.png";
+      = TestPaths::images() + "/face.png";
   if(!std::filesystem::exists(model) || !std::filesystem::exists(img))
     SKIP("model or image not found");
   ImageHarness h{img, model};

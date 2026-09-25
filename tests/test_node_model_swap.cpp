@@ -3,6 +3,7 @@
 //
 // Models are read from $ONNX_TEST_MODELS (default: the models-presets pack);
 // each test SKIPs when its models are missing.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/ENet.hpp>
 #include <OnnxModels/Resnet.hpp>
 
@@ -24,9 +25,7 @@ namespace
 {
 std::string modelDir()
 {
-  if(const char* env = std::getenv("ONNX_TEST_MODELS"))
-    return env;
-  return "/mnt/win2/models/models-presets/models";
+  return TestPaths::models();
 }
 
 std::string slurp(const std::string& path)
@@ -337,7 +336,7 @@ TEST_CASE("EmotionNet: FER+ gets luma and its labels", "[onnx][emotionnet]")
 {
   const auto model = modelDir() + "/image-processor/emotion-ferplus-8.onnx";
   const std::string face
-      = "/mnt/win2/models/libreonnx/ossia-detection-model-pack/test_images/face.png";
+      = TestPaths::images() + "/face.png";
   if(!haveAll({model, face}))
     SKIP("model or image not found");
   QImage q = QImage(QString::fromStdString(face))

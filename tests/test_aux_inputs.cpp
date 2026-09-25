@@ -1,6 +1,7 @@
 // Inputs a node does not own (Onnx/helpers/AuxInputs.hpp; BUG-LEDGER S2, S3,
 // G2, IG1, AA4, T6): the planning rules on real signatures, and the Sequence
 // Processor feeding Silero's sr and a scalar control.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/AudioAnalyzer.hpp>
 #include <OnnxModels/GeometryProcessor.hpp>
 #include <OnnxModels/ImageGenerator.hpp>
@@ -192,7 +193,7 @@ TEST_CASE("Aux filling: typed storage and linked shapes", "[onnx][aux]")
 
 TEST_CASE("Sequence Processor: Silero gets sr = 16000", "[onnx][aux][sequence]")
 {
-  std::string model = "/mnt/sdd1/models/wild/silero-vad__silero_vad.onnx";
+  std::string model = TestPaths::wild() + "/wild/silero-vad__silero_vad.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);
   const auto bytes = slurp(model);
@@ -292,7 +293,7 @@ struct GenHarness
 TEST_CASE("Image Generator: every input of a multi-input generator is fed", "[onnx][aux][generator]")
 {
   const std::string eigengan
-      = "/mnt/win2/PINTO_model_zoo/161_EigenGAN-Tensorflow/saved_model_Anime/model_float32.onnx";
+      = TestPaths::pintoZoo() + "/161_EigenGAN-Tensorflow/saved_model_Anime/model_float32.onnx";
   if(!std::filesystem::exists(eigengan))
     SKIP("model not found: " << eigengan);
 
@@ -314,8 +315,7 @@ TEST_CASE("Image Generator: every input of a multi-input generator is fed", "[on
 
 TEST_CASE("Image Generator: single-input StyleGAN2 unchanged", "[onnx][aux][generator]")
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  const std::string model = std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  const std::string model = TestPaths::models()
                             + "/image-generator/stylegan2-ffhq-1024.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);
@@ -364,7 +364,7 @@ TEST_CASE("Audio Analyzer: a bool input gets a bool", "[onnx][aux][analyzer]")
 TEST_CASE("Audio Analyzer: CLAP's rank-4 input is refused, not retried", "[onnx][aux][analyzer]")
 {
   const std::string clap
-      = "/mnt/sdd1/models/wild2/audio_processing__clap__CLAP_audio_LAION-Audio-630K_with_fusion.onnx";
+      = TestPaths::wild() + "/wild2/audio_processing__clap__CLAP_audio_LAION-Audio-630K_with_fusion.onnx";
   if(!std::filesystem::exists(clap))
     SKIP("model not found: " << clap);
   AnalyzerHarness a{clap};
@@ -376,8 +376,7 @@ TEST_CASE("Audio Analyzer: CLAP's rank-4 input is refused, not retried", "[onnx]
 
 TEST_CASE("Audio Analyzer: Silero still gets its rate", "[onnx][aux][analyzer]")
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  const std::string model = std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  const std::string model = TestPaths::models()
                             + "/audio-analyzer/silero-vad-v4-16k.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);
@@ -416,8 +415,7 @@ TEST_CASE("Image Generator: mapping w chains into a w+ synthesis", "[onnx][gener
   CHECK(OnnxModels::ImageGenerator::chainCompatible({1, 512}, {1, 512}));
   CHECK(!OnnxModels::ImageGenerator::chainCompatible({1, 512}, {1, 17, 500}));
 
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  const std::string dir = std::string(env ? env : "/mnt/win2/models/models-presets/models");
+  const std::string dir = TestPaths::models();
   const std::string synth = dir + "/image-generator/e4e-ffhq-decoder-wplus.onnx";
   const std::string map = dir + "/sequence-processor/mobilestylegan-ffhq-mapping.onnx";
   if(!std::filesystem::exists(synth) || !std::filesystem::exists(map))
@@ -436,8 +434,7 @@ TEST_CASE("Image Generator: mapping w chains into a w+ synthesis", "[onnx][gener
 // generator, for which Denormalize is right.
 TEST_CASE("Image Generator: Auto picks Denormalize for a [-1,1] generator", "[onnx][generator]")
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  const std::string model = std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  const std::string model = TestPaths::models()
                             + "/image-generator/stylegan2-ffhq-1024.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);

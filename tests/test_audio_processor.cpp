@@ -1,6 +1,7 @@
 // Audio Processor async path (BUG-LEDGER A1): the next block was popped from
 // the input ring before checking for a job in flight, so every block that
 // became ready while the worker was busy was consumed and dropped.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/AudioAnalyzer.hpp>
 #include <OnnxModels/AudioProcessor.hpp>
 
@@ -149,8 +150,7 @@ TEST_CASE("Audio model rate from the file name", "[onnx][audio]")
 // tone always landed on bin 246 (543.6 Hz).
 TEST_CASE("Audio Analyzer: CREPE finds a quiet tone's pitch", "[onnx][audio]")
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  const std::string model = std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  const std::string model = TestPaths::models()
                             + "/audio-analyzer/crepe-full.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);

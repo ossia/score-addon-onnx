@@ -2,6 +2,7 @@
 // (LLaVA-Qwen2). SmolVLM (idefics3) failed in its vision encoder (5-D pixel
 // values plus a pixel mask) and gemma3 in its embeddings (896² input), and
 // neither expanded its image placeholder into the tokens the features fill.
+#include <tests/TestPaths.hpp>
 #include <Onnx/helpers/FastVLM.hpp>
 #include <Onnx/helpers/HfConfig.hpp>
 #include <OnnxModels/Utils.hpp>
@@ -20,14 +21,13 @@ namespace
 {
 std::string models()
 {
-  const char* env = std::getenv("ONNX_TEST_VLM_MODELS");
-  return env ? env : "/mnt/win2/models";
+  return TestPaths::vlm();
 }
 
 Onnx::ImageData photo()
 {
   const QImage img
-      = QImage("/mnt/win2/models/libreonnx/ossia-detection-model-pack/test_images/body.jpg")
+      = QImage(QString::fromStdString(TestPaths::images() + "/body.jpg"))
             .convertToFormat(QImage::Format_RGBA8888);
   Onnx::ImageData d;
   d.width = img.width();

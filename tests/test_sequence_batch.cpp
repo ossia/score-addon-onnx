@@ -3,6 +3,7 @@
 // infer() on every tick, and one failure disabled the node without a word.
 // A zero inference at load now finds the batch the graph runs at, or reports
 // why it runs at none.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/SequenceProcessor.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -70,8 +71,7 @@ TEST_CASE("Sequence Processor: a model that runs at no batch is refused at load"
 
 TEST_CASE("Sequence Processor: Informer forecasts after one window", "[onnx][sequence]")
 {
-  const char* env = std::getenv("ONNX_TEST_WILD_MODELS");
-  const std::string model = std::string(env ? env : "/mnt/sdd1/models/wild")
+  const std::string model = TestPaths::wild() + "/wild"
                             + "/informer2020__informer_ETTh1.onnx";
   if(!std::filesystem::exists(model))
     SKIP("model not found: " << model);

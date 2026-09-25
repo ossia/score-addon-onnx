@@ -1,6 +1,7 @@
 // Language Model Thinking port (BUG-LEDGER L2): a reasoning model's <think>
 // block was counted against Max tokens and sent as-is. Hide removes it from
 // Partial and Response; Off asks the model not to think at all.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/QwenLLM.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -14,8 +15,7 @@ namespace
 {
 std::string llmDir(const char* name)
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  return std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  return TestPaths::models()
          + "/language-model/" + name;
 }
 

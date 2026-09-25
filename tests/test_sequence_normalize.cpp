@@ -1,6 +1,7 @@
 // Sequence Processor Normalize input (BUG-LEDGER S4): embedding heads trained
 // on unit-norm CLIP embeddings saturate on raw ones, and the pack had to ship
 // a wrapper model with an LpNormalization in front of the head.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/SequenceProcessor.hpp>
 
 #include <catch2/catch_approx.hpp>
@@ -76,13 +77,11 @@ TEST_CASE("Sequence Processor: Normalize L2 and ZScore", "[onnx][sequence]")
 
 TEST_CASE("Sequence Processor: the raw CLIP NSFW head with L2 matches the wrapper", "[onnx][sequence]")
 {
-  const char* env = std::getenv("ONNX_TEST_WILD_MODELS");
   const std::string raw
-      = std::string(env ? env : "/mnt/sdd1/models") + "/wild2/"
+      = TestPaths::wild() + "/wild2/"
         "nsfw_detector__clip-based-nsfw-detector__clip_nsfw_b32.onnx";
-  const char* penv = std::getenv("ONNX_TEST_MODELS");
   const std::string wrapped
-      = std::string(penv ? penv : "/mnt/win2/models/models-presets/models")
+      = TestPaths::models()
         + "/sequence-processor/clip-vit-b32-nsfw-head-l2norm.onnx";
   if(!std::filesystem::exists(raw) || !std::filesystem::exists(wrapped))
     SKIP("models not found");

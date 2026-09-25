@@ -1,5 +1,6 @@
 // Pose Detector detection stage on real models and images (BUG-LEDGER P1, P3,
 // P4, P6). Each test SKIPs when its model or image is missing.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/PoseDetector_internal.hpp>
 
 #include <QImage>
@@ -17,16 +18,15 @@
 namespace
 {
 const std::string presets = [] {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  return std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  return TestPaths::models()
          + "/pose-detector";
 }();
-const std::string package = "/home/jcelerier/Documents/ossia/score/packages/pose-detector";
-const std::string libreonnx = "/mnt/win2/models/libreonnx";
-const std::string wild2 = "/mnt/sdd1/models/wild2";
+const std::string package = TestPaths::posePackage();
+const std::string libreonnx = TestPaths::libreonnx();
+const std::string wild2 = TestPaths::wild() + "/wild2";
 const std::string body_jpg = libreonnx + "/ossia-detection-model-pack/test_images/body.jpg";
 const std::string hand_jpg
-    = "/home/jcelerier/projets/oss/ailia-models/hand_recognition/blazehand/person_hand.jpg";
+    = TestPaths::ailia() + "/hand_recognition/blazehand/person_hand.jpg";
 
 std::string slurp(const std::string& path)
 {
@@ -326,7 +326,7 @@ TEST_CASE("FaceBoxes: dynamic output dims are probed", "[onnx][pose]")
 TEST_CASE("Dynamic-input multi-class detector: boxes in the image", "[onnx][pose]")
 {
   const std::string det
-      = "/mnt/sdd1/models/pinto/459__yolov9_n_wholebody25_post_0100_1x3x128x160.onnx";
+      = TestPaths::wild() + "/pinto/459__yolov9_n_wholebody25_post_0100_1x3x128x160.onnx";
   if(!haveAll({det, body_jpg}))
     SKIP("model or image not found");
   Harness h{body_jpg, det};

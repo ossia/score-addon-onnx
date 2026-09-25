@@ -1,6 +1,7 @@
 // Video Processor output routing (BUG-LEDGER V1): only the Output Index output
 // was decoded, so RVM gave fgr or pha, never both. The other outputs now go to
 // the outlets the primary one left free, and the recurrent states to none.
+#include <tests/TestPaths.hpp>
 #include <OnnxModels/VideoProcessor.hpp>
 
 #include <QImage>
@@ -62,12 +63,11 @@ bool anyNonZero(const unsigned char* p, std::size_t n)
 
 TEST_CASE("RVM: foreground and alpha from one node", "[onnx][video]")
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
   const std::string model
-      = std::string(env ? env : "/mnt/win2/models/models-presets/models")
+      = TestPaths::models()
         + "/video-processor/rvm_mobilenetv3_fp32.onnx";
   const std::string img
-      = "/mnt/win2/models/libreonnx/ossia-detection-model-pack/test_images/body.jpg";
+      = TestPaths::images() + "/body.jpg";
   if(!std::filesystem::exists(model) || !std::filesystem::exists(img))
     SKIP("model or image not found");
 
@@ -107,12 +107,11 @@ namespace
 {
 std::string rvmModel()
 {
-  const char* env = std::getenv("ONNX_TEST_MODELS");
-  return std::string(env ? env : "/mnt/win2/models/models-presets/models")
+  return TestPaths::models()
          + "/video-processor/rvm_mobilenetv3_fp32.onnx";
 }
 const std::string bodyImage
-    = "/mnt/win2/models/libreonnx/ossia-detection-model-pack/test_images/body.jpg";
+    = TestPaths::images() + "/body.jpg";
 
 // Jobs wait until complete() is called, as on a busy worker.
 struct QueuedVideo : Harness
