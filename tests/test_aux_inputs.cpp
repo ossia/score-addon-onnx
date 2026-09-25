@@ -1,6 +1,7 @@
 // Inputs a node does not own (Onnx/helpers/AuxInputs.hpp): the planning rules
 // on real signatures, and the Sequence
 // Processor feeding Silero's sr and a scalar control.
+#include <tests/TestWorker.hpp>
 #include <tests/TestPaths.hpp>
 #include <OnnxModels/AudioAnalyzer.hpp>
 #include <OnnxModels/GeometryProcessor.hpp>
@@ -212,6 +213,7 @@ TEST_CASE("Sequence Processor: Silero gets sr = 16000", "[onnx][aux][sequence][m
   const auto sig = speechLike(16000);
 
   OnnxModels::SequenceProcessor node;
+  inlineWorker(node);
   node.inputs.model.file.bytes = bytes;
   node.inputs.model.file.filename = model;
   double sum = 0;
@@ -236,6 +238,7 @@ TEST_CASE("Sequence Processor: Param 1 drives a scalar input", "[onnx][aux][sequ
   const std::string model = SCORE_ONNX_TEST_DATA_DIR "/aux/scale.onnx";
   const auto bytes = TestPaths::slurp(model);
   OnnxModels::SequenceProcessor node;
+  inlineWorker(node);
   node.inputs.model.file.bytes = bytes;
   node.inputs.model.file.filename = model;
   node.inputs.param1.value = 2.5f;
