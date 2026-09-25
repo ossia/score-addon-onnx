@@ -452,6 +452,18 @@ avnd_addon_object(
     OnnxModels/QwenLLM.cpp
     Onnx/helpers/QwenLLM.hpp
     Onnx/helpers/QwenLLM.cpp)
+
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME onnx_tokenizer
+  CLASS TokenizerNode
+  NAMESPACE OnnxModels
+  BACKENDS ${ONNX_DATA_BACKENDS}
+  SOURCES
+    OnnxModels/Tokenizer.hpp
+    OnnxModels/Tokenizer.cpp
+    Onnx/helpers/TextTokenizer.hpp
+    Onnx/helpers/TextTokenizer.cpp)
 endif()
 
 avnd_addon_object(
@@ -756,6 +768,9 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     target_sources(score_addon_onnx_node_tests PRIVATE
       tests/test_llm_thinking.cpp
       tests/test_vlm.cpp
+      tests/test_tokenizer.cpp
+      OnnxModels/Tokenizer.cpp
+      Onnx/helpers/TextTokenizer.cpp
       OnnxModels/QwenLLM.cpp
       Onnx/helpers/QwenLLM.cpp
       Onnx/helpers/FastVLM.cpp)
