@@ -16,11 +16,10 @@
 // first-frame allocation profile we already have. release() happens on the
 // worker thread, after work() has moved the results out.
 //
-// The pool type (ossia::object_pool) is provided by a vendored, API-compatible
-// copy under Onnx/helpers/compat so this header carries no ossia/ include; in a
-// score build the compat header transparently uses moodycamel's ConcurrentQueue
-// (same lock-free backing as the real ossia header), standalone falls back to a
-// mutex-guarded queue with the same semantics.
+// The pool type (ossia::object_pool) comes from Onnx/helpers/compat: libossia's
+// own header in a score build, a vendored API-compatible copy standalone
+// (moodycamel's lock-free queue when available, else a mutex-guarded queue
+// with the same semantics).
 #include <Onnx/helpers/compat/buffer_pool.hpp>
 
 #include <memory>
