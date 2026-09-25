@@ -2,8 +2,11 @@
 // the Text Token Processor (CLIP's text encoder), whose Text field is unused.
 #include <tests/TestPaths.hpp>
 #include <tests/TestWorker.hpp>
+#include <OnnxModels/ImageProcessor.hpp>
 #include <OnnxModels/TextToken.hpp>
 #include <OnnxModels/Tokenizer.hpp>
+
+#include <QImage>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -158,6 +161,49 @@ TEST_CASE("Tokenizer node: a file it cannot use gives no ids", "[onnx][tokenizer
   CHECK(h.jobs.empty());
 }
 
+static double cosine(const std::vector<float>& a, const std::vector<float>& b)
+{
+  double ab = 0., aa = 0., bb = 0.;
+  for(std::size_t i = 0; i < a.size() && i < b.size(); i++)
+  {
+    ab += a[i] * b[i];
+    aa += a[i] * a[i];
+    bb += b[i] * b[i];
+  }
+  return ab / std::sqrt(aa * bb);
+}
+
+// Tokenizer -> Text Token Processor (the CLIP text encoder preset).
+struct ClipText
+{
+  Harness tok;
+  std::string bytes;
+  OnnxModels::TextToken enc;
+  std::vector<float> out = std::vector<float>(64);
+  float* outs[1]{out.data()};
+
+  explicit ClipText(const std::string& model)
+      : bytes{slurp(model)}
+  {
+    tok.node.inputs.tokenizer.file.filename = clipJson;
+    enc.prepare({.rate = 48000., .output_channels = 1, .frames = 64});
+    enc.inputs.model.file.bytes = bytes;
+    enc.inputs.model.file.filename = model;
+    enc.outputs.audio.samples = outs;
+    enc.outputs.audio.channels = 1;
+    inlineWorker(enc);
+  }
+  std::vector<float> embed(const std::string& text)
+  {
+    enc.inputs.tokens.value = tok.tokenize(text);
+    for(int i = 0; i < 4; i++)
+      enc(64);
+    auto e = enc.outputs.data.value;
+    REQUIRE(e.size() == 512);
+    return e;
+  }
+};
+
 // Tokenizer -> Text Token Processor -> CLIP embedding: related texts land
 // closer together than unrelated ones.
 TEST_CASE("Tokenizer feeds CLIP's text encoder", "[onnx][tokenizer]")
@@ -166,42 +212,68 @@ TEST_CASE("Tokenizer feeds CLIP's text encoder", "[onnx][tokenizer]")
   if(!std::filesystem::exists(model) || !std::filesystem::exists(clipJson))
     SKIP("CLIP not found");
   REQUIRE(OnnxModels::initOnnxRuntime());
-
-  Harness tok;
-  tok.node.inputs.tokenizer.file.filename = clipJson;
-
-  const auto bytes = slurp(model);
-  OnnxModels::TextToken enc;
-  std::vector<float> out(64);
-  float* outs[1]{out.data()};
-  enc.prepare({.rate = 48000., .output_channels = 1, .frames = 64});
-  enc.inputs.model.file.bytes = bytes;
-  enc.inputs.model.file.filename = model;
-  enc.outputs.audio.samples = outs;
-  enc.outputs.audio.channels = 1;
-  inlineWorker(enc);
-
-  auto embed = [&](const std::string& text) {
-    enc.inputs.tokens.value = tok.tokenize(text);
-    for(int i = 0; i < 4; i++)
-      enc(64);
-    auto e = enc.outputs.data.value;
-    REQUIRE(e.size() == 512);
-    return e;
-  };
-  auto cosine = [](const std::vector<float>& a, const std::vector<float>& b) {
-    double ab = 0., aa = 0., bb = 0.;
-    for(std::size_t i = 0; i < a.size(); i++)
-    {
-      ab += a[i] * b[i];
-      aa += a[i] * a[i];
-      bb += b[i] * b[i];
-    }
-    return ab / std::sqrt(aa * bb);
-  };
+  ClipText text{model};
+  auto embed = [&](const std::string& t) { return text.embed(t); };
   const auto dog = embed("a photo of a dog");
   const auto puppy = embed("a picture of a puppy");
   const auto sheet = embed("a spreadsheet of quarterly tax figures");
   INFO("dog/puppy " << cosine(dog, puppy) << ", dog/spreadsheet " << cosine(dog, sheet));
   CHECK(cosine(dog, puppy) > cosine(dog, sheet) + 0.1);
+}
+
+// The CLIP image encoder preset (Image Processor, 224x224, ImageNet
+// normalization, Task = Data) gives an embedding in the text encoder's
+// space: zero-shot labels come out right. CLIP's own mean/std differ
+// slightly from ImageNet's; offline the embeddings agree to 0.97-0.99.
+TEST_CASE("CLIP image encoder preset matches the text encoder", "[onnx][tokenizer]")
+{
+  const auto imageModel = TestPaths::models() + "/image-processor/clip-vit-b32-encode-image.onnx";
+  const auto textModel = clipDir + "/clip-vit-b32-encode-text.onnx";
+  const auto images = TestPaths::libreonnx() + "/ossia-detection-model-pack/test_images/";
+  if(!std::filesystem::exists(imageModel) || !std::filesystem::exists(textModel)
+     || !std::filesystem::exists(images + "animal.jpg"))
+    SKIP("CLIP image encoder, text encoder or test images not found");
+  REQUIRE(OnnxModels::initOnnxRuntime());
+
+  ClipText text{textModel};
+  const std::vector<std::string> labels{
+      "a photo of a dog", "a photo of a cat", "a photo of people playing sports",
+      "a photo of a face", "a photo of a car"};
+  std::vector<std::vector<float>> T;
+  for(auto& l : labels)
+    T.push_back(text.embed(l));
+
+  const auto bytes = slurp(imageModel);
+  for(auto [file, expected] :
+      {std::pair{"animal.jpg", 0}, {"body.jpg", 2}, {"face.png", 3}})
+  {
+    OnnxModels::ImageProcessor node;
+    node.inputs.model.file.bytes = bytes;
+    node.inputs.model.file.filename = imageModel;
+    node.inputs.resolution.value = {224, 224};
+    node.inputs.normalization.value = OnnxModels::InputNormalization::ImageNet;
+    node.inputs.resize_mode.value = OnnxModels::ResizeMode::Crop;
+    node.inputs.task.value = OnnxModels::TaskMode::Data;
+    inlineWorker(node);
+    QImage img = QImage(QString::fromStdString(images + file))
+                     .convertToFormat(QImage::Format_RGBA8888);
+    REQUIRE(!img.isNull());
+    for(int i = 0; i < 4; i++)
+    {
+      auto& t = node.inputs.image.texture;
+      t.bytes = img.bits();
+      t.width = img.width();
+      t.height = img.height();
+      t.changed = true;
+      node();
+    }
+    const auto& e = node.outputs.data.value;
+    REQUIRE(e.size() == 512);
+    int best = 0;
+    for(int k = 1; k < (int)T.size(); k++)
+      if(cosine(e, T[k]) > cosine(e, T[best]))
+        best = k;
+    INFO(file << ": " << labels[best]);
+    CHECK(best == expected);
+  }
 }
