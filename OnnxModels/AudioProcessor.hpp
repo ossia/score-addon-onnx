@@ -135,6 +135,14 @@ public:
           "Log-mel features fed to a vocoder ([1,n_mels,T] input); the "
           "model's metadata sets the sample rate, n_fft and hop");
     } mel_style;
+    struct : halp::spinbox_i32<"Block", halp::range{0, 1 << 21, 0}>
+    {
+      halp_meta(
+          description,
+          "Samples per inference, at the model's rate, for a model whose "
+          "length is free; 0 = 1024. Demucs wants its training segment, "
+          "343980 at 44.1 kHz");
+    } block;
   } inputs;
 
   struct
@@ -182,6 +190,7 @@ private:
   int lastRateOverride = 0;
   AudioOverlap lastOverlap{};
   AudioMelStyle lastMelStyle{};
+  int lastBlock = 0;
   std::vector<Onnx::AuxPlan> aux; // inputs other than the waveform and states:
                                   // scalars take Params 2..4
   std::vector<std::vector<uint8_t>> aux_store;

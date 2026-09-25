@@ -88,6 +88,25 @@ void AudioProcessor::prepare(halp::setup info)
   ctx.reset();
 }
 
+namespace
+{
+// Per-channel RMS of a planar [C,N] block, into `out` (C values).
+void planarRms(const std::vector<float>& planar, int channels, std::vector<float>& out)
+{
+  const int oc = channels > 0 ? channels : 1;
+  const std::size_t per = planar.size() / (std::size_t)oc;
+  out.assign((std::size_t)oc, 0.f);
+  for(int c = 0; c < oc; ++c)
+  {
+    double acc = 0.0;
+    const float* p = planar.data() + (std::size_t)c * per;
+    for(std::size_t i = 0; i < per; ++i)
+      acc += (double)p[i] * p[i];
+    out[c] = per ? (float)std::sqrt(acc / (double)per) : 0.f;
+  }
+}
+}
+
 void AudioProcessor::reloadModel()
 {
   ctx = std::make_shared<Onnx::OnnxRunContext>(
@@ -287,7 +306,12 @@ void AudioProcessor::resolveIO()
     mel.reset();
     synth.reset();
   }
-  const int64_t block = in_shape.block > 0 ? in_shape.block : 1024;
+  // A model whose length is free (Demucs' mix [1,2,l]) runs on the Block
+  // input's size; 1024 without it.
+  lastBlock = inputs.block.value;
+  const int64_t block = in_shape.block > 0 ? in_shape.block
+                        : lastBlock > 0    ? (int64_t)lastBlock
+                                           : 1024;
   // Heavy models (separation/vocoder, >32MB or big block) run async; light
   // streaming models (recurrent denoise) run inline for low latency. A
   // vocoder always does: its mel analysis alone is too long for the audio
@@ -337,7 +361,8 @@ try
     return;
   if((inputs.model_rate.value != lastRateOverride
       || inputs.overlap.value != lastOverlap
-      || inputs.mel_style.value != lastMelStyle)
+      || inputs.mel_style.value != lastMelStyle
+      || inputs.block.value != lastBlock)
      && !inferenceInProgress)
     resolveIO(); // re-prepares the resamplers and the block hop
 
@@ -542,16 +567,7 @@ void AudioProcessor::dispatchInfer(int64_t n, bool force_async)
   if(!out_planar.empty())
   {
     const int oc = out_shape.channels > 0 ? out_shape.channels : 1;
-    const std::size_t per = out_planar.size() / (std::size_t)oc;
-    outputs.data.value.assign((std::size_t)oc, 0.f);
-    for(int c = 0; c < oc; ++c)
-    {
-      double acc = 0.0;
-      const float* p = out_planar.data() + (std::size_t)c * per;
-      for(std::size_t i = 0; i < per; ++i)
-        acc += (double)p[i] * p[i];
-      outputs.data.value[c] = per ? (float)std::sqrt(acc / (double)per) : 0.f;
-    }
+    planarRms(out_planar, oc, outputs.data.value);
   }
 }
 
@@ -707,14 +723,22 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
       new_states.emplace_back(job->state_in_index[k], std::move(st));
     }
 
+    // The Data outlet's per-channel RMS, as on the synchronous path.
+    std::vector<float> rms;
+    if(on > 0)
+      planarRms(planar, oc, rms);
+
     return [planar = std::move(planar), oc, on, gen = job->gen,
             new_states = std::move(new_states),
-            acc = std::move(job->synth_acc)](AudioProcessor& self) mutable
+            acc = std::move(job->synth_acc),
+            rms = std::move(rms)](AudioProcessor& self) mutable
     {
       self.inferenceInProgress = false;
       self.failures.succeeded();
       if(gen != self.gen)
         return; // Reset while it ran: keep the zeroed states, drop the block
+      if(!rms.empty())
+        std::swap(self.outputs.data.value, rms);
       if(acc.size() == self.synth_acc.size())
         self.synth_acc = std::move(acc);
       if(on > 0)
