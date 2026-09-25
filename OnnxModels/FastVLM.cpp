@@ -87,13 +87,18 @@ try
     outputs.response.value = "ONNX Runtime not available";
     return;
   }
-  if (inputs.visionEncoder.current_model_invalid)
-    return;
-  if (inputs.embedTokens.current_model_invalid)
-    return;
-  if (inputs.decoder.current_model_invalid)
-    return;
-  if (inputs.tokenizer.current_model_invalid)
+  // A file that is set but could not be read: say which one instead of
+  // staying silent.
+  auto missing = [this](const auto& port, const char* name) {
+    if (!port.current_model_invalid || port.file.filename.empty())
+      return false;
+    outputs.response.value = std::string("Cannot read the ") + name + " file: "
+                             + std::string(port.file.filename);
+    return true;
+  };
+  if (missing(inputs.visionEncoder, "Vision Encoder")
+      || missing(inputs.embedTokens, "Embed Tokens")
+      || missing(inputs.decoder, "Decoder") || missing(inputs.tokenizer, "Tokenizer"))
     return;
 
   if (needsReinitialization())
