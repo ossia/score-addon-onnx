@@ -87,13 +87,7 @@ makePipeline(const AudioBuildParams& bp, std::shared_ptr<Onnx::OnnxRunContext> c
   auto P = std::make_shared<AudioPipeline>();
   P->params = bp;
   if(!ctx)
-  {
-    std::ifstream f(bp.path, std::ios::binary);
-    if(!f)
-      throw std::runtime_error("cannot read the file");
-    const std::string bytes{std::istreambuf_iterator<char>(f), {}};
-    ctx = std::make_shared<Onnx::OnnxRunContext>(bytes, bp.path);
-  }
+    ctx = Onnx::loadRunContext(bp.path, Onnx::Options::precise());
   P->ctx = std::move(ctx);
   P->spec = P->ctx->readModelSpec();
   P->arch = Onnx::classifyModel(Onnx::toArchIO(P->spec));

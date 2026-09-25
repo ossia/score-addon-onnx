@@ -25,6 +25,15 @@ save("identity_dyn",
      [helper.make_tensor_value_info("audio", TensorProto.FLOAT, [1, 1, "N"])],
      [helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, 1, "N"])])
 
+# A matrix product with both operands as inputs: on CUDA's TF32 path its
+# error is ~2e-5 of the summed magnitudes, 1e-8 in float32
+# (test_audio_precision).
+save("matmul",
+     [helper.make_node("MatMul", ["a", "b"], ["c"])],
+     [helper.make_tensor_value_info("a", TensorProto.FLOAT, ["M", "K"]),
+      helper.make_tensor_value_info("b", TensorProto.FLOAT, ["K", "N"])],
+     [helper.make_tensor_value_info("c", TensorProto.FLOAT, ["M", "N"])])
+
 # Reference log-mel (HiFi-GAN settings, librosa's Slaney filterbank written
 # out with numpy) of one streaming block of a fixed three-tone signal, for
 # the MelFrontend test: float32 [80, 32].
