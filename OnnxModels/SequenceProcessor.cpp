@@ -8,6 +8,9 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -127,22 +130,6 @@ Ort::Value buildTensor(
   }
 }
 
-// Decoded result staged in heap (so readback also runs off the worker thread):
-// the primary output (Out), an optional secondary Data output, and the new
-// recurrent-state values to swap into the node's persistent buffers.
-struct SeqResult
-{
-  std::vector<float> out;
-  std::vector<float> data;
-  bool has_data = false;
-  struct NewState
-  {
-    int in_index = 0;
-    std::vector<float> values;
-  };
-  std::vector<NewState> states;
-};
-
 void applyResult(SequenceProcessor& self, SeqResult& r);
 
 // Normalises each frame (the last dim) of the input in place.
@@ -187,66 +174,183 @@ void normalizeFrames(
 }
 } // namespace
 
-SequenceProcessor::SequenceProcessor() noexcept
-{
-  in_scratch.reserve(4096);
-}
+SequenceProcessor::SequenceProcessor() noexcept = default;
 
 SequenceProcessor::~SequenceProcessor() = default;
 
-void SequenceProcessor::resetState()
+namespace
 {
-  ++gen;
-  for(auto& s : states)
-    std::fill(s.values.begin(), s.values.end(), 0.f);
-  window.reset();
+// Run a full multi-IO inference: place the primary input + all recurrent-state
+// inputs at their model-declared indices, run every declared output, decode the
+// primary/data outputs and capture the new state values into `r`. `sc` and
+// `r` keep their buffers from run to run.
+void runInference(
+    Onnx::OnnxRunContext& ctx, const Onnx::ModelSpec& spec,
+    std::vector<float>& input, const std::vector<int64_t>& ishape,
+    TensorElemType in_dt, int primary_in, int primary_out, int data_out,
+    std::vector<SeqState>& states, const std::vector<Onnx::AuxPlan>& aux,
+    std::span<const float> params, int64_t batch, SeqScratch& sc, SeqResult& r)
+{
+  const int nin = (int)spec.input_names_char.size();
+  const int nout = (int)spec.output_names_char.size();
+
+  auto& ins = sc.ins;
+  ins.clear();
+  for(int i = 0; i < nin; ++i)
+    ins.emplace_back(nullptr);
+
+  ins[primary_in] = buildTensor(input, ishape, in_dt, sc.i64, sc.i32, sc.f64);
+
+  sc.s_i64.resize(states.size());
+  sc.s_i32.resize(states.size());
+  sc.s_f64.resize(states.size());
+  for(size_t k = 0; k < states.size(); ++k)
+  {
+    auto& st = states[k];
+    if(st.in_index < 0 || st.in_index >= nin)
+      continue;
+    ins[st.in_index] = buildTensor(
+        st.values, st.shape, st.dt, sc.s_i64[k], sc.s_i32[k], sc.s_f64[k]);
+  }
+
+  // The other inputs, by the aux plan: sr gets the rate, scalars Param 1 / 2,
+  // the rest zeros. Each keeps its own storage while the tensors are alive.
+  sc.aux_store.resize(aux.size());
+  sc.aux_shape.resize(aux.size());
+  Onnx::AuxHost host{.params = params, .primary_shape = ishape, .batch = batch};
+  for(std::size_t k = 0; k < aux.size(); ++k)
+    if(aux[k].index >= 0 && aux[k].index < nin && !ins[aux[k].index])
+      ins[aux[k].index] = Onnx::fillAux(aux[k], host, sc.aux_store[k], sc.aux_shape[k]);
+
+  // Anything still unfilled (a state the pairing released) gets zeros so ORT
+  // has a value for every declared name.
+  sc.filler.resize(nin);
+  sc.f_i64.resize(nin);
+  sc.f_i32.resize(nin);
+  sc.f_f64.resize(nin);
+  for(int i = 0; i < nin; ++i)
+  {
+    if(ins[i])
+      continue;
+    auto shp = spec.inputs[i].shape;
+    for(auto& d : shp)
+      if(d <= 0)
+        d = 1;
+    sc.filler[i].assign((size_t)flatPos(shp), 0.f);
+    ins[i] = buildTensor(
+        sc.filler[i], shp, spec.inputs[i].elem_type, sc.f_i64[i], sc.f_i32[i],
+        sc.f_f64[i]);
+  }
+
+  auto& outs = sc.outs;
+  outs.clear();
+  for(int i = 0; i < nout; ++i)
+    outs.emplace_back(nullptr);
+
+  ctx.infer(spec, ins, outs);
+
+  auto decode = [&](int idx, std::vector<float>& dst)
+  {
+    const auto info = outs[idx].GetTensorTypeAndShapeInfo();
+    const int64_t cnt = (int64_t)info.GetElementCount();
+    const TensorElemType odt
+        = Onnx::fromOrtElementType(info.GetElementType());
+    const void* raw = outs[idx].GetTensorData<uint8_t>();
+    const float* f = toFloatView(raw, cnt, odt, sc.decode);
+    // A replicated batch: every slice is the same, keep the first.
+    sc.oshape.resize(info.GetDimensionsCount());
+    Ort::ThrowOnError(
+        Ort::GetApi().GetDimensions(info, sc.oshape.data(), sc.oshape.size()));
+    const int64_t n
+        = (batch > 1 && sc.oshape.size() >= 2 && sc.oshape[0] == batch) ? cnt / batch
+                                                                          : cnt;
+    dst.assign(f, f + std::max<int64_t>(n, 0));
+  };
+
+  const int po = std::clamp(primary_out, 0, nout - 1);
+  decode(po, r.out);
+  r.has_data = data_out >= 0 && data_out < nout;
+  if(r.has_data)
+    decode(data_out, r.data);
+
+  // Capture new state values for feedback.
+  std::size_t n = 0;
+  for(auto& st : states)
+  {
+    if(st.out_index < 0 || st.out_index >= nout)
+      continue;
+    if(r.states.size() <= n)
+      r.states.emplace_back();
+    r.states[n].in_index = st.in_index;
+    decode(st.out_index, r.states[n].values);
+    ++n;
+  }
+  r.states.resize(n);
 }
 
-void SequenceProcessor::reloadModel()
+// Swaps the result in: the outputs and states take its buffers, and it takes
+// theirs back, so the next run decodes into buffers with the capacity.
+void applyResult(SequenceProcessor& self, SeqResult& r)
 {
-  ctx = std::make_shared<Onnx::OnnxRunContext>(
-      inputs.model.file.bytes, inputs.model.file.filename);
-  spec = ctx->readModelSpec();
-  arch = Onnx::classifyModel(toArchIO(spec));
-  lastModelPath = inputs.model.file.filename;
+  self.failures.succeeded();
+  std::swap(self.outputs.out.value, r.out);
+  if(r.has_data)
+    std::swap(self.outputs.data.value, r.data);
+  else
+    self.outputs.data.value.assign(
+        self.outputs.out.value.begin(), self.outputs.out.value.end());
 
+  if(!self.pipe)
+    return;
+  for(auto& ns : r.states)
+    for(auto& sb : self.pipe->states)
+      if(sb.in_index == ns.in_index)
+      {
+        if(ns.values.size() == sb.values.size())
+          std::swap(sb.values, ns.values);
+        break;
+      }
+}
+
+static void routeSeqIO(SeqPipeline& P)
+{
   // --- route I/O from the archetype --------------------------------------
   // Primary input: the first Sequence/Vector/Latent/Scalar input that is not a
   // recurrent state. Primary output: the first Sequence/Vector output that is
   // not a recurrent state; the second non-state output (if any) feeds Data.
-  primaryIn = 0;
-  primaryOut = 0;
-  dataOut = -1;
-  stateful = arch.stateful;
+  P.primaryIn = 0;
+  P.primaryOut = 0;
+  P.dataOut = -1;
+  P.stateful = P.arch.stateful;
 
 
   // --- recurrent state: each state input with the output it is fed from ---
   // Paired once by classifyModel (names first, then free same-shape outputs,
   // dynamic dims as wildcards); claim those outputs BEFORE routing the data
   // outputs. An output is claimed by at most one state input.
-  states.clear();
-  std::vector<bool> out_is_state(arch.outputs.size(), false);
-  if(stateful)
+  P.states.clear();
+  std::vector<bool> out_is_state(P.arch.outputs.size(), false);
+  if(P.stateful)
   {
-    for(size_t i = 0; i < arch.inputs.size(); ++i)
+    for(size_t i = 0; i < P.arch.inputs.size(); ++i)
     {
-      if(arch.inputs[i].arch != PortArchetype::RecurrentState)
+      if(P.arch.inputs[i].arch != PortArchetype::RecurrentState)
         continue;
-      const int matched = arch.inputs[i].state_pair;
+      const int matched = P.arch.inputs[i].state_pair;
       if(matched < 0 || out_is_state[matched])
         continue; // no feedback output -> can't thread this state; skip it
       out_is_state[matched] = true;
 
-      StateBuf sb;
+      SeqState sb;
       sb.in_index = (int)i;
       sb.out_index = matched;
-      sb.shape = spec.inputs[i].shape;
+      sb.shape = P.spec.inputs[i].shape;
       for(auto& d : sb.shape)
         if(d <= 0)
           d = 1; // concretize dynamic state dims (batch etc.) to 1
-      sb.dt = spec.inputs[i].elem_type;
+      sb.dt = P.spec.inputs[i].elem_type;
       sb.values.assign((size_t)flatPos(sb.shape), 0.f);
-      states.push_back(std::move(sb));
+      P.states.push_back(std::move(sb));
     }
   }
   // A state pairing that consumes EVERY output is spurious (e.g. a stateless
@@ -255,17 +359,17 @@ void SequenceProcessor::reloadModel()
   // first) until a data output survives.
   auto anyDataOut = [&]
   {
-    for(size_t i = 0; i < arch.outputs.size(); ++i)
+    for(size_t i = 0; i < P.arch.outputs.size(); ++i)
       if(!out_is_state[i])
         return true;
     return false;
   };
-  while(!states.empty() && !anyDataOut())
+  while(!P.states.empty() && !anyDataOut())
   {
-    out_is_state[states.back().out_index] = false;
-    states.pop_back();
+    out_is_state[P.states.back().out_index] = false;
+    P.states.pop_back();
   }
-  stateful = !states.empty(); // tagged-but-unpaired/released -> effectively stateless
+  P.stateful = !P.states.empty(); // tagged-but-unpaired/released -> effectively stateless
 
   // The data input, once the threaded states are known: a sequence / vector
   // / latent first; else anything that is not a control (scalar), a bool
@@ -275,14 +379,14 @@ void SequenceProcessor::reloadModel()
   // released above (x [1,4] -> y [1,4]) is data again.
   {
     auto threaded = [&](size_t i) {
-      return std::any_of(states.begin(), states.end(), [&](const StateBuf& sb) {
+      return std::any_of(P.states.begin(), P.states.end(), [&](const SeqState& sb) {
         return sb.in_index == (int)i;
       });
     };
     auto pick = [&](auto pred) {
-      for(size_t i = 0; i < arch.inputs.size(); ++i)
-        if(!threaded(i) && spec.inputs[i].elem_type != TensorElemType::Bool
-           && pred(arch.inputs[i].arch))
+      for(size_t i = 0; i < P.arch.inputs.size(); ++i)
+        if(!threaded(i) && P.spec.inputs[i].elem_type != TensorElemType::Bool
+           && pred(P.arch.inputs[i].arch))
           return (int)i;
       return -1;
     };
@@ -296,53 +400,177 @@ void SequenceProcessor::reloadModel()
                && a != PortArchetype::TokenSeq;
       });
     if(p < 0)
-      for(size_t i = 0; i < arch.inputs.size(); ++i)
+      for(size_t i = 0; i < P.arch.inputs.size(); ++i)
         if(!threaded(i))
         {
           p = (int)i;
           break;
         }
-    primaryIn = std::max(p, 0);
+    P.primaryIn = std::max(p, 0);
   }
 
   // Route primary + secondary (Data) outputs from the non-state remainder.
   bool first_out = true;
-  for(size_t i = 0; i < arch.outputs.size(); ++i)
+  for(size_t i = 0; i < P.arch.outputs.size(); ++i)
   {
     if(out_is_state[i])
       continue;
     if(first_out)
     {
-      primaryOut = (int)i;
+      P.primaryOut = (int)i;
       first_out = false;
     }
-    else if(dataOut < 0)
+    else if(P.dataOut < 0)
     {
-      dataOut = (int)i;
+      P.dataOut = (int)i;
       break;
     }
   }
 
-  std::vector<int> owned{primaryIn};
-  for(const auto& sb : states)
+  std::vector<int> owned{P.primaryIn};
+  for(const auto& sb : P.states)
     owned.push_back(sb.in_index);
-  aux = Onnx::planAuxInputs(spec.inputs, owned);
+  P.aux = Onnx::planAuxInputs(P.spec.inputs, owned);
+}
 
-  resolveWindow();
-  resetState();
+// One zero inference at load, when the model's input shape does not depend
+// on the payload (every dim but the batch is concrete): a model that cannot
+// run is refused with its error instead of failing on every tick. When it
+// fails at batch 1 on a dynamic batch, the graph may have one baked in
+// (Informer: 2), which is tried next. Runs in the build job, on the worker.
+static void probeSeq(SeqPipeline& P)
+{
+  const auto& pin = P.spec.inputs[P.primaryIn].shape;
+  if(pin.empty())
+    return;
+  for(std::size_t k = 1; k < pin.size(); ++k)
+    if(pin[k] <= 0)
+      return;
+
+  auto run = [&](int64_t b)
+  {
+    auto shape = pin;
+    shape[0] = b;
+    std::vector<float> input((size_t)flatPos(shape), 0.f);
+    auto st = P.states;
+    const float params[2]{};
+    SeqScratch sc;
+    SeqResult r;
+    runInference(
+        *P.ctx, P.spec, input, shape, P.spec.inputs[P.primaryIn].elem_type,
+        P.primaryIn, P.primaryOut, P.dataOut, st, P.aux, params, b, sc, r);
+  };
+
+  try
+  {
+    run(P.batch);
+  }
+  catch(const std::exception& e)
+  {
+    const std::string first = e.what();
+    if(pin.size() >= 2 && pin[0] <= 0 && P.batch == 1 && P.states.empty())
+    {
+      try
+      {
+        run(2);
+        P.batch = 2;
+        std::fprintf(
+            stderr,
+            "Sequence Processor: %s: the graph needs a batch of 2, the input "
+            "is fed twice\n",
+            P.path.c_str());
+        return;
+      }
+      catch(...)
+      {
+      }
+    }
+    P.refusal = "the model does not run: " + first;
+  }
+}
+
+// Worker side of a model change: the session (from the file, since the
+// port's mapping may be gone by now), the routing, the probe, the window.
+static std::shared_ptr<SeqPipeline>
+makeSeqPipeline(const std::string& path, std::size_t model_bytes)
+{
+  auto pp = std::make_shared<SeqPipeline>();
+  auto& P = *pp;
+  P.path = path;
+  P.model_bytes = model_bytes;
+  {
+    std::ifstream f(path, std::ios::binary);
+    if(!f)
+      throw std::runtime_error("cannot read the file");
+    const std::string bytes{std::istreambuf_iterator<char>(f), {}};
+    P.ctx = std::make_shared<Onnx::OnnxRunContext>(bytes, path);
+  }
+  P.spec = P.ctx->readModelSpec();
+  P.arch = Onnx::classifyModel(toArchIO(P.spec));
+  if(P.spec.inputs.empty() || P.spec.outputs.empty())
+    return pp;
+  routeSeqIO(P);
 
   // A concrete declared batch is honoured; a dynamic one is 1 unless the
   // probe finds that the graph only runs at another.
-  const auto& pin = spec.inputs[primaryIn].shape;
-  batch = (pin.size() >= 2 && pin[0] > 1 && !stateful) ? pin[0] : 1;
-  failures.succeeded();
-  if(!probe())
-    inputs.model.current_model_invalid = true;
+  const auto& pin = P.spec.inputs[P.primaryIn].shape;
+  P.batch = (pin.size() >= 2 && pin[0] > 1 && !P.stateful) ? pin[0] : 1;
+  probeSeq(P);
+
+  // A fixed [1,T,F] input: its window is sized now rather than on the
+  // processing thread when the first frames arrive.
+  if(pin.size() >= 3 && pin[1] > 1 && pin.back() > 0)
+    P.window.configure(pin[1], pin.back());
+  P.in_scratch.reserve(4096);
+  return pp;
+}
+} // namespace
+
+void SequenceProcessor::resetState()
+{
+  ++gen;
+  if(!pipe)
+    return;
+  for(auto& s : pipe->states)
+    std::fill(s.values.begin(), s.values.end(), 0.f);
+  pipe->window.reset();
 }
 
 void SequenceProcessor::reportError(std::string_view what)
 {
   failures.failed(name(), inputs.model.file.filename, what);
+}
+
+void SequenceProcessor::requestBuild()
+{
+  building = true;
+  requested = std::string(inputs.model.file.filename);
+  auto job = JobPool<SeqInferJob>::instance().acquire();
+  job->kind = SeqInferJob::Kind::Build;
+  job->build_path = requested;
+  job->build_bytes = inputs.model.file.bytes.size();
+  worker.request(std::move(job));
+}
+
+// On the processing thread: the new model replaces the running one, which
+// goes back to the worker to be freed.
+void SequenceProcessor::install(std::shared_ptr<SeqPipeline> p)
+{
+  std::swap(pipe, p);
+  inferenceInProgress = false;
+  resetState(); // bumps gen: a job of the old model brings nothing back
+  resolveWindow();
+  dispose(std::move(p));
+}
+
+void SequenceProcessor::dispose(std::shared_ptr<SeqPipeline> p)
+{
+  if(!p)
+    return;
+  auto job = JobPool<SeqInferJob>::instance().acquire();
+  job->kind = SeqInferJob::Kind::Dispose;
+  job->pipeline = std::move(p);
+  worker.request(std::move(job));
 }
 
 // The model needs a fixed T when the primary input rank>=3 with a concrete time
@@ -353,7 +581,9 @@ void SequenceProcessor::resolveWindow()
 {
   lastWindowMode = inputs.window_mode.value;
   resolvedWindow = Onnx::WindowMode::Passthrough;
-  const auto& pin = spec.inputs[primaryIn].shape;
+  if(!pipe)
+    return;
+  const auto& pin = pipe->spec.inputs[pipe->primaryIn].shape;
   const bool fixedTime = pin.size() >= 3 && pin[1] > 1;
   switch(inputs.window_mode.value)
   {
@@ -369,39 +599,25 @@ void SequenceProcessor::resolveWindow()
           = fixedTime ? Onnx::WindowMode::Sliding : Onnx::WindowMode::Passthrough;
       break;
   }
-  window.configure(0, 0); // forces reconfigure on first buildInput
+  // Start the history over, in the buffers it has (no reallocation).
+  pipe->window.reset();
 }
 
 void SequenceProcessor::operator()()
 try
 {
   ONNX_PROF_SCOPE(Total);
-  if(!available)
-    return;
-  if(inputs.model.current_model_invalid)
-    return;
-  if(inputs.model.file.bytes.empty())
+  if(!available || inputs.model.current_model_invalid
+     || inputs.model.file.bytes.empty())
     return;
 
-  if(!ctx || lastModelPath != inputs.model.file.filename)
-  {
-    try
-    {
-      reloadModel();
-    }
-    catch(const std::exception& e)
-    {
-      lastModelPath = inputs.model.file.filename;
-      reportError(e.what());
-      ctx.reset();
-      inputs.model.current_model_invalid = true;
-      return;
-    }
-    if(inputs.model.current_model_invalid)
-      return; // the probe failed
-  }
-  if(spec.inputs.empty() || spec.outputs.empty())
+  // A new file: its pipeline is built (and probed) on the worker.
+  if(!building && (!pipe || pipe->path != inputs.model.file.filename)
+     && requested != inputs.model.file.filename)
+    requestBuild();
+  if(!pipe || pipe->spec.inputs.empty() || pipe->spec.outputs.empty())
     return;
+  auto& P = *pipe;
   if(inputs.window_mode.value != lastWindowMode)
     resolveWindow();
 
@@ -415,30 +631,32 @@ try
 
   // Build the primary input ([1,T,F] / [1,D]) from the payload, windowing as
   // resolved. feat_hint comes from a concrete last declared dim if present.
-  const auto& declared = spec.inputs[primaryIn].shape;
+  const auto& declared = P.spec.inputs[P.primaryIn].shape;
   const int64_t feat_hint
       = (!declared.empty() && declared.back() > 0) ? declared.back() : 0;
 
   Onnx::InputBuild b = Onnx::buildInput(
-      declared, inputs.in.value, resolvedWindow, window, in_scratch, feat_hint,
+      declared, inputs.in.value, resolvedWindow, P.window, P.in_scratch, feat_hint,
       /*require_full_window*/ true);
   if(!b.ready || !b.data || b.count <= 0)
     return; // window not yet filled, or nothing to feed
 
-  std::vector<float> input(b.data, b.data + b.count);
-  normalizeFrames(input, b.shape, inputs.normalize.value);
-  if(batch > 1 && !b.shape.empty())
+  // Into the pipeline's buffer (the job hands its own back, see dispatchInfer).
+  P.input.resize((std::size_t)(b.count * std::max<int64_t>(P.batch, 1)));
+  std::copy_n(b.data, b.count, P.input.begin());
+  normalizeFrames(std::span<float>(P.input.data(), (std::size_t)b.count), b.shape,
+                  inputs.normalize.value);
+  if(P.batch > 1 && !b.shape.empty())
   {
-    input.resize((std::size_t)(b.count * batch));
-    for(int64_t k = 1; k < batch; ++k)
-      std::copy_n(input.begin(), b.count, input.begin() + k * b.count);
-    b.shape[0] = batch;
+    for(int64_t k = 1; k < P.batch; ++k)
+      std::copy_n(P.input.begin(), b.count, P.input.begin() + k * b.count);
+    b.shape[0] = P.batch;
   }
+  P.ishape.assign(b.shape.begin(), b.shape.end());
 
   // Heavy if the model is large or the flattened input is big.
-  const bool heavy = inputs.model.file.bytes.size() > 64u * 1024 * 1024
-                     || b.count > 1 << 20;
-  dispatchInfer(std::move(input), std::move(b.shape), heavy);
+  const bool heavy = P.model_bytes > 64u * 1024 * 1024 || b.count > 1 << 20;
+  dispatchInfer(heavy);
 }
 catch(const std::exception& e)
 {
@@ -451,146 +669,10 @@ catch(...)
   reportError("unknown error");
 }
 
-namespace
+void SequenceProcessor::dispatchInfer(bool force_async)
 {
-// Run a full multi-IO inference: place the primary input + all recurrent-state
-// inputs at their model-declared indices, run every declared output, decode the
-// primary/data outputs and capture the new state values.
-SeqResult runInference(
-    Onnx::OnnxRunContext& ctx, const Onnx::ModelSpec& spec,
-    std::vector<float>& input, const std::vector<int64_t>& ishape,
-    TensorElemType in_dt, int primary_in, int primary_out, int data_out,
-    std::vector<SeqInferJob::State>& states, const std::vector<Onnx::AuxPlan>& aux,
-    std::span<const float> params, int64_t batch)
-{
-  const int nin = (int)spec.input_names_char.size();
-  const int nout = (int)spec.output_names_char.size();
-
-  // Staging buffers must outlive the inference (tensors are non-owning views).
-  std::vector<int64_t> i64_buf;
-  std::vector<int32_t> i32_buf;
-  std::vector<double> f64_buf;
-  // Per-state staging (own vectors so views stay valid).
-  std::vector<std::vector<int64_t>> s_i64(states.size());
-  std::vector<std::vector<int32_t>> s_i32(states.size());
-  std::vector<std::vector<double>> s_f64(states.size());
-
-  std::vector<Ort::Value> ins;
-  ins.reserve(nin);
-  for(int i = 0; i < nin; ++i)
-    ins.emplace_back(nullptr);
-
-  ins[primary_in]
-      = buildTensor(input, ishape, in_dt, i64_buf, i32_buf, f64_buf);
-
-  for(size_t k = 0; k < states.size(); ++k)
-  {
-    auto& st = states[k];
-    if(st.in_index < 0 || st.in_index >= nin)
-      continue;
-    ins[st.in_index] = buildTensor(
-        st.values, st.shape, st.dt, s_i64[k], s_i32[k], s_f64[k]);
-  }
-
-  // The other inputs, by the aux plan: sr gets the rate, scalars Param 1 / 2,
-  // the rest zeros. Each keeps its own storage while the tensors are alive.
-  std::vector<std::vector<uint8_t>> aux_store(aux.size());
-  std::vector<std::vector<int64_t>> aux_shape(aux.size());
-  Onnx::AuxHost host{.params = params, .primary_shape = ishape, .batch = batch};
-  for(std::size_t k = 0; k < aux.size(); ++k)
-    if(aux[k].index >= 0 && aux[k].index < nin && !ins[aux[k].index])
-      ins[aux[k].index] = Onnx::fillAux(aux[k], host, aux_store[k], aux_shape[k]);
-
-  // Anything still unfilled (a state the pairing released) gets zeros so ORT
-  // has a value for every declared name.
-  std::vector<std::vector<float>> filler(nin);
-  std::vector<std::vector<int64_t>> f_i64(nin);
-  std::vector<std::vector<int32_t>> f_i32(nin);
-  std::vector<std::vector<double>> f_f64(nin);
-  for(int i = 0; i < nin; ++i)
-  {
-    if(ins[i])
-      continue;
-    auto shp = spec.inputs[i].shape;
-    for(auto& d : shp)
-      if(d <= 0)
-        d = 1;
-    filler[i].assign((size_t)flatPos(shp), 0.f);
-    ins[i] = buildTensor(
-        filler[i], shp, spec.inputs[i].elem_type, f_i64[i], f_i32[i], f_f64[i]);
-  }
-
-  std::vector<Ort::Value> outs;
-  outs.reserve(nout);
-  for(int i = 0; i < nout; ++i)
-    outs.emplace_back(nullptr);
-
-  ctx.infer(spec, ins, outs);
-
-  SeqResult r;
-  std::vector<float> scratch;
-  auto decode = [&](int idx, std::vector<float>& dst)
-  {
-    const auto info = outs[idx].GetTensorTypeAndShapeInfo();
-    const int64_t cnt = (int64_t)info.GetElementCount();
-    const TensorElemType odt
-        = Onnx::fromOrtElementType(info.GetElementType());
-    const void* raw = outs[idx].GetTensorData<uint8_t>();
-    const float* f = toFloatView(raw, cnt, odt, scratch);
-    // A replicated batch: every slice is the same, keep the first.
-    const auto oshape = info.GetShape();
-    const int64_t n = (batch > 1 && oshape.size() >= 2 && oshape[0] == batch)
-                          ? cnt / batch
-                          : cnt;
-    dst.assign(f, f + std::max<int64_t>(n, 0));
-  };
-
-  const int po = std::clamp(primary_out, 0, nout - 1);
-  decode(po, r.out);
-  if(data_out >= 0 && data_out < nout)
-  {
-    decode(data_out, r.data);
-    r.has_data = true;
-  }
-
-  // Capture new state values for feedback.
-  for(auto& st : states)
-  {
-    if(st.out_index < 0 || st.out_index >= nout)
-      continue;
-    SeqResult::NewState ns;
-    ns.in_index = st.in_index;
-    decode(st.out_index, ns.values);
-    r.states.push_back(std::move(ns));
-  }
-  return r;
-}
-
-void applyResult(SequenceProcessor& self, SeqResult& r)
-{
-  self.failures.succeeded();
-  self.outputs.out.value = std::move(r.out);
-  if(r.has_data)
-    self.outputs.data.value = std::move(r.data);
-  else
-    self.outputs.data.value = self.outputs.out.value;
-
-  // Swap new state values back into the persistent buffers (size-checked).
-  for(auto& ns : r.states)
-    for(auto& sb : self.states)
-      if(sb.in_index == ns.in_index)
-      {
-        if(ns.values.size() == sb.values.size())
-          sb.values = std::move(ns.values);
-        break;
-      }
-}
-} // namespace
-
-void SequenceProcessor::dispatchInfer(
-    std::vector<float> input, std::vector<int64_t> ishape, bool force_async)
-{
-  const TensorElemType in_dt = spec.inputs[primaryIn].elem_type;
+  auto& P = *pipe;
+  const TensorElemType in_dt = P.spec.inputs[P.primaryIn].elem_type;
 
   if(force_async)
   {
@@ -601,103 +683,42 @@ void SequenceProcessor::dispatchInfer(
     // Pooled job: lock-free acquire; recycled vectors keep their capacity so
     // the assignments below don't allocate in steady state.
     auto job = JobPool<SeqInferJob>::instance().acquire();
-    job->ctx = ctx;
-    job->input = std::move(input);
-    job->ishape = std::move(ishape);
+    job->kind = SeqInferJob::Kind::Infer;
+    job->ctx = P.ctx;
+    std::swap(job->input, P.input); // the job's recycled buffer comes back
+    job->ishape.assign(P.ishape.begin(), P.ishape.end());
     job->in_dt = in_dt;
-    job->primary_in_index = primaryIn;
-    job->primary_out_index = primaryOut;
-    job->aux = aux;
+    job->primary_in_index = P.primaryIn;
+    job->primary_out_index = P.primaryOut;
+    job->aux = P.aux;
     job->params[0] = inputs.param1.value;
     job->params[1] = inputs.param2.value;
-    job->data_out_index = dataOut;
-    job->batch = batch;
+    job->data_out_index = P.dataOut;
+    job->batch = P.batch;
     job->gen = gen;
     // The job is recycled: resize + indexed assignment (not push_back) so
     // stale states from a previous use never accumulate.
-    job->states.resize(states.size());
-    for(std::size_t k = 0; k < states.size(); ++k)
+    job->states.resize(P.states.size());
+    for(std::size_t k = 0; k < P.states.size(); ++k)
     {
       auto& js = job->states[k];
-      js.in_index = states[k].in_index;
-      js.out_index = states[k].out_index;
-      js.shape = states[k].shape;
-      js.dt = states[k].dt;
-      js.values = states[k].values;
+      js.in_index = P.states[k].in_index;
+      js.out_index = P.states[k].out_index;
+      js.shape.assign(P.states[k].shape.begin(), P.states[k].shape.end());
+      js.dt = P.states[k].dt;
+      js.values.assign(P.states[k].values.begin(), P.states[k].values.end());
     }
     worker.request(std::move(job));
     return;
   }
 
-  std::vector<SeqInferJob::State> st;
-  for(auto& sb : states)
-    st.push_back({sb.in_index, sb.out_index, sb.shape, sb.dt, sb.values});
-
+  // Synchronous: the states are fed as they are, and the pipeline's scratch
+  // and result are reused.
   const float params[2]{inputs.param1.value, inputs.param2.value};
-  SeqResult r = runInference(
-      *ctx, spec, input, ishape, in_dt, primaryIn, primaryOut, dataOut, st, aux,
-      params, batch);
-  applyResult(*this, r);
-}
-
-// One zero inference at load, when the model's input shape does not depend
-// on the payload (every dim but the batch is concrete): a model that cannot
-// run is reported with its error instead of failing on every tick. When it
-// fails at batch 1 on a dynamic batch, the graph may have one baked in
-// (Informer: 2), which is tried next.
-bool SequenceProcessor::probe()
-{
-  const auto& pin = spec.inputs[primaryIn].shape;
-  if(pin.empty())
-    return true;
-  for(std::size_t k = 1; k < pin.size(); ++k)
-    if(pin[k] <= 0)
-      return true;
-  if(inputs.model.file.bytes.size() > 64u * 1024 * 1024)
-    return true; // the probe would stall the render thread
-
-  auto run = [&](int64_t b)
-  {
-    auto shape = pin;
-    shape[0] = b;
-    std::vector<float> input((size_t)flatPos(shape), 0.f);
-    std::vector<SeqInferJob::State> st;
-    for(auto& sb : states)
-      st.push_back({sb.in_index, sb.out_index, sb.shape, sb.dt, sb.values});
-    const float params[2]{};
-    runInference(
-        *ctx, spec, input, shape, spec.inputs[primaryIn].elem_type, primaryIn,
-        primaryOut, dataOut, st, aux, params, b);
-  };
-
-  try
-  {
-    run(batch);
-    return true;
-  }
-  catch(const std::exception& e)
-  {
-    const std::string first = e.what();
-    if(pin.size() >= 2 && pin[0] <= 0 && batch == 1 && states.empty())
-    {
-      try
-      {
-        run(2);
-        batch = 2;
-        std::fprintf(
-            stderr,
-            "Sequence Processor: %s: the graph needs a batch of 2, the input "
-            "is fed twice\n",
-            lastModelPath.c_str());
-        return true;
-      }
-      catch(...)
-      {
-      }
-    }
-    reportError("the model does not run: " + first);
-    return false;
-  }
+  runInference(
+      *P.ctx, P.spec, P.input, P.ishape, in_dt, P.primaryIn, P.primaryOut, P.dataOut,
+      P.states, P.aux, params, P.batch, P.scratch, P.result);
+  applyResult(*this, P.result);
 }
 
 std::function<void(SequenceProcessor&)>
@@ -711,26 +732,76 @@ SequenceProcessor::worker::work(std::unique_ptr<SeqInferJob> job)
     ~Recycle()
     {
       if(j)
+      {
         j->ctx.reset(); // don't keep the ORT session alive from the pool
+        j->pipeline.reset();
+        j->kind = SeqInferJob::Kind::Infer;
+      }
       JobPool<SeqInferJob>::instance().release(std::move(j));
     }
   } recycle{job};
+
+  if(job && job->kind == SeqInferJob::Kind::Dispose)
+  {
+    job->pipeline.reset(); // the session and the buffers are freed here
+    return {};
+  }
+  if(job && job->kind == SeqInferJob::Kind::Build)
+  {
+    try
+    {
+      auto p = makeSeqPipeline(job->build_path, job->build_bytes);
+      return [p = std::move(p)](SequenceProcessor& self) mutable
+      {
+        self.building = false;
+        if(p->path != self.inputs.model.file.filename)
+        {
+          self.requested.clear(); // another file was picked meanwhile
+          self.dispose(std::move(p));
+          return;
+        }
+        if(!p->refusal.empty())
+        {
+          self.reportError(p->refusal);
+          self.inputs.model.current_model_invalid = true;
+          self.dispose(std::move(p));
+          return;
+        }
+        self.failures.succeeded();
+        self.install(std::move(p));
+      };
+    }
+    catch(const std::exception& e)
+    {
+      return [what = std::string(e.what()), path = job->build_path](SequenceProcessor& self)
+      {
+        self.building = false;
+        if(path != self.inputs.model.file.filename)
+          return;
+        self.reportError("cannot load the model: " + what);
+        self.inputs.model.current_model_invalid = true;
+      };
+    }
+  }
 
   if(!job || !job->ctx)
     return [](SequenceProcessor& self) { self.inferenceInProgress = false; };
   try
   {
     const auto& spec = job->ctx->readModelSpec();
-    SeqResult r = runInference(
+    SeqScratch sc;
+    SeqResult r;
+    runInference(
         *job->ctx, spec, job->input, job->ishape, job->in_dt,
         job->primary_in_index, job->primary_out_index, job->data_out_index,
-        job->states, job->aux, job->params, job->batch);
-    return [r = std::move(r), gen = job->gen](SequenceProcessor& self) mutable
+        job->states, job->aux, job->params, job->batch, sc, r);
+    auto rp = std::make_shared<SeqResult>(std::move(r));
+    return [rp = std::move(rp), gen = job->gen](SequenceProcessor& self) mutable
     {
       self.inferenceInProgress = false;
       if(gen != self.gen)
         return; // Reset or a new model while it ran: its state is stale
-      applyResult(self, r);
+      applyResult(self, *rp);
     };
   }
   catch(const std::exception& e)

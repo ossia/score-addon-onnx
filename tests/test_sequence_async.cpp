@@ -1,6 +1,7 @@
 // Sequence Processor with a job in flight (BUG-LEDGER S6) and the choice of
 // its data input (S7).
 #include <OnnxModels/SequenceProcessor.hpp>
+#include <tests/TestWorker.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -36,7 +37,15 @@ struct Deferred
     bytes = slurp(path);
     node.inputs.model.file.bytes = bytes;
     node.inputs.model.file.filename = name;
+    // Loading a model and freeing the old one run right away; only the
+    // inference jobs wait.
     node.worker.request = [this](std::unique_ptr<OnnxModels::SeqInferJob> job) {
+      if(job->kind != OnnxModels::SeqInferJob::Kind::Infer)
+      {
+        if(auto done = OnnxModels::SequenceProcessor::worker::work(std::move(job)))
+          done(node);
+        return;
+      }
       ++requests;
       held = std::move(job);
     };
@@ -47,7 +56,7 @@ struct Deferred
     if(auto done = OnnxModels::SequenceProcessor::worker::work(std::move(held)))
       done(node);
   }
-  float state() const { return node.states.at(0).values.at(0); }
+  float state() const { return node.currentStates().at(0).values.at(0); }
   // More than 1 << 20 values: the worker path.
   void tick(bool payload = true)
   {
@@ -109,6 +118,7 @@ TEST_CASE("Sequence Processor: a scalar declared first stays a control", "[onnx]
 {
   REQUIRE(OnnxModels::initOnnxRuntime());
   OnnxModels::SequenceProcessor node;
+  inlineWorker(node);
   const std::string path = fixtures + "scalar_first.onnx";
   const auto bytes = slurp(path);
   node.inputs.model.file.bytes = bytes;

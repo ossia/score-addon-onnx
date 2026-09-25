@@ -2,6 +2,7 @@
 // window mode was only resolved on model reload, so switching it later did
 // nothing. RNNoise takes [?,100,42]: Sliding streams 42-value frames into its
 // 100-frame window, Passthrough feeds each payload on its own.
+#include <tests/TestWorker.hpp>
 #include <tests/TestPaths.hpp>
 #include <OnnxModels/SequenceProcessor.hpp>
 
@@ -46,6 +47,7 @@ void load(OnnxModels::SequenceProcessor& p, const std::string& bytes, const std:
 {
   p.inputs.model.file.bytes = bytes;
   p.inputs.model.file.filename = name;
+  inlineWorker(p);
 }
 }
 

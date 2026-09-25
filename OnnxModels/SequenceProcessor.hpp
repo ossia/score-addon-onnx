@@ -34,8 +34,98 @@ struct SequenceProcessor;
 // heap-allocated and recycled through the lock-free JobPool (only the
 // unique_ptr crosses the queue; recycled vectors keep their capacity, so the
 // steady-state request path does not allocate). See OnnxModels/JobPool.hpp.
+// A recurrent state: an input fed from the output it is paired with.
+struct SeqState
+{
+  int in_index = 0;
+  int out_index = 0;
+  std::vector<int64_t> shape;
+  Onnx::TensorElemType dt = Onnx::TensorElemType::Float;
+  std::vector<float> values;
+};
+
+// Staging for one inference, reused from run to run on the processing thread
+// (tensors are non-owning views over these).
+struct SeqScratch
+{
+  std::vector<int64_t> i64;
+  std::vector<int32_t> i32;
+  std::vector<double> f64;
+  std::vector<std::vector<int64_t>> s_i64, f_i64;
+  std::vector<std::vector<int32_t>> s_i32, f_i32;
+  std::vector<std::vector<double>> s_f64, f_f64;
+  std::vector<std::vector<float>> filler;
+  std::vector<std::vector<uint8_t>> aux_store;
+  std::vector<std::vector<int64_t>> aux_shape;
+  std::vector<Ort::Value> ins, outs;
+  std::vector<float> decode;
+  std::vector<int64_t> oshape;
+};
+
+// A decoded result: the primary output (Out), an optional secondary Data
+// output, and the new recurrent-state values.
+struct SeqResult
+{
+  std::vector<float> out;
+  std::vector<float> data;
+  bool has_data = false;
+  struct NewState
+  {
+    int in_index = 0;
+    std::vector<float> values;
+  };
+  std::vector<NewState> states;
+};
+
+// What the node's model resolves to: the session, the I/O routing, the aux
+// plans, the batch the probe found, the recurrent states, the window ring and
+// the synchronous path's scratch. Built by a worker job (creating the session
+// and running the probe inference there), never on the processing thread;
+// the processing thread swaps it in and hands the old one back to the worker
+// to be freed.
+struct SeqPipeline
+{
+  std::string path;
+  std::size_t model_bytes = 0;
+  std::shared_ptr<Onnx::OnnxRunContext> ctx;
+  Onnx::ModelSpec spec;
+  Onnx::ModelArchetype arch;
+  std::string refusal; // non-empty: the model does not run
+
+  int primaryIn = 0;
+  int primaryOut = 0;
+  int dataOut = -1;
+  bool stateful = false;
+  std::vector<Onnx::AuxPlan> aux; // inputs other than the primary and states
+  // Exports that bake a batch size into the graph (Informer: 2, while the
+  // input declares it dynamic) are fed that many copies of the input.
+  int64_t batch = 1;
+  std::vector<SeqState> states;
+
+  // Sized here when the model's T and F are known, so the processing thread
+  // does not allocate it on the first frames.
+  Onnx::FrameWindow window;
+  std::vector<float> in_scratch;
+  std::vector<float> input; // the primary input of the next run
+  std::vector<int64_t> ishape;
+  SeqScratch scratch;       // the synchronous path's
+  SeqResult result;         // the synchronous path's
+};
+
 struct SeqInferJob
 {
+  // Infer runs the model; Build makes a pipeline for build_path; Dispose frees
+  // `pipeline` here, off the processing thread.
+  enum class Kind : uint8_t
+  {
+    Infer,
+    Build,
+    Dispose
+  } kind = Kind::Infer;
+  std::string build_path;
+  std::size_t build_bytes = 0;
+  std::shared_ptr<SeqPipeline> pipeline;
+
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   std::vector<float> input;        // primary input, flattened [1,T,F]/[1,D]
   std::vector<int64_t> ishape;     // primary input shape (batch == 1)
@@ -49,14 +139,7 @@ struct SeqInferJob
   // Recurrent state threaded internally: for each (input_index -> output_index)
   // pair, the current state values + shape. work() feeds `values` in and reads
   // the matching output back out into the returned applicator.
-  struct State
-  {
-    int in_index = 0;
-    int out_index = 0;
-    std::vector<int64_t> shape;
-    Onnx::TensorElemType dt = Onnx::TensorElemType::Float;
-    std::vector<float> values;
-  };
+  using State = SeqState;
   std::vector<State> states;
 
   // The other inputs (Silero sr, scalar controls): planned at load, filled here.
@@ -129,53 +212,35 @@ public:
     work(std::unique_ptr<SeqInferJob> job);
   } worker;
 
-  // Recurrent-state buffers, persistent across ticks (zero-init; Reset
-  // re-zeros). Public: applyResult() (a free function in the .cpp, reached from
-  // the worker completion lambda) swaps fresh values back in.
-  struct StateBuf
+  // The running model's recurrent states (for tests; empty before a model).
+  const std::vector<SeqState>& currentStates() const noexcept
   {
-    int in_index = 0;
-    int out_index = 0;
-    std::vector<int64_t> shape;
-    Onnx::TensorElemType dt = Onnx::TensorElemType::Float;
-    std::vector<float> values;
-  };
-  std::vector<StateBuf> states;
+    static const std::vector<SeqState> none;
+    return pipe ? pipe->states : none;
+  }
+
+  // Public for applyResult() (a free function in the .cpp, reached from the
+  // worker completion lambda).
+  std::shared_ptr<SeqPipeline> pipe;
 
 private:
-  std::shared_ptr<Onnx::OnnxRunContext> ctx;
-  Onnx::ModelSpec spec;
-  Onnx::ModelArchetype arch;
-  std::string lastModelPath;
+  bool building = false;
+  std::string requested; // the file the last build was for
   bool inferenceInProgress = false;
-
-  // Resolved I/O routing (computed at reload from the archetype).
-  int primaryIn = 0;
-  int primaryOut = 0;
-  int dataOut = -1;
-  bool stateful = false;
   Onnx::WindowMode resolvedWindow = Onnx::WindowMode::Passthrough;
   SeqWindowMode lastWindowMode{};
-  std::vector<Onnx::AuxPlan> aux; // inputs other than the primary and states
-  // Exports that bake a batch size into the graph (Informer: 2, while the
-  // input declares it dynamic) are fed that many copies of the input.
-  int64_t batch = 1;
-  // Bumped by Reset and by a model reload: a job dispatched before either
-  // must not bring its state and output back.
+  // Bumped by Reset and by a new model: a job dispatched before either must
+  // not bring its state and output back.
   uint32_t gen = 0;
 
   void reportError(std::string_view what);
-  bool probe();
+  void requestBuild();
+  void install(std::shared_ptr<SeqPipeline> p);
+  void dispose(std::shared_ptr<SeqPipeline> p);
 
-  // Hot-path scratch (reused).
-  Onnx::FrameWindow window;
-  std::vector<float> in_scratch;
-
-  void reloadModel();
   void resolveWindow();
   void resetState();
-  void dispatchInfer(
-      std::vector<float> input, std::vector<int64_t> ishape, bool force_async);
+  void dispatchInfer(bool force_async);
 };
 
 }
