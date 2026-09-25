@@ -101,3 +101,29 @@ TEST_CASE("Audio Processor: overlap-add gives the input back", "[onnx][audio]")
   CHECK(half >= 2 * none - 2);
   CHECK(quarter >= 4 * none - 4);
 }
+
+// A mono model on a stereo output: each host channel popped the one model
+// ring in turn, so left got a block, right the next, and each side lost
+// half the audio (the vocoders came out garbled in score).
+TEST_CASE("Audio output: a mono model plays on both host channels", "[onnx][audio]")
+{
+  Onnx::WaveformOutput out;
+  out.prepare(1, 48000., 48000., 1024, 256);
+  std::vector<float> ramp(1024);
+  for(int i = 0; i < 1024; i++)
+    ramp[i] = (float)i;
+  out.push(ramp.data(), 1, 1024);
+
+  std::vector<float> l(256), r(256), all;
+  float* chans[2]{l.data(), r.data()};
+  for(int k = 0; k < 3; k++)
+  {
+    out.pull(chans, 2, 256);
+    CHECK(l == r);
+    all.insert(all.end(), l.begin(), l.end());
+  }
+  // Consecutive: no block went to the other side.
+  for(std::size_t i = 1; i < all.size(); i++)
+    REQUIRE(all[i] >= all[i - 1]);
+  CHECK(all.back() > 700.f);
+}

@@ -549,16 +549,21 @@ struct WaveformOutput
   }
 
   // Drain `frames` into the host channels; missing samples are zero-filled.
+  // Host channels past the model's copy its last channel: popping that ring
+  // again would hand each host channel every other block (a mono vocoder on
+  // a stereo output lost half its samples on each side).
   void pull(float* const* chans, int host_channels, std::size_t frames)
   {
-    for(int c = 0; c < host_channels; ++c)
+    const int popped = std::min(host_channels, std::min(channels, (int)rings.size()));
+    for(int c = 0; c < popped; ++c)
+      if(!rings[c].pop(chans[c], frames))
+        std::fill_n(chans[c], frames, 0.f);
+    for(int c = std::max(popped, 0); c < host_channels; ++c)
     {
-      const int src = (c < channels) ? c : (channels - 1);
-      if(src < 0 || src >= (int)rings.size() || !rings[src].pop(chans[c], frames))
-      {
-        for(std::size_t i = 0; i < frames; ++i)
-          chans[c][i] = 0.f;
-      }
+      if(popped > 0)
+        std::copy_n(chans[popped - 1], frames, chans[c]);
+      else
+        std::fill_n(chans[c], frames, 0.f);
     }
   }
 
