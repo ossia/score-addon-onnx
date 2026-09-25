@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -138,4 +139,39 @@ TEST_CASE("Image Generator: the old model's Auto mapping does not carry over", "
   REQUIRE(out.changed);
   // With tanh's Denormalize latched, (20 + 1) * 127.5 saturates at 255.
   CHECK(out.bytes[0] == 20);
+}
+
+// BUG-LEDGER I7: an image-pair model (FILM, RIFE) always ran on the render
+// thread, whatever its size; at HD one frame took seconds. A heavy one now
+// runs on the worker like a single-input model.
+TEST_CASE("Image Processor: a heavy image-pair model runs on the worker", "[onnx][image]")
+{
+  REQUIRE(OnnxModels::initOnnxRuntime());
+  Deferred<OnnxModels::ImageProcessor, OnnxModels::InferJob> p;
+  QImage a{64, 64, QImage::Format_RGBA8888}, b{64, 64, QImage::Format_RGBA8888};
+  a.fill(QColor(200, 0, 0));
+  b.fill(QColor(0, 0, 100));
+  p.node.inputs.normalization.value = OnnxModels::InputNormalization::DivBy255;
+  p.node.inputs.resolution.value = {768, 768}; // above 512²
+  p.load(dir + "pair_mean.onnx");
+  auto& t = p.node.inputs.image.texture;
+  t.bytes = a.bits();
+  t.width = a.width();
+  t.height = a.height();
+  t.changed = true;
+  auto& u = p.node.inputs.aux.texture;
+  u.bytes = b.bits();
+  u.width = b.width();
+  u.height = b.height();
+  u.changed = true;
+  p.node.outputs.image.texture.changed = false;
+  p.node();
+  REQUIRE(p.held); // queued, not run inline
+  CHECK(p.held->multi);
+  CHECK_FALSE(p.node.outputs.image.texture.changed);
+  p.complete();
+  auto& out = p.node.outputs.image.texture;
+  REQUIRE(out.changed);
+  CHECK(std::abs(out.bytes[0] - 100) <= 1); // (200 + 0) / 2
+  CHECK(std::abs(out.bytes[2] - 50) <= 1);  // (0 + 100) / 2
 }

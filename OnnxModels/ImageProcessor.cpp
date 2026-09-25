@@ -446,6 +446,79 @@ void ImageProcessor::runImage()
 // Params, zero-filled leftovers) and runs synchronously. Single-input models
 // never reach here. Backing buffers (members + the in-scope locals) outlive the
 // synchronous infer() call.
+namespace
+{
+struct MultiInputs
+{
+  boost::container::vector<float>* primary{};
+  std::vector<int64_t> primary_shape;
+  TensorElemType primary_dt{};
+  int primary_index = 0;
+  boost::container::vector<float>* aux{};
+  std::vector<int64_t> aux_shape;
+  TensorElemType aux_dt{};
+  int aux_index = -1;
+  int param_index[2]{-1, -1};
+  float param_value[2]{};
+};
+
+// Builds every input of a multi-input model (the images, Param 1 / 2 as
+// scalars, zeros for the rest) and runs it; the render thread and the worker
+// share it.
+void runMulti(
+    Onnx::OnnxRunContext& ctx, const Onnx::ModelSpec& spec, MultiInputs& mi,
+    std::vector<Ort::Value>& outs, std::vector<uint16_t>& half_buf,
+    std::vector<uint8_t>& u8_buf, std::vector<uint16_t>& aux_half_buf,
+    std::vector<uint8_t>& aux_u8_buf)
+{
+  const int nin = (int)spec.inputs.size();
+  const int nout = (int)spec.output_names_char.size();
+  std::vector<Ort::Value> ins;
+  ins.reserve(nin);
+  for(int i = 0; i < nin; ++i)
+    ins.emplace_back(nullptr);
+
+  ins[mi.primary_index]
+      = buildInputTensor(*mi.primary, mi.primary_shape, mi.primary_dt, half_buf, u8_buf);
+  if(mi.aux && mi.aux_index >= 0 && mi.aux_index < nin)
+    ins[mi.aux_index]
+        = buildInputTensor(*mi.aux, mi.aux_shape, mi.aux_dt, aux_half_buf, aux_u8_buf);
+
+  // Scalar params (single-element float tensors; their storage must outlive Run).
+  auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  for(int k = 0; k < 2; ++k)
+  {
+    const int p = mi.param_index[k];
+    if(p >= 0 && p < nin)
+    {
+      auto sh = concreteShape(spec.inputs[p].shape);
+      ins[p] = Ort::Value::CreateTensor<float>(
+          mem, &mi.param_value[k], 1, sh.data(), sh.size());
+    }
+  }
+
+  // Zero-fill any input we didn't bind (defensive; keeps the model runnable).
+  std::vector<boost::container::vector<float>> zero_bufs(nin);
+  for(int i = 0; i < nin; ++i)
+  {
+    if(ins[i])
+      continue;
+    auto sh = concreteShape(spec.inputs[i].shape);
+    int64_t n = 1;
+    for(auto d : sh)
+      n *= d;
+    zero_bufs[i].assign((std::size_t)n, 0.f);
+    ins[i] = Onnx::vec_to_tensor<float>(zero_bufs[i], sh);
+  }
+
+  outs.clear();
+  outs.reserve(nout);
+  for(int i = 0; i < nout; ++i)
+    outs.emplace_back(nullptr);
+  ctx.infer(spec, ins, outs);
+}
+}
+
 void ImageProcessor::runImageMulti()
 {
   const ImageModelKind kind = applyTaskOverride(role.kind, inputs.task.value);
@@ -458,21 +531,17 @@ void ImageProcessor::runImageMulti()
   const int rx = inputs.resolution.value.x, ry = inputs.resolution.value.y;
   const int stride = role.in_stride;
 
-  std::vector<Ort::Value> ins;
-  ins.reserve(nin);
-  for(int i = 0; i < nin; ++i)
-    ins.emplace_back(nullptr);
+  // Preprocessing stays here (the textures are only valid during the tick);
+  // running the model may not, see below.
+  std::vector<int64_t> primary_shape, aux_shape;
 
   // Primary image.
   {
     auto& t = inputs.image.texture;
-    const auto ish = preprocessTexture(
+    primary_shape = preprocessTexture(
         t.bytes, t.width, t.height, spec.inputs[image_input_index].shape,
         inputs.normalization.value, inputs.channel_order.value,
         inputs.resize_mode.value, rx, ry, stride, storage);
-    ins[image_input_index] = buildInputTensor(
-        storage, ish, spec.inputs[image_input_index].elem_type, half_buf,
-        u8_buf);
   }
 
   // Optional 2nd image (Aux). If unconnected, feed a zeroed frame of the right
@@ -517,45 +586,65 @@ void ImageProcessor::runImageMulti()
                              : std::vector<int64_t>{1, 3, mh, mw});
       }
     }
-    ins[aux_input_index] = buildInputTensor(
-        aux_storage, ish, spec.inputs[aux_input_index].elem_type, aux_half_buf,
-        aux_u8_buf);
+    aux_shape = std::move(ish);
   }
-
-  // Scalar params (single-element float tensors; their storage must outlive Run).
-  auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-  float pv[2] = {inputs.param1.value, inputs.param2.value};
-  for(int k = 0; k < 2; ++k)
-  {
-    if(param_in[k] >= 0 && param_in[k] < nin)
-    {
-      auto sh = concreteShape(spec.inputs[param_in[k]].shape);
-      ins[param_in[k]]
-          = Ort::Value::CreateTensor<float>(mem, &pv[k], 1, sh.data(), sh.size());
-    }
-  }
-
-  // Zero-fill any input we didn't bind (defensive; keeps the model runnable).
-  std::vector<boost::container::vector<float>> zero_bufs(nin);
-  for(int i = 0; i < nin; ++i)
-  {
-    if(ins[i])
-      continue;
-    auto sh = concreteShape(spec.inputs[i].shape);
-    int64_t n = 1;
-    for(auto d : sh)
-      n *= d;
-    zero_bufs[i].assign((std::size_t)n, 0.f);
-    ins[i] = Onnx::vec_to_tensor<float>(zero_bufs[i], sh);
-  }
-
-  std::vector<Ort::Value> outs;
-  outs.reserve(nout);
-  for(int i = 0; i < nout; ++i)
-    outs.emplace_back(nullptr);
-  ctx->infer(spec, ins, outs);
 
   const int idx = std::clamp(inputs.output_index.value, 0, nout - 1);
+  // An image-pair model at HD (FILM, RIFE) takes far longer than a frame:
+  // as for single-input models, a heavy one runs on the worker.
+  int64_t pixels = 1;
+  for(auto d : primary_shape)
+    pixels *= std::max<int64_t>(d, 1);
+  pixels /= 3;
+  const bool heavy = isHeavyModel(inputs.model.file.bytes.size(), pixels);
+
+  if(heavy)
+  {
+    if(inferenceInProgress)
+      return; // latest wins: drop this frame
+    inferenceInProgress = true;
+    auto job = JobPool<InferJob>::instance().acquire();
+    job->ctx = ctx;
+    job->multi = true;
+    std::swap(job->input, storage);
+    job->ishape = primary_shape;
+    job->in_dt = spec.inputs[image_input_index].elem_type;
+    job->image_index = image_input_index;
+    job->aux_index = aux_input_index;
+    if(aux_input_index >= 0)
+    {
+      std::swap(job->aux_input, aux_storage);
+      job->aux_shape = aux_shape;
+      job->aux_dt = spec.inputs[aux_input_index].elem_type;
+    }
+    for(int k = 0; k < 2; ++k)
+    {
+      job->param_index[k] = param_in[k];
+      job->param_value[k] = k == 0 ? inputs.param1.value : inputs.param2.value;
+    }
+    job->output_index = inputs.output_index.value;
+    job->kind = kind;
+    job->wm = wm;
+    job->out_kinds = out_kinds;
+    job->gen = gen;
+    worker.request(std::move(job));
+    return;
+  }
+
+  MultiInputs mi{
+      .primary = &storage,
+      .primary_shape = primary_shape,
+      .primary_dt = spec.inputs[image_input_index].elem_type,
+      .primary_index = image_input_index,
+      .aux = aux_input_index >= 0 ? &aux_storage : nullptr,
+      .aux_shape = aux_shape,
+      .aux_dt = aux_input_index >= 0 ? spec.inputs[aux_input_index].elem_type
+                                     : TensorElemType::Float,
+      .aux_index = aux_input_index,
+      .param_index = {param_in[0], param_in[1]},
+      .param_value = {inputs.param1.value, inputs.param2.value}};
+  std::vector<Ort::Value> outs;
+  runMulti(*ctx, spec, mi, outs, half_buf, u8_buf, aux_half_buf, aux_u8_buf);
   auto ds = decodeAll(outs, idx, kind, wm, out_kinds, out_scratch);
   applyDecoded(*this, ds);
 }
@@ -587,6 +676,7 @@ void ImageProcessor::dispatchInfer(
     job->kind = kind;
     job->wm = wm;
     job->out_kinds = out_kinds;
+    job->multi = false;
     job->gen = gen;
     worker.request(std::move(job));
     return;
@@ -628,18 +718,35 @@ ImageProcessor::worker::work(std::unique_ptr<InferJob> job)
   try
   {
     const auto& spec = job->ctx->readModelSpec();
-    std::vector<uint16_t> half_buf;
-    std::vector<uint8_t> u8_buf;
-    Ort::Value in_val = buildInputTensor(
-        job->input, job->ishape, job->in_dt, half_buf, u8_buf);
-
+    std::vector<uint16_t> half_buf, aux_half_buf;
+    std::vector<uint8_t> u8_buf, aux_u8_buf;
     const int nout = (int)spec.output_names_char.size();
     std::vector<Ort::Value> outs;
-    outs.reserve(nout);
-    for(int i = 0; i < nout; ++i)
-      outs.emplace_back(nullptr);
-    Ort::Value ins[1] = {std::move(in_val)};
-    job->ctx->infer(spec, ins, outs);
+    if(job->multi)
+    {
+      MultiInputs mi{
+          .primary = &job->input,
+          .primary_shape = job->ishape,
+          .primary_dt = job->in_dt,
+          .primary_index = job->image_index,
+          .aux = job->aux_index >= 0 ? &job->aux_input : nullptr,
+          .aux_shape = job->aux_shape,
+          .aux_dt = job->aux_dt,
+          .aux_index = job->aux_index,
+          .param_index = {job->param_index[0], job->param_index[1]},
+          .param_value = {job->param_value[0], job->param_value[1]}};
+      runMulti(*job->ctx, spec, mi, outs, half_buf, u8_buf, aux_half_buf, aux_u8_buf);
+    }
+    else
+    {
+      Ort::Value in_val = buildInputTensor(
+          job->input, job->ishape, job->in_dt, half_buf, u8_buf);
+      outs.reserve(nout);
+      for(int i = 0; i < nout; ++i)
+        outs.emplace_back(nullptr);
+      Ort::Value ins[1] = {std::move(in_val)};
+      job->ctx->infer(spec, ins, outs);
+    }
 
     const int idx = std::clamp(job->output_index, 0, nout - 1);
     std::vector<float> scratch;
