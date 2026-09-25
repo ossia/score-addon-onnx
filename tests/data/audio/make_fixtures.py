@@ -18,6 +18,13 @@ save("identity_512",
      [helper.make_tensor_value_info("audio", TensorProto.FLOAT, [1, 1, 512])],
      [helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, 1, 512])])
 
+
+# A model whose length is free: [1,1,N] -> the same.
+save("identity_dyn",
+     [helper.make_node("Identity", ["audio"], ["out"])],
+     [helper.make_tensor_value_info("audio", TensorProto.FLOAT, [1, 1, "N"])],
+     [helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, 1, "N"])])
+
 # Reference log-mel (HiFi-GAN settings, librosa's Slaney filterbank written
 # out with numpy) of one streaming block of a fixed three-tone signal, for
 # the MelFrontend test: float32 [80, 32].
