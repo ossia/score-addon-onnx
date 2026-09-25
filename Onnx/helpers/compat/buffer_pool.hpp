@@ -1,18 +1,24 @@
 #pragma once
-// Vendored, self-contained copy of ossia::object_pool (from libossia,
-// ossia/detail/buffer_pool.hpp). Used only for standalone builds, where
-// libossia is not on the include path; the score build picks the real header
-// via __has_include in JobPool.hpp. Keep API-compatible with ossia.
+// ossia::object_pool for JobPool.hpp.
 //
+// In a score build libossia is on the include path: its own header is used,
+// so the pool is not defined twice when another header of the build includes
+// ossia/detail/buffer_pool.hpp too.
+//
+// Standalone builds have no libossia: a vendored, API-compatible copy follows.
 // JobPool only uses ossia::object_pool<std::unique_ptr<Job>>, whose backing
 // store is a lock-free MPMC queue (ossia::mpmc_queue == moodycamel's
-// ConcurrentQueue). When the moodycamel header is available we use it directly
-// to keep the lock-free acquire()/release() semantics; otherwise we fall back
-// to a small mutex-guarded queue with the same API (acquire pops, release
-// pushes), which preserves correctness if not the lock-freedom.
+// ConcurrentQueue). When the moodycamel header is available it is used
+// directly, keeping the lock-free acquire()/release(); otherwise a small
+// mutex-guarded queue with the same API (acquire pops, release pushes) keeps
+// the behaviour, if not the lock-freedom.
+
+#if __has_include(<ossia/detail/buffer_pool.hpp>)
+#include <ossia/detail/buffer_pool.hpp>
+#else
+
 #include <mutex>
 #include <utility>
-
 #if __has_include(<concurrentqueue/concurrentqueue.h>)
 #define OSSIA_COMPAT_HAS_MOODYCAMEL 1
 #include <concurrentqueue/concurrentqueue.h>
@@ -73,3 +79,4 @@ struct object_pool
   void release(Obj_T b) { buffers.enqueue(std::move(b)); }
 };
 }
+#endif

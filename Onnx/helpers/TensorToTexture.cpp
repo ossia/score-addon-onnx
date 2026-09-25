@@ -1,6 +1,7 @@
 #include <Onnx/helpers/TensorToTexture.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace Onnx
@@ -56,8 +57,10 @@ inline float mapPixel(float v, float mn, float inv_range) noexcept
 {
   if constexpr(M == WriteMode::DirectClamp)
     return v * 255.f;
-  else if constexpr(M == WriteMode::MinMaxNormalize)
+  else if constexpr(M == WriteMode::MinMaxNormalize || M == WriteMode::AutoRange)
     return (v - mn) * inv_range * 255.f;
+  else if constexpr(M == WriteMode::Sigmoid)
+    return 255.f / (1.f + std::exp(-v));
   else if constexpr(M == WriteMode::Denormalize)
     return (v + 1.f) * 127.5f;
   else if constexpr(M == WriteMode::Passthrough)
@@ -88,6 +91,23 @@ struct Fetch
   }
 };
 
+// The offset and scale of the range-based modes: MinMaxNormalize always
+// stretches [lo,hi]; AutoRange keeps a frame that is already within [0,1],
+// give or take the rounding of an fp16 export: a -0.01 in one frame must not
+// switch the stretch on for that frame only (flicker).
+template <WriteMode M>
+inline void rangeParams(float lo, float hi, float& mn, float& inv_range) noexcept
+{
+  if(M == WriteMode::AutoRange && lo >= -0.02f && hi <= 1.02f)
+  {
+    mn = 0.f;
+    inv_range = 1.f;
+    return;
+  }
+  mn = lo;
+  inv_range = (hi - lo > 1e-9f) ? 1.f / (hi - lo) : 1.f;
+}
+
 template <WriteMode M>
 void writeRgbImpl(const float* data, const OutSpec& s, uint8_t* dst)
 {
@@ -99,7 +119,7 @@ void writeRgbImpl(const float* data, const OutSpec& s, uint8_t* dst)
   const bool has_a = C >= 4;
 
   float mn = 0.f, inv_range = 1.f;
-  if constexpr(M == WriteMode::MinMaxNormalize)
+  if constexpr(M == WriteMode::MinMaxNormalize || M == WriteMode::AutoRange)
   {
     float lo = at(0, 0), hi = at(0, 0);
     const int cc = std::min(C, 3);
@@ -110,8 +130,7 @@ void writeRgbImpl(const float* data, const OutSpec& s, uint8_t* dst)
         lo = std::min(lo, v);
         hi = std::max(hi, v);
       }
-    mn = lo;
-    inv_range = (hi - lo > 1e-9f) ? 1.f / (hi - lo) : 1.f;
+    rangeParams<M>(lo, hi, mn, inv_range);
   }
 
   for(int64_t p = 0; p < HW; ++p)
@@ -124,34 +143,68 @@ void writeRgbImpl(const float* data, const OutSpec& s, uint8_t* dst)
   }
 }
 
+// A 2-channel (background, foreground) output: its foreground value.
+// Probabilities are taken as they are; logits go through the 2-way softmax.
+// Values within 0.05 of [0,1] are still probabilities: fp16 exports emit
+// 1.0002 or -1e-4, and one such pixel used to turn the whole frame into
+// softmax(fg - bg) of probabilities (a mask that flickered in video).
+struct Foreground
+{
+  const float* data;
+  int64_t HW;
+  bool nhwc;
+  bool logits;
+  static Foreground make(const float* data, int64_t HW, bool nhwc)
+  {
+    Foreground f{data, HW, nhwc, false};
+    for(int64_t p = 0; p < HW && !f.logits; ++p)
+    {
+      const float v = f.channel(1, p);
+      f.logits = !(v >= -0.05f && v <= 1.05f);
+    }
+    return f;
+  }
+  inline float channel(int c, int64_t p) const noexcept
+  {
+    return nhwc ? data[p * 2 + c] : data[c * HW + p];
+  }
+  inline float operator()(int64_t p) const noexcept
+  {
+    return logits ? 1.f / (1.f + std::exp(channel(0, p) - channel(1, p)))
+                  : channel(1, p);
+  }
+};
+
 template <WriteMode M>
 void writeMaskImpl(const float* data, const OutSpec& s, uint8_t* dst)
 {
   const int64_t HW = (int64_t)s.w * s.h;
+  const int C = s.channels;
   // channel 0: for both NCHW and NHWC-with-C==1 the first HW values are plane 0
   // (single channel is contiguous in either layout). For NHWC C>1 take stride.
-  const bool strided = s.nhwc && s.channels > 1;
-  const int C = s.channels;
+  // Two channels are background / foreground: take the foreground.
+  const bool strided = s.nhwc && C > 1;
+  const bool twoClass = C == 2;
+  const Foreground fg = twoClass ? Foreground::make(data, HW, s.nhwc) : Foreground{};
+  auto value = [&](int64_t p) {
+    return twoClass ? fg(p) : (strided ? data[p * C] : data[p]);
+  };
 
   float mn = 0.f, inv_range = 1.f;
-  if constexpr(M == WriteMode::MinMaxNormalize)
+  if constexpr(M == WriteMode::MinMaxNormalize || M == WriteMode::AutoRange)
   {
-    float lo = data[0], hi = data[0];
+    float lo = value(0), hi = lo;
     for(int64_t p = 0; p < HW; ++p)
     {
-      const float v = strided ? data[p * C] : data[p];
+      const float v = value(p);
       lo = std::min(lo, v);
       hi = std::max(hi, v);
     }
-    mn = lo;
-    inv_range = (hi - lo > 1e-9f) ? 1.f / (hi - lo) : 1.f;
+    rangeParams<M>(lo, hi, mn, inv_range);
   }
 
   for(int64_t p = 0; p < HW; ++p)
-  {
-    const float v = strided ? data[p * C] : data[p];
-    dst[p] = clamp8(mapPixel<M>(v, mn, inv_range));
-  }
+    dst[p] = clamp8(mapPixel<M>(value(p), mn, inv_range));
 }
 
 template <typename Impl>
@@ -164,6 +217,8 @@ void dispatchMode(WriteMode m, Impl&& impl)
     case WriteMode::Denormalize:     impl(std::integral_constant<WriteMode, WriteMode::Denormalize>{}); break;
     case WriteMode::Passthrough:     impl(std::integral_constant<WriteMode, WriteMode::Passthrough>{}); break;
     case WriteMode::Half255:         impl(std::integral_constant<WriteMode, WriteMode::Half255>{}); break;
+    case WriteMode::AutoRange:       impl(std::integral_constant<WriteMode, WriteMode::AutoRange>{}); break;
+    case WriteMode::Sigmoid:         impl(std::integral_constant<WriteMode, WriteMode::Sigmoid>{}); break;
   }
 }
 } // namespace

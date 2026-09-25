@@ -19,6 +19,7 @@
 
 #include <Onnx/helpers/TensorType.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -234,6 +235,22 @@ struct WaveformShape
   WaveLayout layout = WaveLayout::BNC1;
   int channels = 1; // model-side channel count
   int64_t block = 0; // N (samples per inference); <=0 means dynamic
+  int stems = 1;     // separated sources in one tensor ([B,S,C,N] outputs)
+
+  // An output: like an input, but a rank-4 [B,S,C,N] (Demucs) holds S stems
+  // of C channels. `fallback_channels` stands in for a symbolic channel count.
+  static WaveformShape
+  fromOutputShape(const std::vector<int64_t>& s, int fallback_channels) noexcept
+  {
+    if(s.size() != 4)
+      return fromInputShape(s);
+    WaveformShape w;
+    w.layout = WaveLayout::BNC1;
+    w.stems = s[1] > 0 ? (int)s[1] : 1;
+    w.channels = (s[2] == 1 || s[2] == 2) ? (int)s[2] : std::max(fallback_channels, 1);
+    w.block = s[3];
+    return w;
+  }
 
   // Derive from a model input port shape (positive dims; -1 == dynamic).
   static WaveformShape fromInputShape(const std::vector<int64_t>& s) noexcept
@@ -263,6 +280,18 @@ struct WaveformShape
         break;
     }
     return w;
+  }
+
+  // Same, into an existing vector (no allocation once it has the capacity).
+  void tensorShapeInto(int64_t n, std::vector<int64_t>& out) const
+  {
+    switch(layout)
+    {
+      case WaveLayout::BNC1: out.assign({1, (int64_t)channels, n}); return;
+      case WaveLayout::BN:   out.assign({1, n}); return;
+      case WaveLayout::N:    out.assign({n}); return;
+    }
+    out.assign({1, (int64_t)channels, n});
   }
 
   std::vector<int64_t> tensorShape(int64_t n) const
@@ -297,7 +326,7 @@ struct WaveformInput
   void prepare(
       const WaveformShape& s, double in_rate, double out_rate,
       int64_t fixed_block, int64_t hop_size, int host_channels,
-      std::size_t max_host_frames)
+      std::size_t max_host_frames, int backlog_blocks = 0)
   {
     shape = s;
     host_rate = in_rate;
@@ -319,7 +348,9 @@ struct WaveformInput
     const double ratio = (in_rate > 0) ? out_rate / in_rate : 1.0;
     const std::size_t per_block
         = (std::size_t)std::ceil((double)max_host_frames * ratio) + 2;
-    const std::size_t cap = (std::size_t)block + per_block + 2;
+    // backlog_blocks: extra whole blocks kept while an async job runs.
+    const std::size_t cap
+        = (std::size_t)block * (1 + std::max(backlog_blocks, 0)) + per_block + 2;
 
     rings.assign(mc, {});
     for(auto& rg : rings)
@@ -403,9 +434,16 @@ struct WaveformOutput
   std::vector<AudioRing> rings;         // one per channel (host rate)
   std::vector<std::vector<float>> rs_scratch;
 
+  // Overlap-add, when the input takes a block every hop < block samples.
+  int64_t ola_block = 0;
+  int64_t ola_hop = 0;
+  std::vector<float> ola_window; // Hann, scaled so the overlaps sum to 1
+  std::vector<std::vector<float>> ola_acc; // one block per channel
+  std::vector<float> ola_emit;             // planar [C, hop]
+
   void prepare(
       int chans, double in_rate, double out_rate, int64_t model_block,
-      std::size_t max_host_frames)
+      std::size_t max_host_frames, int backlog_blocks = 0)
   {
     channels = chans > 0 ? chans : 1;
     model_rate = in_rate;
@@ -417,7 +455,8 @@ struct WaveformOutput
     const double ratio = (in_rate > 0) ? out_rate / in_rate : 1.0;
     const std::size_t per_block
         = (std::size_t)std::ceil((double)(model_block) * ratio) + 2;
-    const std::size_t cap = per_block + max_host_frames + 2;
+    const std::size_t cap
+        = per_block * (1 + std::max(backlog_blocks, 0)) + max_host_frames + 2;
     rings.assign(channels, {});
     for(auto& rg : rings)
       rg.prepare(cap);
@@ -435,6 +474,59 @@ struct WaveformOutput
       r.reset();
     for(auto& rg : rings)
       rg.clear();
+    for(auto& a : ola_acc)
+      std::fill(a.begin(), a.end(), 0.f);
+  }
+
+  // Frames of `block` samples every `hop` (block a multiple of 2 * hop): a
+  // periodic Hann window sums to block / (2 * hop) over the overlaps, so it
+  // is scaled by the inverse and a model that returns its input gives the
+  // input back. hop >= block turns overlap-add off.
+  void prepareOverlap(int64_t block, int64_t hop)
+  {
+    if(hop <= 0 || hop >= block)
+    {
+      ola_block = ola_hop = 0;
+      ola_acc.clear();
+      return;
+    }
+    ola_block = block;
+    ola_hop = hop;
+    const double gain = 2.0 * (double)hop / (double)block;
+    ola_window.resize((std::size_t)block);
+    for(int64_t i = 0; i < block; ++i)
+      ola_window[i] = (float)(gain * 0.5
+                              * (1.0 - std::cos(2.0 * 3.14159265358979323846
+                                                * (double)i / (double)block)));
+    ola_acc.assign(channels, std::vector<float>((std::size_t)block, 0.f));
+    ola_emit.assign((std::size_t)channels * hop, 0.f);
+  }
+
+  bool overlapping() const noexcept { return ola_block > 0; }
+
+  // Adds a block-long model frame into the overlap and pushes the `hop`
+  // samples it completes. A frame of another length (the model does not
+  // return what it was given) is pushed as is.
+  void pushOverlap(const float* planar, int chans, int64_t n)
+  {
+    if(!overlapping() || n != ola_block)
+    {
+      push(planar, chans, n);
+      return;
+    }
+    const int nc = std::min(chans, (int)ola_acc.size());
+    const std::size_t hop = (std::size_t)ola_hop;
+    for(int c = 0; c < nc; ++c)
+    {
+      auto& acc = ola_acc[c];
+      const float* in = planar + (std::size_t)c * n;
+      for(int64_t i = 0; i < n; ++i)
+        acc[i] += ola_window[i] * in[i];
+      std::copy_n(acc.begin(), hop, ola_emit.begin() + c * hop);
+      std::copy(acc.begin() + hop, acc.end(), acc.begin());
+      std::fill(acc.end() - hop, acc.end(), 0.f);
+    }
+    push(ola_emit.data(), nc, (int64_t)hop);
   }
 
   // Push a model-rate planar block ([c0..][c1..]) of `n` frames per channel.
@@ -457,16 +549,21 @@ struct WaveformOutput
   }
 
   // Drain `frames` into the host channels; missing samples are zero-filled.
+  // Host channels past the model's copy its last channel: popping that ring
+  // again would hand each host channel every other block (a mono vocoder on
+  // a stereo output lost half its samples on each side).
   void pull(float* const* chans, int host_channels, std::size_t frames)
   {
-    for(int c = 0; c < host_channels; ++c)
+    const int popped = std::min(host_channels, std::min(channels, (int)rings.size()));
+    for(int c = 0; c < popped; ++c)
+      if(!rings[c].pop(chans[c], frames))
+        std::fill_n(chans[c], frames, 0.f);
+    for(int c = std::max(popped, 0); c < host_channels; ++c)
     {
-      const int src = (c < channels) ? c : (channels - 1);
-      if(src < 0 || src >= (int)rings.size() || !rings[src].pop(chans[c], frames))
-      {
-        for(std::size_t i = 0; i < frames; ++i)
-          chans[c][i] = 0.f;
-      }
+      if(popped > 0)
+        std::copy_n(chans[popped - 1], frames, chans[c]);
+      else
+        std::fill_n(chans[c], frames, 0.f);
     }
   }
 

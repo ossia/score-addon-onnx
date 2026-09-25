@@ -1,5 +1,6 @@
 #pragma once
 #include <Onnx/helpers/QwenLLM.hpp>
+#include <OnnxModels/ThinkFilter.hpp>
 #include <OnnxModels/Utils.hpp>
 #include <halp/controls.hpp>
 #include <halp/file_port.hpp>
@@ -46,6 +47,16 @@ public:
     Sentence,
     Word,
     Token
+  };
+
+  // What a reasoning model (Qwen3, DeepSeek-R1) does with its <think> block:
+  // shown as generated, removed from Partial and Response (it still counts
+  // against Max tokens), or not generated at all. Other models ignore it.
+  enum ThinkingMode
+  {
+    Show,
+    Hide,
+    Off
   };
 
   struct
@@ -100,6 +111,15 @@ public:
         combobox
       };
     } partialMode;
+
+    struct : halp::enum_t<ThinkingMode, "Thinking">
+    {
+      enum widget
+      {
+        combobox
+      };
+      void update(QwenLLMNode& g) { g.must_infer = true; }
+    } thinking;
   } inputs;
 
   struct
@@ -127,6 +147,7 @@ public:
         float,
         int,
         int,
+        bool,
         std::shared_ptr<Onnx::QwenLLMInference>,
         std::shared_ptr<TokenStream>)>
         request;
@@ -137,6 +158,7 @@ public:
         float topP,
         int topK,
         int maxTokens,
+        bool thinking,
         std::shared_ptr<Onnx::QwenLLMInference> llm,
         std::shared_ptr<TokenStream> stream);
   } worker;
@@ -152,6 +174,12 @@ private:
   std::string last_processed_prompt;
 
   void segmentPartials(std::string_view delta);
+  // Adds generated text to the response and the partials, through the
+  // think filter when Thinking is Hide or Off.
+  void appendGenerated(std::string_view delta);
+
+  ThinkFilter think_filter;
+  bool filter_thinking = false;
 
   std::shared_ptr<TokenStream> token_stream;
   std::string accumulated_response;

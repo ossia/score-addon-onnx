@@ -85,6 +85,10 @@ inline LayoutInfo resolveLayout(const std::vector<int64_t>& s)
   {
     if(isChan(s[1])) { ci = 1; hi = 2; wi = 3; }       // NCHW
     else if(isChan(s[3])) { ci = 3; hi = 1; wi = 2; nhwc = true; } // NHWC
+    // Two channels: a background / foreground segmentation. Checked after
+    // 1/3/4 so that [1,2,H,W] is not read as NHWC with W=2 and vice versa.
+    else if(s[3] == 2) { ci = 3; hi = 1; wi = 2; nhwc = true; }   // NHWC, 2 ch
+    else if(s[1] == 2) { ci = 1; hi = 2; wi = 3; }                // NCHW, 2 ch
     else { ci = 1; hi = 2; wi = 3; }                   // symbolic channel -> NCHW
   }
   else if(rank == 3)

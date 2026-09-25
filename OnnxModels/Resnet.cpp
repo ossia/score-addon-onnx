@@ -23,21 +23,35 @@ try
   if (!in_tex.changed)
     return;
 
-  if (!this->ctx)
+  // Recreate the session when the model file changes: keyed on "no ctx yet"
+  // only, a model swap kept running the previous model. Only a failed load
+  // marks the model invalid; a per-frame failure (e.g. a resolution the model
+  // rejects) just skips that frame.
+  if (!this->ctx || lastModelPath != this->inputs.model.file.filename)
   {
-    this->ctx
-        = std::make_unique<Onnx::OnnxRunContext>(this->inputs.model.file.bytes);
+    this->ctx.reset();
+    try
+    {
+      this->ctx
+          = std::make_unique<Onnx::OnnxRunContext>(
+          this->inputs.model.file.bytes, this->inputs.model.file.filename);
+      lastModelPath = this->inputs.model.file.filename;
+    }
+    catch (...)
+    {
+      inputs.model.current_model_invalid = true;
+      return;
+    }
   }
   auto& ctx = *this->ctx;
   const auto& spec = ctx.readModelSpec();
+  // The model's own input size; the resolution knob only sizes dynamic
+  // exports.
+  const auto [mw, mh] = nchwInputSize(
+      spec.inputs[0], this->inputs.resolution.value.x,
+      this->inputs.resolution.value.y);
   auto t = nchw_tensorFromRGBA(
-      spec.inputs[0],
-      in_tex.bytes,
-      in_tex.width,
-      in_tex.height,
-      this->inputs.resolution.value.x,
-      this->inputs.resolution.value.y,
-      storage,
+      spec.inputs[0], in_tex.bytes, in_tex.width, in_tex.height, mw, mh, storage,
       {255.f * 0.485f, 255.f * 0.456f, 255.f * 0.406f},
       {255.f * 0.229f, 255.f * 0.224f, 255.f * 0.225f});
   Ort::Value tt[1] = {std::move(t.value)};
@@ -62,6 +76,6 @@ try
 }
 catch (...)
 {
-  inputs.model.current_model_invalid = true;
+  outputs.detection.value.clear();
 }
 }

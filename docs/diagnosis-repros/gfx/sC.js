@@ -1,0 +1,20 @@
+var RED_FS = "/tmp/claude-1000/-mnt-sdb2-home-jcelerier-projets-ossia-score-master-src-addons-score-addon-onnx/a3ff42b7-59b7-418e-8dc2-baba3a54c9a3/scratchpad/diag/gfx/red.fs";
+var PRESET = {"Key": {"Uuid": "74ca45ff-92c9-44a0-8f1a-754dea05ee1b", "Effect": ""}, "Name": "Grid 2x2", "Category": "Utility", "Preset": {"Fragment": "/*{\n  \"DESCRIPTION\": \"Lays out up to four inputs in a 2x2 grid. Each tile has a gain, for inputs whose values are not in [0,1] (raw depth, logits). Single-channel textures (R8 / R32F masks and depth maps) show up red.\",\n  \"CREDIT\": \"ossia score\",\n  \"ISFVSN\": \"2.0\",\n  \"CATEGORIES\": [\"Utility\"],\n  \"INPUTS\": [\n    { \"NAME\": \"topLeft\",     \"TYPE\": \"image\" },\n    { \"NAME\": \"topRight\",    \"TYPE\": \"image\" },\n    { \"NAME\": \"bottomLeft\",  \"TYPE\": \"image\" },\n    { \"NAME\": \"bottomRight\", \"TYPE\": \"image\" },\n    { \"NAME\": \"gap\", \"LABEL\": \"Gap\", \"TYPE\": \"float\", \"DEFAULT\": 0.05, \"MIN\": 0.0, \"MAX\": 0.1 },\n    { \"NAME\": \"gainTopLeft\",     \"LABEL\": \"Gain top left\",     \"TYPE\": \"float\", \"DEFAULT\": 1.0, \"MIN\": 0.0, \"MAX\": 10.0 },\n    { \"NAME\": \"gainTopRight\",    \"LABEL\": \"Gain top right\",    \"TYPE\": \"float\", \"DEFAULT\": 1.0, \"MIN\": 0.0, \"MAX\": 10.0 },\n    { \"NAME\": \"gainBottomLeft\",  \"LABEL\": \"Gain bottom left\",  \"TYPE\": \"float\", \"DEFAULT\": 1.0, \"MIN\": 0.0, \"MAX\": 10.0 },\n    { \"NAME\": \"gainBottomRight\", \"LABEL\": \"Gain bottom right\", \"TYPE\": \"float\", \"DEFAULT\": 1.0, \"MIN\": 0.0, \"MAX\": 10.0 }\n  ]\n}*/\n\nvoid main()\n{\n  vec2 uv = isf_FragNormCoord;\n\n  // Tile coordinates, then shrink each tile by the gap.\n  vec2 local = fract(uv * 2.0);\n  float half_gap = gap;\n  if(any(lessThan(local, vec2(half_gap))) || any(greaterThan(local, vec2(1.0 - half_gap))))\n  {\n    gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);\n    return;\n  }\n  local = (local - half_gap) / (1.0 - 2.0 * half_gap);\n\n  bool left = uv.x < 0.5;\n  bool top = uv.y >= 0.5;\n\n  vec4 c;\n  if(top && left)\n    c = IMG_NORM_PIXEL(topLeft, local) * gainTopLeft;\n  else if(top)\n    c = IMG_NORM_PIXEL(topRight, local) * gainTopRight;\n  else if(left)\n    c = IMG_NORM_PIXEL(bottomLeft, local) * gainBottomLeft;\n  else\n    c = IMG_NORM_PIXEL(bottomRight, local) * gainBottomRight;\n\n  gl_FragColor = vec4(c.rgb, 1.0);\n}\n", "Vertex": "", "Controls": [[4, {"Float": 0.05}], [5, {"Float": 1.0}], [6, {"Float": 1.0}], [7, {"Float": 1.0}], [8, {"Float": 1.0}]]}};
+var UUID_ISF = "74ca45ff-92c9-44a0-8f1a-754dea05ee1b";
+var UUID_WINDOW = "5a181207-7d40-4ad8-814e-879fcdf8cc31";
+var FLICKS_PER_MS = 705600;
+function llog(m) { console.log("[probe] " + m); }
+Score.createDevice("Window", UUID_WINDOW, {});
+var s = Score.find("Scenario.1"); if (s) Score.remove(s);
+var g_root = Score.rootInterval();
+Score.setIntervalDuration(g_root, 600000 * FLICKS_PER_MS);
+Score.setIntervalMaxDuration(g_root, 600000 * FLICKS_PER_MS);
+function finalizeRun() { Score.saveAs(OUT_DIR + "/final.score"); }
+var IMAGE = "/home/jcelerier/projets/oss/ailia-models/depth_estimation/depth_anything/demo1.png";
+var g_img = Score.createProcess(g_root, "e96c5c0b-7e09-49fb-a851-ff6f4811bb00", "");
+Score.setValue(Score.inlet(g_img, 5), [IMAGE]);
+var g = Score.createProcess(g_root, UUID_ISF, RED_FS);
+Score.loadPreset(g, JSON.stringify(PRESET));
+Score.setAddress(Score.outlet(g, 0), "Window:/");
+if(!Score.createCable(Score.outlet(g_img, 0), Score.inlet(g, 0))) llog("cable fail");
+Score.saveAs(OUT_DIR + "/ready.score");

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -34,6 +35,14 @@ struct Options
 {
   std::string provider = "default";
   int device_id = 0;
+  // CUDA runs convolutions and matmuls in TF32 by default on Ampere and
+  // newer: a 10-bit mantissa, a noise floor near -60 dB. Harmless for images,
+  // audible for audio, and a model that boosts part of the spectrum turns it
+  // into a howl (deep-music-enhancer: +40 dB above 13 kHz).
+  bool tf32 = true;
+
+  // For the audio nodes: full float32 precision.
+  static Options precise() { return {.tf32 = false}; }
 };
 
 static Ort::SessionOptions create_session_options(const Options& opts)
@@ -122,7 +131,8 @@ try
         "cudnn_conv_use_max_workspace",
         "cudnn_conv1d_pad_to_nc1d",
         "enable_cuda_graph",
-        "enable_skip_layer_norm_strict_mode"};
+        "enable_skip_layer_norm_strict_mode",
+        "use_tf32"};
     const std::vector values{
         device_id_str,
         "kNextPowerOfTwo",
@@ -131,7 +141,8 @@ try
         "1",
         "1",
         "0",
-        "1"};
+        "1",
+        opts.tf32 ? "1" : "0"};
     Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
         cuda_option_v2, keys.data(), values.data(), keys.size()));
     // FIXME release options
@@ -237,6 +248,9 @@ catch (...)
 // session initialization ("Tensor type mismatch. T != MLFloat16" from
 // tensor.h:210, a float-only fusion kernel touching an fp16 tensor). Basic
 // optimizations initialize and run those models fine, so retry with them.
+// The first attempt is silenced, or ORT logs that recovered failure as an
+// error; the retry keeps the caller's options (provider, threads) and logs as
+// usual, so a model that fails both ways is still reported.
 template <typename PathString>
 inline std::unique_ptr<Ort::Session> create_session_with_fallback(
     Ort::Env& env,
@@ -245,19 +259,23 @@ inline std::unique_ptr<Ort::Session> create_session_with_fallback(
 {
   try
   {
+    // Muted only for this attempt: the session keeps its normal log level,
+    // so its warnings and run errors are still printed afterwards.
+    QuietOrtLog quiet;
     return std::make_unique<Ort::Session>(env, path.data(), sessionOptions);
   }
   catch (const Ort::Exception& e)
   {
-    std::fprintf(
-        stderr,
-        "Onnxruntime: session init failed (%s); retrying with basic graph "
-        "optimizations\n",
-        e.what());
-    auto fallback = create_session_options(Options{});
+    auto fallback = sessionOptions.Clone();
     fallback.SetGraphOptimizationLevel(
         GraphOptimizationLevel::ORT_ENABLE_BASIC);
-    return std::make_unique<Ort::Session>(env, path.data(), fallback);
+    auto session = std::make_unique<Ort::Session>(env, path.data(), fallback);
+    std::fprintf(
+        stderr,
+        "Onnxruntime: loaded with basic graph optimizations (extended failed: "
+        "%s)\n",
+        e.what());
+    return session;
   }
 }
 
@@ -292,10 +310,16 @@ struct OnnxRunContext
 
   Ort::AllocatorWithDefaultOptions allocator;
 
-  // bytes is not the filename, it is the raw model binary data
-  explicit OnnxRunContext(std::string_view bytes)
-      : env(make_env("ossia"))
-      , session_options(create_session_options(opts))
+  // bytes is not the filename, it is the raw model binary data.
+  // model_path is the file the bytes were read from, if known: a session built
+  // from a buffer has no base directory, so without it the external data of a
+  // model (model.onnx_data next to model.onnx) is looked up in the process's
+  // working directory and not found.
+  explicit OnnxRunContext(
+      std::string_view bytes, std::string_view model_path = {}, Options o = {})
+      : opts(std::move(o))
+      , env(make_env("ossia"))
+      , session_options(withModelFolder(create_session_options(opts), model_path))
       , session(env, bytes.data(), bytes.size(), session_options)
   {
     // The session (and therefore its I/O spec) is immutable for the context's
@@ -311,6 +335,21 @@ struct OnnxRunContext
   const ModelSpec& readModelSpec() const noexcept { return m_spec; }
 
 private:
+  static Ort::SessionOptions
+  withModelFolder(Ort::SessionOptions so, std::string_view model_path)
+  {
+    if(!model_path.empty())
+    {
+      const auto folder = std::filesystem::path(model_path).parent_path().string();
+      if(!folder.empty())
+        // kOrtSessionOptionsModelExternalInitializersFileFolderPath, spelled out
+        // so that older onnxruntime headers without the constant still build.
+        so.AddConfigEntry(
+            "session.model_external_initializers_file_folder_path", folder.c_str());
+    }
+    return so;
+  }
+
   ModelSpec buildModelSpec()
   {
     ONNX_PROF_SCOPE(ReadSpec);
@@ -372,6 +411,8 @@ private:
   }
 
   ModelSpec m_spec; // built once in the ctor; returned by readModelSpec()
+  std::mutex m_error_mutex;
+  std::string m_last_error;
 
 public:
   void infer(
@@ -397,10 +438,18 @@ public:
     }
     catch (const Ort::Exception& exception)
     {
-      // Per-frame failure (bad/odd output shape on a frame, ORT hiccup): log and
-      // rethrow so the node's operator() catch skips this frame. NEVER exit() —
-      // that would kill the whole host process on a single transient throw.
-      std::fprintf(stderr, "ERROR running model inference: %s\n", exception.what());
+      // Per-frame failure (bad/odd output shape on a frame, ORT hiccup): log
+      // and rethrow so the node's operator() catch skips this frame. NEVER
+      // exit(): that would kill the whole host process on a single transient
+      // throw. The same error on the next frames is not printed again.
+      {
+        std::lock_guard lock{m_error_mutex};
+        if(m_last_error != exception.what())
+        {
+          m_last_error = exception.what();
+          std::fprintf(stderr, "ERROR running model inference: %s\n", exception.what());
+        }
+      }
       throw;
     }
   }

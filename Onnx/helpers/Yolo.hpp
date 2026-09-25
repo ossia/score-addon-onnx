@@ -278,17 +278,6 @@ struct YOLO_blob
 
 struct YOLO_pose
 {
-  static constexpr int NUM_KPS = 17;
-  struct pose_data
-  {
-    struct rect
-    {
-      float x, y, w, h;
-    } geometry;
-    float confidence{};
-    float keypoints[NUM_KPS][3]{};
-  };
-
   struct pose_type
   {
     std::string name;
@@ -326,7 +315,38 @@ struct YOLO_pose
     return false;
   }
 
-  void processOutput(
+  // The layout of a pose head, from its output shape:
+  //  - v8 / v11: channel-major [1, 5+3K, A] (cx,cy,w,h, conf, kpts) over A
+  //    anchors (8400 at 640, 2100 at 320), or its transpose [1, A, 5+3K];
+  //  - yolo26: row-major [1, N, 6+3K] (x1,y1,x2,y2, conf, class, kpts), N
+  //    detections already deduplicated.
+  // 5+3K and 6+3K differ modulo 3, so a feature count is one or the other.
+  struct Layout
+  {
+    int count = 0;       // anchors or detections
+    int features = 0;
+    int keypoints = 0;
+    bool row_major = false;
+    bool corners = false; // yolo26: x1,y1,x2,y2 and a class column
+  };
+  static Layout layoutOf(const std::vector<int64_t>& shape) noexcept
+  {
+    Layout l;
+    if (shape.size() != 3 || shape[1] <= 0 || shape[2] <= 0)
+      return l;
+    const int a = (int)shape[1], b = (int)shape[2];
+    if (a < b && a > 5 && (a - 5) % 3 == 0)
+      l = {b, a, (a - 5) / 3, false, false};
+    else if (b > 6 && (b - 6) % 3 == 0)
+      l = {a, b, (b - 6) / 3, true, true};
+    else if (b > 5 && (b - 5) % 3 == 0)
+      l = {a, b, (b - 5) / 3, true, false};
+    return l;
+  }
+
+  // Decodes every pose above min_confidence; returns the keypoint count K of
+  // the model (0 when the output is not a pose head).
+  int processOutput(
       const Onnx::ModelSpec& spec,
       std::span<Ort::Value> outputTensor,
       std::vector<pose_type>& out,
@@ -339,138 +359,56 @@ struct YOLO_pose
       int model_w = 640,
       int model_h = 640) const
   {
-    const int src_cols = image_w;
-    const int src_rows = image_h;
     out.clear();
-    if (outputTensor.size() > 0)
+    if (outputTensor.empty())
+      return 0;
+    const auto info = outputTensor.front().GetTensorTypeAndShapeInfo();
+    const Layout l = layoutOf(info.GetShape());
+    if (l.keypoints <= 0
+        || (int64_t)l.count * l.features != (int64_t)info.GetElementCount())
+      return 0;
+
+    const float* data = outputTensor.front().GetTensorData<float>();
+    auto at = [&](int det, int f) {
+      return l.row_major ? data[(std::size_t)det * l.features + f]
+                         : data[(std::size_t)f * l.count + det];
+    };
+
+    // 1. The candidates above the threshold, best first.
+    thread_local boost::container::vector<int> idx;
+    idx.clear();
+    for (int i = 0; i < l.count; i++)
+      if (at(i, 4) > min_confidence)
+        idx.push_back(i);
+    if (idx.empty())
+      return l.keypoints;
+    std::stable_sort(idx.begin(), idx.end(), [&](int i1, int i2) {
+      return at(i1, 4) > at(i2, 4);
+    });
+
+    // 2. One pose each; the anchor formats overlap and are deduplicated.
+    const int kp0 = l.corners ? 6 : 5;
+    for (int j : idx)
     {
-      const int Nfloats
-          = outputTensor.front().GetTensorTypeAndShapeInfo().GetElementCount();
-      if (Nfloats == 56 * 8400)
+      pose_type::rect rect;
+      if (l.corners)
+        rect = {at(j, 0), at(j, 1), at(j, 2) - at(j, 0), at(j, 3) - at(j, 1)};
+      else
       {
-        // 1. Grab the pose indiceswith global confidence > minimum
-        const float* data = outputTensor.front().GetTensorData<float>();
-        const float* recog = data + 4 * 8400;
-        thread_local boost::container::vector<int> idx;
-        idx.clear();
-        idx.resize(8400, boost::container::default_init);
-
-        int k = 0;
-#pragma omp simd
-        for (int i = 0; i < 8400; i++)
-        {
-          if (recog[i] > min_confidence)
-            idx[k++] = i;
-        }
-        if (k == 0)
-          return;
-        idx.resize(k);
-
-        // 2. Sort the resulting array. First element will be index of pose with highest confidence.
-        std::stable_sort(
-            idx.data(),
-            idx.data() + k,
-            [&](int i1, int i2) { return recog[i1] > recog[i2]; });
-
-        // 3. Add the pose to the list and process the keypoints
-        for (auto j : idx)
-        {
-          pose_data p;
-#pragma omp simd
-          for (int k = 0; k < 56; k++)
-          {
-            reinterpret_cast<float*>(&p)[k] = (data + k * 8400)[j];
-          }
-          auto rect = pose_type::rect{
-              p.geometry.x - p.geometry.w / 2,
-              p.geometry.y - p.geometry.h / 2,
-              p.geometry.w,
-              p.geometry.h};
-
-          // Filter out rects we already added
-          if (hasSimilarRect(rect, out))
-            continue;
-
-          out.push_back(
-              pose_type{.geometry = rect, .confidence = p.confidence});
-          auto& kps = out.back().keypoints;
-          for (int i = 0; i < NUM_KPS; i++)
-          {
-            const auto& [x, y, c] = p.keypoints[i];
-            if (c > min_confidence)
-            {
-              kps.push_back({i, x, y});
-            }
-          }
-        }
+        rect = {at(j, 0) - at(j, 2) / 2, at(j, 1) - at(j, 3) / 2, at(j, 2), at(j, 3)};
+        if (hasSimilarRect(rect, out))
+          continue;
       }
-      else if (Nfloats == 300 * 57)
-      { // YOLO 26 Implementation (1, 300, 57)
-        const float* data = outputTensor.front().GetTensorData<float>();
-        thread_local boost::container::vector<int> idx;
-        idx.clear();
-        idx.resize(300, boost::container::default_init);
-
-        // 1. Filter by confidence (index 4 in the 57-length feature vector)
-        int k = 0;
-#pragma omp simd
-        for (int i = 0; i < 300; i++)
-        {
-          if (data[i * 57 + 4] > min_confidence)
-            idx[k++] = i;
-        }
-
-        if (k == 0)
-          return;
-        idx.resize(k);
-
-        // 2. Sort the array by confidence descending
-        std::stable_sort(
-            idx.data(),
-            idx.data() + k,
-            [&](int i1, int i2)
-            { return data[i1 * 57 + 4] > data[i2 * 57 + 4]; });
-
-        // 3. Add the poses directly (No NMS / hasSimilarRect needed for YOLO 26)
-        for (auto j : idx)
-        {
-          // Pointer to the start of this specific prediction's 57 features
-          const float* row = data + (j * 57);
-
-          // Indices 0-3 are absolute coordinates: x1, y1, x2, y2
-          float x1 = row[0];
-          float y1 = row[1];
-          float x2 = row[2];
-          float y2 = row[3];
-          float conf = row[4];
-          // float class_id = row[5]; // Unused, we assume class is correct
-
-          auto rect = pose_type::rect{
-              x1,
-              y1,
-              x2 - x1, // Calculate width
-              y2 - y1  // Calculate height
-          };
-
-          out.push_back(pose_type{.geometry = rect, .confidence = conf});
-
-          auto& kps = out.back().keypoints;
-
-          // Indices 6 to 56 are the keypoints (x, y, visibility)
-          for (int i = 0; i < NUM_KPS; i++) // Assumes NUM_KPS <= 17
-          {
-            float kx = row[6 + (i * 3) + 0];
-            float ky = row[6 + (i * 3) + 1];
-            float kc = row[6 + (i * 3) + 2];
-
-            if (kc > min_confidence)
-            {
-              kps.push_back({i, kx, ky});
-            }
-          }
-        }
+      out.push_back(pose_type{.geometry = rect, .confidence = at(j, 4)});
+      auto& kps = out.back().keypoints;
+      for (int i = 0; i < l.keypoints; i++)
+      {
+        const float c = at(j, kp0 + i * 3 + 2);
+        if (c > min_confidence)
+          kps.push_back({i, at(j, kp0 + i * 3), at(j, kp0 + i * 3 + 1)});
       }
     }
+    return l.keypoints;
   }
 };
 

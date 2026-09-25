@@ -344,7 +344,7 @@ void PoseDetector::runMultiInstance(
   if(m_rois.empty())
   {
     m_frames_since_detect = 0;
-    m_dets = runDetector(m_detector_role, src, role.domain);
+    m_dets = runDetector(m_detector_role, src, role.domain, detectorClass());
     // App-side NMS before the tracker: the end2end / PINTO / pre-decoded
     // detector branches assume the graph already deduplicated, but some exports
     // emit overlapping boxes for one subject. Two boxes -> two ROIs -> two

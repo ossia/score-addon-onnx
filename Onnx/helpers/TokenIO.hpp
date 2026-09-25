@@ -135,6 +135,9 @@ enum class AuxRole : uint8_t
   SpeakerId,   // sid / speaker / spk : int scalar
   GenericFloat,// any other small float scalar -> mapped to a Param
   GenericInt,  // any other small int scalar
+  Mask,        // attention_mask / valid_ids : int, ones shaped like the tokens
+  TokenTypes,  // token_type_ids / segment_ids : int, zeros shaped like the tokens
+  Style,       // style / speaker embedding (Kitten, Kokoro) : a voices.bin row
   Autoregress, // KV-cache / past_* / step : node must REFUSE
   Unknown,
 };
@@ -186,13 +189,26 @@ inline AuxRole classifyAux(
   if(detail::anyName(name, {"noise_scale", "noise"}))
     return AuxRole::NoiseScale;
 
+  // Per-token int inputs of text encoders: fed at the token tensor's shape
+  // (a [1,1] mask fails BERT's reshape, and a [1,1] valid_ids gives the
+  // punctuation model zero valid tokens).
+  if(isInt && detail::anyName(name, {"mask", "valid", "attention"}))
+    return AuxRole::Mask;
+  if(isInt && detail::anyName(name, {"token_type", "segment"}))
+    return AuxRole::TokenTypes;
+
   if(detail::anyName(
          name, {"input_lengths", "text_lengths", "x_lengths", "token_length",
-                "length", "lengths", "seq_len"}))
+                "length", "lengths", "seq_len", "lens"}))
     return AuxRole::InputLength;
 
   if(detail::anyName(name, {"sid", "speaker", "spk", "voice_id", "spk_id"}))
     return AuxRole::SpeakerId;
+
+  // A speaker embedding: one row of the model's voices file.
+  if(!isInt && pos > 3
+     && detail::anyName(name, {"style", "speaker_emb", "spk_emb", "ref_s"}))
+    return AuxRole::Style;
 
   // A small float vector named "scales" packs (noise, length, noise_w).
   if(!isInt && detail::anyName(name, {"scales", "scale"}) && pos >= 1)
@@ -215,7 +231,7 @@ inline AuxRole classifyAux(
 // ---------------------------------------------------------------------------
 enum class TokenOutputRole : uint8_t
 {
-  Waveform, // TTS audio [1,1,N] / [1,N] / [N]
+  Waveform, // TTS audio [1,1,1,N] / [1,1,N] / [1,N] / [N]
   Vector,   // embedding / logits / scores [1,D]
   Tokens,   // int token ids out (e.g. unit/codec codes) -> Data
 };
@@ -235,6 +251,11 @@ inline TokenOutputRole classifyTokenOutput(
   if(isInt)
     return TokenOutputRole::Tokens;
 
+  // Piper / VITS [B,T=1,1,N] -> waveform. A [1,C,1,W] image-like output with
+  // C>1 is not audio.
+  if(rank == 4 && shape[2] == 1 && (shape[1] == 1 || shape[1] <= 0)
+     && (last <= 0 || last > 32))
+    return TokenOutputRole::Waveform;
   // [1,1,N] / [1,C,N] with a long last axis -> waveform.
   if(rank == 3 && (shape[1] == 1 || shape[1] == 2)
      && (last <= 0 || last > 32))

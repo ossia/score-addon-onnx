@@ -1,5 +1,6 @@
 #include "QwenLLM.hpp"
 
+#include <Onnx/helpers/HfConfig.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <cmath>
 #include <cstdio>
@@ -18,35 +19,6 @@
 
 namespace Onnx
 {
-
-// Reads eos_token_id (a number or a list of numbers) from a HF-style JSON
-// config next to the tokenizer; returns an empty vector when absent.
-static std::vector<int64_t> readStopTokens(const std::filesystem::path& file)
-{
-  std::ifstream in(file);
-  if (!in)
-    return {};
-  std::stringstream buf;
-  buf << in.rdbuf();
-
-  const auto json
-      = nlohmann::json::parse(buf.str(), nullptr, /*allow_exceptions=*/false);
-  if (json.is_discarded() || !json.is_object())
-    return {};
-
-  const auto it = json.find("eos_token_id");
-  if (it == json.end())
-    return {};
-
-  std::vector<int64_t> ids;
-  if (it->is_number_integer())
-    ids.push_back(it->get<int64_t>());
-  else if (it->is_array())
-    for (const auto& v : *it)
-      if (v.is_number_integer())
-        ids.push_back(v.get<int64_t>());
-  return ids;
-}
 
 static std::size_t qwenKvElementSize(ONNXTensorElementDataType t)
 {
@@ -98,17 +70,28 @@ QwenLLMInference::QwenLLMInference(
     const char* msg = OrtxGetLastErrorMessage();
     throw std::runtime_error(std::string("Failed to create tokenizer: ") + msg);
   }
+  // The prompt is the rendered chat template, which already holds the
+  // model's special tokens (gemma's and Llama's <bos>): tokenizing it must
+  // not add them again, as HF's add_special_tokens=False after
+  // apply_chat_template. Without this gemma got "<bos><bos>" and Llama
+  // "<|begin_of_text|>" twice.
+  {
+    const char* keys[] = {"add_special_tokens"};
+    const char* values[] = {"false"};
+    OrtxUpdateTokenizerOptions(tokenizer, keys, values, 1);
+  }
 
   // The reply's stop tokens live next to the tokenizer, in
   // generation_config.json (preferred; may list several ids) or config.json.
   // Without either, keep the Qwen ChatML defaults the member initializes to.
   {
     const std::filesystem::path tokDir{std::string(tokenizerModelPath)};
-    auto ids = readStopTokens(tokDir / "generation_config.json");
-    if (ids.empty())
-      ids = readStopTokens(tokDir / "config.json");
-    if (!ids.empty())
+    if (auto ids = HfConfig::stopTokens(tokDir); !ids.empty())
       stopTokenIds = std::move(ids);
+    // Reasoning models declare <think> and </think> as added tokens.
+    thinkingModel
+        = HfConfig::addsTokens(tokDir / "tokenizer.json", "<think>", "</think>");
+    spaceMarker = HfConfig::decoderReplacesSpaceMarker(tokDir / "tokenizer.json");
   }
 
   // Get input/output names and inspect shapes
@@ -131,54 +114,79 @@ QwenLLMInference::QwenLLMInference(
   }
 
   inputNamePtrs.reserve(inputNames.size());
-  outputNamePtrs.reserve(outputNames.size());
-
   for (const auto& name : inputNames)
     inputNamePtrs.push_back(name.c_str());
-  for (const auto& name : outputNames)
-    outputNamePtrs.push_back(name.c_str());
 
-  // Discover the graph geometry of this export: layer count from the number
-  // of past_key_values inputs, KV dtype / heads / head-dim from the first
-  // one. The dtype really does vary per model *and* per variant (the Qwen3
-  // fp16 export uses an fp16 cache, the Qwen2.5 fp16 export an fp32 one), so
-  // it cannot be assumed.
-  int pastInputs = 0;
+  const auto hasOutput = [this](const std::string& name) {
+    return std::find(outputNames.begin(), outputNames.end(), name)
+           != outputNames.end();
+  };
+  if (!hasOutput("logits"))
+    throw std::runtime_error("QwenLLM: the model has no 'logits' output");
+
+  // Classify every input by name; refuse the ones we cannot feed rather than
+  // guessing.
+  std::string unknown;
+  bool hasIds = false;
   for (size_t i = 0; i < inputNames.size(); ++i)
   {
-    if (inputNames[i].starts_with("past_key_values."))
+    const std::string& name = inputNames[i];
+    InputSlot slot;
+    std::string output;
+    if (name == "input_ids")
     {
-      ++pastInputs;
-      if (inputNames[i] == "past_key_values.0.key")
-      {
-        // Keep the TypeInfo alive: GetTensorTypeAndShapeInfo() is a view.
-        const auto typeInfo = modelSession->GetInputTypeInfo(i);
-        const auto info = typeInfo.GetTensorTypeAndShapeInfo();
-        kvType = info.GetElementType();
-        // Shape is [batch, kv_heads, past_seq_len, head_dim]
-        if (const auto sh = info.GetShape(); sh.size() == 4)
-        {
-          if (sh[1] > 0)
-            kvHeads = sh[1];
-          if (sh[3] > 0)
-            headDim = sh[3];
-        }
-      }
+      slot.role = InputRole::Ids;
+      hasIds = true;
     }
-    else if (inputNames[i] == "position_ids")
+    else if (name == "attention_mask")
+      slot.role = InputRole::Mask;
+    else if (name == "position_ids")
+      slot.role = InputRole::Positions;
+    else if (name == "num_logits_to_keep")
+      slot.role = InputRole::LogitsToKeep;
+    else if (name.starts_with("past_key_values."))
+      output = "present." + name.substr(std::string_view("past_key_values.").size());
+    else if (name.starts_with("past_conv."))
+      output = "present_conv." + name.substr(std::string_view("past_conv.").size());
+    else
     {
-      hasPositionIds = true;
+      unknown += (unknown.empty() ? "" : ", ") + name;
+      continue;
     }
-  }
-  numLayers = pastInputs / 2;
-  if (numLayers <= 0 || kvHeads <= 0 || headDim <= 0)
-    throw std::runtime_error(
-        "QwenLLM: could not derive the KV cache geometry from the model "
-        "(not a transformers.js-style decoder export?)");
 
-  keyCache.assign(numLayers, {});
-  valueCache.assign(numLayers, {});
-  cacheShapes.assign(numLayers, {});
+    if (!output.empty())
+    {
+      if (!hasOutput(output))
+        throw std::runtime_error(
+            "QwenLLM: state input '" + name + "' has no '" + output + "' output");
+      // Keep the TypeInfo alive: GetTensorTypeAndShapeInfo() is a view.
+      const auto typeInfo = modelSession->GetInputTypeInfo(i);
+      const auto info = typeInfo.GetTensorTypeAndShapeInfo();
+      StateSlot st;
+      st.output = std::move(output);
+      st.type = info.GetElementType();
+      (void)qwenKvElementSize(st.type); // throws on a dtype we cannot carry
+      st.initShape = info.GetShape();
+      // Batch 1; a dynamic axis past it is the past length, empty at first.
+      for (std::size_t d = 0; d < st.initShape.size(); ++d)
+        if (st.initShape[d] <= 0)
+          st.initShape[d] = (d == 0) ? 1 : 0;
+      slot.role = InputRole::State;
+      slot.state = (int)states.size();
+      states.push_back(std::move(st));
+    }
+    inputSlots.push_back(slot);
+  }
+  if (!unknown.empty())
+    throw std::runtime_error("QwenLLM: unsupported decoder inputs: " + unknown);
+  if (!hasIds || states.empty())
+    throw std::runtime_error(
+        "QwenLLM: not a decoder with a KV cache (no input_ids or no "
+        "past_key_values.* inputs)");
+
+  runOutputNames.push_back("logits");
+  for (const auto& st : states)
+    runOutputNames.push_back(st.output.c_str());
 }
 
 QwenLLMInference::~QwenLLMInference()
@@ -224,6 +232,8 @@ std::string QwenLLMInference::decodeToken(int64_t tokenId) const
   OrtxStringArrayGetItem(texts, 0, &text);
   std::string strResult(text);
   OrtxDispose((OrtxObject**)&texts);
+  if (spaceMarker)
+    HfConfig::replaceSpaceMarkers(strResult);
 
   return strResult;
 }
@@ -244,6 +254,8 @@ std::string QwenLLMInference::decodeTokens(std::span<int64_t> tokens) const
   OrtxStringArrayGetItem(texts, 0, &text);
   std::string strResult(text);
   OrtxDispose((OrtxObject**)&texts);
+  if (spaceMarker)
+    HfConfig::replaceSpaceMarkers(strResult);
 
   return strResult;
 }
@@ -381,6 +393,20 @@ int64_t QwenLLMInference::sampleToken(
 }
 
 std::string
+QwenLLMInference::applyChatTemplate(const std::string& userPrompt, bool thinking) const
+{
+  auto text = applyChatTemplate(userPrompt);
+  if (thinking || !thinkingModel)
+    return text;
+  // What Qwen3's template adds for enable_thinking=false, which the Jinja
+  // engine has no way to pass: an empty, closed think block. DeepSeek-R1's
+  // newer templates already open the block.
+  if (text.ends_with("<think>\n"))
+    return text + "\n</think>\n\n";
+  return text + "<think>\n\n</think>\n\n";
+}
+
+std::string
 QwenLLMInference::applyChatTemplate(const std::string& userPrompt) const
 {
   // Only a user message: templates insert their model's own default system
@@ -423,17 +449,16 @@ void QwenLLMInference::generateLoop(
     float temperature,
     float topP,
     int topK,
+    bool thinking,
     std::function<bool(int64_t)> onToken)
 {
-  auto inputIds = tokenize(applyChatTemplate(prompt));
+  auto inputIds = tokenize(applyChatTemplate(prompt, thinking));
   if (inputIds.empty())
     return;
   const size_t promptLen = inputIds.size();
 
   Ort::MemoryInfo memoryInfo
       = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
-  const std::size_t kvElemSize = qwenKvElementSize(kvType);
 
   auto createIdsTensor = [&memoryInfo](std::span<int64_t> ids)
   {
@@ -442,39 +467,25 @@ void QwenLLMInference::generateLoop(
         memoryInfo, ids.data(), ids.size(), shape.data(), shape.size());
   };
 
-  // KV cache tensors are created in the model's own dtype straight over the
-  // raw cache bytes.
-  auto createKVCacheTensor = [&memoryInfo, this](
-                                 std::vector<std::byte>& cache,
-                                 const std::vector<int64_t>& shape)
+  // State tensors are created in their own dtype straight over the raw bytes.
+  auto createStateTensor = [&memoryInfo](StateSlot& st)
   {
     return Ort::Value::CreateTensor(
-        memoryInfo,
-        cache.data(),
-        cache.size(),
-        shape.data(),
-        shape.size(),
-        kvType);
+        memoryInfo, st.data.data(), st.data.size(), st.shape.data(),
+        st.shape.size(), st.type);
   };
 
-  auto storeKVCache = [this, kvElemSize](std::vector<Ort::Value>& outs)
+  auto storeStates = [this](std::vector<Ort::Value>& outs)
   {
-    for (int layer = 0; layer < numLayers; ++layer)
+    for (std::size_t k = 0; k < states.size(); ++k)
     {
-      auto& keyTensor = outs[1 + layer * 2]; // present.{layer}.key
-      const auto keyInfo = keyTensor.GetTensorTypeAndShapeInfo();
-      const auto keyShape = keyInfo.GetShape();
-      const std::size_t bytes = keyInfo.GetElementCount() * kvElemSize;
-
-      const auto* keyData
-          = static_cast<const std::byte*>(keyTensor.GetTensorRawData());
-      keyCache[layer].assign(keyData, keyData + bytes);
-      cacheShapes[layer].assign(keyShape.begin(), keyShape.end());
-
-      auto& valueTensor = outs[1 + layer * 2 + 1]; // present.{layer}.value
-      const auto* valueData
-          = static_cast<const std::byte*>(valueTensor.GetTensorRawData());
-      valueCache[layer].assign(valueData, valueData + bytes);
+      auto& t = outs[1 + k]; // runOutputNames[1 + k] == states[k].output
+      const auto info = t.GetTensorTypeAndShapeInfo();
+      const std::size_t bytes
+          = info.GetElementCount() * qwenKvElementSize(states[k].type);
+      const auto* d = static_cast<const std::byte*>(t.GetTensorRawData());
+      states[k].data.assign(d, d + bytes);
+      states[k].shape = info.GetShape();
     }
   };
 
@@ -501,71 +512,77 @@ void QwenLLMInference::generateLoop(
     }
   };
 
-  // Reset the cache from any previous generation.
-  for (auto& c : keyCache)
-    c.clear();
-  for (auto& c : valueCache)
-    c.clear();
-  std::vector<int64_t> emptyCacheShape = {1, kvHeads, 0, headDim};
-  for (auto& s : cacheShapes)
-    s = emptyCacheShape;
+  // Reset the states from any previous generation: an empty KV cache, a
+  // zeroed convolution state.
+  for (auto& st : states)
+  {
+    st.shape = st.initShape;
+    std::size_t n = 1;
+    for (auto d : st.shape)
+      n *= (std::size_t)d;
+    st.data.assign(n * qwenKvElementSize(st.type), std::byte{0});
+  }
 
   int64_t nextToken = -1;
   std::vector<int64_t> stepIds;
 
   for (int step = 0; step < maxTokens; ++step)
   {
-    std::vector<Ort::Value> inputs;
-    inputs.reserve(3 + 2 * numLayers);
-
     const size_t totalLen = promptLen + step;
     if (step == 0)
     {
       // Prefill: the whole prompt in one pass.
-      inputs.push_back(createIdsTensor(inputIds));
-      reusableAttentionMask.assign(promptLen, 1);
-      inputs.push_back(createIdsTensor(reusableAttentionMask));
-      if (hasPositionIds)
-      {
-        reusablePositionIds.resize(promptLen);
-        std::iota(reusablePositionIds.begin(), reusablePositionIds.end(), 0);
-        inputs.push_back(createIdsTensor(reusablePositionIds));
-      }
+      stepIds = inputIds;
+      reusablePositionIds.resize(promptLen);
+      std::iota(reusablePositionIds.begin(), reusablePositionIds.end(), 0);
     }
     else
     {
       // One new token against the cached past.
       stepIds.assign(1, nextToken);
-      inputs.push_back(createIdsTensor(stepIds));
-      reusableAttentionMask.assign(totalLen, 1);
-      inputs.push_back(createIdsTensor(reusableAttentionMask));
-      if (hasPositionIds)
-      {
-        reusablePositionIds.assign(1, static_cast<int64_t>(totalLen - 1));
-        inputs.push_back(createIdsTensor(reusablePositionIds));
-      }
+      reusablePositionIds.assign(1, static_cast<int64_t>(totalLen - 1));
     }
+    reusableAttentionMask.assign(totalLen, 1);
 
-    for (int layer = 0; layer < numLayers; ++layer)
+    // In the session's input order.
+    std::vector<Ort::Value> inputs;
+    inputs.reserve(inputSlots.size());
+    for (const auto& slot : inputSlots)
     {
-      inputs.push_back(createKVCacheTensor(keyCache[layer], cacheShapes[layer]));
-      inputs.push_back(
-          createKVCacheTensor(valueCache[layer], cacheShapes[layer]));
+      switch (slot.role)
+      {
+        case InputRole::Ids:
+          inputs.push_back(createIdsTensor(stepIds));
+          break;
+        case InputRole::Mask:
+          inputs.push_back(createIdsTensor(reusableAttentionMask));
+          break;
+        case InputRole::Positions:
+          inputs.push_back(createIdsTensor(reusablePositionIds));
+          break;
+        case InputRole::LogitsToKeep:
+          inputs.push_back(Ort::Value::CreateTensor<int64_t>(
+              memoryInfo, &logitsToKeep, 1, nullptr, 0));
+          break;
+        case InputRole::State:
+          inputs.push_back(createStateTensor(states[slot.state]));
+          break;
+      }
     }
 
     auto outputs = modelSession->Run(
         Ort::RunOptions{nullptr},
         inputNamePtrs.data(),
         inputs.data(),
-        std::min(inputs.size(), inputNamePtrs.size()),
-        outputNamePtrs.data(),
-        outputNamePtrs.size());
+        inputs.size(),
+        runOutputNames.data(),
+        runOutputNames.size());
 
     if (outputs.empty())
       throw std::runtime_error("No outputs from model");
 
     readLastLogits(outputs[0]);
-    storeKVCache(outputs);
+    storeStates(outputs);
 
     nextToken = sampleToken(logits, temperature, topP, topK);
 
@@ -583,11 +600,12 @@ std::string QwenLLMInference::generate(
     int maxTokens,
     float temperature,
     float topP,
-    int topK)
+    int topK,
+    bool thinking)
 {
   std::vector<int64_t> generated;
   generateLoop(
-      prompt, maxTokens, temperature, topP, topK,
+      prompt, maxTokens, temperature, topP, topK, thinking,
       [&generated](int64_t token)
       {
         generated.push_back(token);
@@ -603,14 +621,15 @@ void QwenLLMInference::generateStreaming(
     int maxTokens,
     float temperature,
     float topP,
-    int topK)
+    int topK,
+    bool thinking)
 {
   // Decoding tokens one at a time splits multi-byte UTF-8 sequences (byte
   // level BPE): re-decode the whole reply each step and emit the increment.
   std::vector<int64_t> ids;
   std::string lastText;
   generateLoop(
-      prompt, maxTokens, temperature, topP, topK,
+      prompt, maxTokens, temperature, topP, topK, thinking,
       [&, this](int64_t token)
       {
         ids.push_back(token);

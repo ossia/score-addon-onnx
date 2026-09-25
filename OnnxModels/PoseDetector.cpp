@@ -50,6 +50,17 @@ static Onnx::ModelIO toModelIO(const Onnx::ModelSpec& s)
   return io;
 }
 
+// classify(), retried from probed output shapes when the declared ones are
+// too dynamic to tell (see probeOutputShapes).
+static Onnx::ModelRole classifyModel(Onnx::OnnxRunContext& ctx)
+{
+  auto io = toModelIO(ctx.readModelSpec());
+  auto role = Onnx::classify(io);
+  if(role.kind == Onnx::ModelKind::Unknown && probeOutputShapes(ctx, io))
+    role = Onnx::classify(io);
+  return role;
+}
+
 Onnx::ModelRole PoseDetector::roleForWorkflow(PoseWorkflow w) const
 {
   // Keep the real model's input dims/layout; override the kind by selection.
@@ -213,6 +224,7 @@ try
   {
     det_ctx.reset();
     m_last_det_model = std::string(inputs.det_model.file.filename);
+    m_yolox_range = {};
     reinit = true;
   }
   if(inputs.reid_model.file.filename != m_last_reid_model)
@@ -246,20 +258,19 @@ try
     if(have_landmark && !this->ctx)
     {
       this->ctx = std::make_unique<Onnx::OnnxRunContext>(
-          this->inputs.model.file.bytes);
-      m_landmark_role = Onnx::classify(toModelIO(this->ctx->readModelSpec()));
+          this->inputs.model.file.bytes, this->inputs.model.file.filename);
+      m_landmark_role = classifyModel(*this->ctx);
     }
     if(have_det && !this->det_ctx)
     {
       this->det_ctx = std::make_unique<Onnx::OnnxRunContext>(
-          this->inputs.det_model.file.bytes);
-      m_detector_role
-          = Onnx::classify(toModelIO(this->det_ctx->readModelSpec()));
+          this->inputs.det_model.file.bytes, this->inputs.det_model.file.filename);
+      m_detector_role = classifyModel(*this->det_ctx);
     }
     if(have_reid && !this->reid_ctx)
     {
       this->reid_ctx = std::make_unique<Onnx::OnnxRunContext>(
-          this->inputs.reid_model.file.bytes);
+          this->inputs.reid_model.file.bytes, this->inputs.reid_model.file.filename);
       m_reid_spec
           = Onnx::classifyReid(toModelIO(this->reid_ctx->readModelSpec()));
     }
@@ -336,7 +347,8 @@ try
     if(!from_tracking)
     {
       auto dets = runDetector(
-          m_detector_role, src, role.domain, -2, nullptr, detThreshold());
+          m_detector_role, src, role.domain, detectorClass(), nullptr,
+          detThreshold());
       if(dets.empty())
       {
         holdOrPassthrough(src);

@@ -426,9 +426,24 @@ enum class GeomOutputKind : uint8_t
 
 // Decide from the output shape: rank-3 point-set-like -> a cloud; everything
 // else (rank-1/2 logits, per-point labels, SDF values) -> Data.
-inline GeomOutputKind classifyGeomOutput(const std::vector<int64_t>& oshape)
+// in_channels: per-point components of the model's input cloud (-1 if unknown).
+//
+// The input layout detector accepts xyz + up to 13 features, but on an output a
+// channel count other than 3 is per-point features or logits (PointNet part
+// segmentation: pred [1,2048,4] of log-probs), not coordinates, and a 3x3 is a
+// transform matrix. So an output is a cloud only with exactly 3 channels, or
+// the same channel count as the input cloud (xyz + normals in, out).
+inline GeomOutputKind
+classifyGeomOutput(const std::vector<int64_t>& oshape, int in_channels = -1)
 {
-  if(oshape.size() == 3 && detectPointLayout(oshape).valid())
+  if(oshape.size() != 3)
+    return GeomOutputKind::Data;
+  const PointLayout pl = detectPointLayout(oshape);
+  if(!pl.valid())
+    return GeomOutputKind::Data;
+  if(pl.channels == 3 && pl.count == 3)
+    return GeomOutputKind::Data; // [1,3,3]: a transform, not three points
+  if(pl.channels == 3 || (in_channels > 3 && pl.channels == in_channels))
     return GeomOutputKind::PointCloud;
   return GeomOutputKind::Data;
 }

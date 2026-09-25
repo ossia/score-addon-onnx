@@ -64,6 +64,18 @@ inline FloatTensor nchw_tensorFromARGB(
 }
 
 // When coming from a GL_RGBA texture
+// The input size of an NCHW image model: its own H/W where concrete, the
+// requested size where they are dynamic. Feeding the requested size to a fixed
+// model made ORT throw (smaller) or read misaligned planes (larger).
+inline std::pair<int, int>
+nchwInputSize(const ModelSpec::Port& port, int requested_w, int requested_h)
+{
+  const auto& s = port.shape;
+  if(s.size() != 4)
+    return {requested_w, requested_h};
+  return {s[3] > 0 ? (int)s[3] : requested_w, s[2] > 0 ? (int)s[2] : requested_h};
+}
+
 inline FloatTensor nchw_tensorFromRGBA(
     const ModelSpec::Port& port,
     const unsigned char* source_bits,
@@ -81,7 +93,33 @@ inline FloatTensor nchw_tensorFromRGBA(
   std::vector<std::int64_t> input_shape = port.shape;
   if(!input_shape.empty())
     input_shape[0] = 1;
+  // The shape follows the buffer we fill: a dynamic H/W takes the size we
+  // resize to, and a size the model does not accept fails in ORT instead of
+  // being read with the wrong plane stride.
+  if(input_shape.size() == 4)
+  {
+    input_shape[2] = model_h;
+    input_shape[3] = model_w;
+  }
   auto rgba = resize_fill_crop_rgba(source_bits, source_w, source_h, model_w, model_h);
+
+  // A 1-channel model (FER+ [1,1,64,64]) takes one luma plane.
+  if(input_shape.size() == 4 && input_shape[1] == 1)
+  {
+    input_tensor_values.resize(model_w * model_h, boost::container::default_init);
+    const unsigned char* px = rgba.data();
+    for(int i = 0; i < model_w * model_h; i++, px += 4)
+    {
+      const float y = 0.299f * px[0] + 0.587f * px[1] + 0.114f * px[2];
+      input_tensor_values[i] = (y - mean[0]) / std[0];
+    }
+    FloatTensor f{
+        .storage = {},
+        .value = vec_to_tensor<float>(input_tensor_values, input_shape)};
+    f.storage = std::move(input_tensor_values);
+    return f;
+  }
+
   auto rgb = rgba_to_rgb(rgba.data(), model_w, model_h);
 
   // FIXME pass storage as input instead

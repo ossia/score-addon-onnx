@@ -288,6 +288,119 @@ avnd_addon_object(
   SOURCES
     OnnxModels/DepthAnything2.hpp
     OnnxModels/DepthAnything2.cpp)
+  
+  
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+  OnnxModels/ImageProcessor.hpp
+  OnnxModels/ImageProcessor.cpp
+  TARGET
+  image_processor
+  MAIN_CLASS
+  ImageProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/VideoProcessor.hpp
+    OnnxModels/VideoProcessor.cpp
+  TARGET
+    video_processor
+  MAIN_CLASS
+    VideoProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/AudioProcessor.hpp
+    OnnxModels/AudioProcessor.cpp
+  TARGET
+    audio_processor
+  MAIN_CLASS
+    AudioProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/AudioAnalyzer.hpp
+    OnnxModels/AudioAnalyzer.cpp
+  TARGET
+    audio_analyzer
+  MAIN_CLASS
+    AudioAnalyzer
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/SequenceProcessor.hpp
+    OnnxModels/SequenceProcessor.cpp
+  TARGET
+    sequence_processor
+  MAIN_CLASS
+    SequenceProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/GeometryProcessor.hpp
+    OnnxModels/GeometryProcessor.cpp
+  TARGET
+    geometry_processor
+  MAIN_CLASS
+    GeometryProcessor
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/ImageGenerator.hpp
+    OnnxModels/ImageGenerator.cpp
+  TARGET
+    image_generator
+  MAIN_CLASS
+    ImageGenerator
+  NAMESPACE
+    OnnxModels
+)
+
+avnd_score_plugin_add(
+  BASE_TARGET
+    score_addon_onnx_models
+  SOURCES
+    OnnxModels/TextToken.hpp
+    OnnxModels/TextToken.cpp
+  TARGET
+    text_token
+  MAIN_CLASS
+    TextToken
+  NAMESPACE
+    OnnxModels
+)
 
 avnd_addon_object(
   BASE score_addon_onnx_models
@@ -295,6 +408,8 @@ avnd_addon_object(
   CLASS Regressor
   NAMESPACE RapidlibModels
   BACKENDS ${ONNX_DATA_BACKENDS}
+  BASE_TARGET
+    score_addon_onnx_models
   SOURCES
     RapidlibModels/Regressor.hpp
     RapidlibModels/Regressor.cpp)
@@ -308,7 +423,6 @@ avnd_addon_object(
   SOURCES
     RapidlibModels/Classifier.hpp
     RapidlibModels/Classifier.cpp)
-
 
 # FastVLM and QwenLLM are the only objects that #include the onnxruntime-extensions
 # tokenizer headers (Onnx/helpers/TokenIO.hpp etc.), so they are built only when the
@@ -338,6 +452,18 @@ avnd_addon_object(
     OnnxModels/QwenLLM.cpp
     Onnx/helpers/QwenLLM.hpp
     Onnx/helpers/QwenLLM.cpp)
+
+avnd_addon_object(
+  BASE score_addon_onnx_models
+  C_NAME onnx_tokenizer
+  CLASS TokenizerNode
+  NAMESPACE OnnxModels
+  BACKENDS ${ONNX_DATA_BACKENDS}
+  SOURCES
+    OnnxModels/Tokenizer.hpp
+    OnnxModels/Tokenizer.cpp
+    Onnx/helpers/TextTokenizer.hpp
+    Onnx/helpers/TextTokenizer.cpp)
 endif()
 
 avnd_addon_object(
@@ -562,6 +688,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
   add_executable(score_addon_onnx_tests
     tests/test_rapidlib_models.cpp
     tests/test_text_segmentation.cpp
+    tests/test_think_filter.cpp
     # real object sources under test:
     RapidlibModels/Classifier.cpp
     RapidlibModels/Regressor.cpp
@@ -575,6 +702,84 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     score_plugin_avnd
   )
   add_test(NAME score_addon_onnx_tests COMMAND score_addon_onnx_tests)
+
+  # Node-level tests on the real object sources and real models (models from
+  # $ONNX_TEST_MODELS, default the models-presets pack; tests SKIP without them).
+  add_executable(score_addon_onnx_node_tests
+    tests/test_node_model_swap.cpp
+    tests/test_external_data.cpp
+    tests/test_state_pairing.cpp
+    tests/test_geometry_output.cpp
+    tests/test_sequence_window.cpp
+    tests/test_sequence_batch.cpp
+    tests/test_sequence_normalize.cpp
+    tests/test_sequence_async.cpp
+    tests/test_sequence_rt.cpp
+    tests/alloc_counter.cpp
+    tests/test_texttoken_rate.cpp
+    tests/test_texttoken_rt.cpp
+    tests/test_pose_detector.cpp
+    tests/test_video_outputs.cpp
+    tests/test_aux_inputs.cpp
+    tests/test_audio_processor.cpp
+    tests/test_audio_overlap.cpp
+    tests/test_audio_precision.cpp
+    tests/test_audio_mel.cpp
+    tests/test_audio_block.cpp
+    tests/test_audio_rt.cpp
+    tests/test_classifier_routing.cpp
+    tests/test_image_outputs.cpp
+    tests/test_node_failures.cpp
+    tests/test_model_swap_jobs.cpp
+    OnnxModels/Resnet.cpp
+    OnnxModels/ENet.cpp
+    OnnxModels/SequenceProcessor.cpp
+    OnnxModels/TextToken.cpp
+    OnnxModels/PoseDetector.cpp
+    OnnxModels/PoseDetector_draw.cpp
+    OnnxModels/PoseDetector_detect.cpp
+    OnnxModels/PoseDetector_landmark.cpp
+    OnnxModels/PoseDetector_tracking.cpp
+    OnnxModels/VideoProcessor.cpp
+    OnnxModels/GeometryProcessor.cpp
+    OnnxModels/ImageGenerator.cpp
+    OnnxModels/AudioAnalyzer.cpp
+    OnnxModels/AudioProcessor.cpp
+    OnnxModels/ImageProcessor.cpp
+  )
+  target_include_directories(score_addon_onnx_node_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  target_compile_features(score_addon_onnx_node_tests PRIVATE cxx_std_23)
+  target_compile_definitions(score_addon_onnx_node_tests PRIVATE
+    SCORE_ONNX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+  target_link_libraries(score_addon_onnx_node_tests PRIVATE
+    Catch2::Catch2WithMain
+    score_plugin_avnd
+    onnxruntime::onnxruntime
+    score_onnx_ctx_overlay
+    score_onnx_imageops
+  )
+  if(TARGET Boost::boost)
+    target_link_libraries(score_addon_onnx_node_tests PRIVATE Boost::boost)
+  endif()
+  # The Language Model node needs the tokenizer library.
+  if(SCORE_ONNX_ENABLE_EXTENSIONS)
+    target_sources(score_addon_onnx_node_tests PRIVATE
+      tests/test_llm_thinking.cpp
+      tests/test_vlm.cpp
+      tests/test_tokenizer.cpp
+      OnnxModels/Tokenizer.cpp
+      Onnx/helpers/TextTokenizer.cpp
+      OnnxModels/QwenLLM.cpp
+      Onnx/helpers/QwenLLM.cpp
+      Onnx/helpers/FastVLM.cpp)
+    target_link_libraries(score_addon_onnx_node_tests PRIVATE
+      ocos_operators
+      onnxruntime_extensions)
+  endif()
+  add_test(NAME score_addon_onnx_node_tests COMMAND score_addon_onnx_node_tests)
+  set_tests_properties(score_addon_onnx_node_tests PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED")
 
   # Manual smoke harness for the FastVLM pipeline: needs real model files on
   # disk (pass a FastVLM-*-ONNX snapshot directory), so it is built with the

@@ -8,6 +8,7 @@
 #include <Onnx/helpers/ModelRole.hpp>  // detail::nameContains
 #include <Onnx/helpers/TensorType.hpp> // TensorElemType
 
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -60,6 +61,9 @@ struct ArchPort
   std::vector<int64_t> shape;
   TensorElemType dtype = TensorElemType::Float;
   PortArchetype arch = PortArchetype::Unknown;
+  // RecurrentState pairing: on an input, the index of the output it is fed back
+  // from; on an output, the index of the input it feeds. -1 when unpaired.
+  int state_pair = -1;
 };
 
 struct ModelArchetype
@@ -136,6 +140,15 @@ inline PortArchetype classifyPort(
 
   // Integer sequences are tokens (phonemes, BPE, REMI, codec codes). A dynamic
   // length [1,-1] has flatPos==1 but is still a token sequence (VITS/Piper).
+  // (X4-a) bool tensors are masks (tacotron `mask`, moirai `prediction_mask`),
+  // never token ids.
+  if(dt == TensorElemType::Bool)
+    return PortArchetype::Unknown;
+  // (X4-b) integer *_id (singular) columns are index metadata (moirai
+  // sample_id/time_id/variate_id), unlike *_ids token tensors.
+  if(is_input && rank >= 2 && isIntType(dt) && name.size() > 3
+     && name.compare(name.size() - 3, 3, "_id") == 0)
+    return PortArchetype::Unknown;
   if(isIntType(dt) && rank >= 1 && rank <= 2 && !metaName)
   {
     bool dynamic = false;
@@ -163,10 +176,18 @@ inline PortArchetype classifyPort(
     // thus image-shaped (e.g. CLAP mel_fusion [B,1,T,F]); check name first.
     if(specName)
       return PortArchetype::Spectrogram;
-    if(isChanDim(s[1]) || isChanDim(s[3]))
-      return PortArchetype::Image;       // NCHW / NHWC
-    if(s[1] <= 0)
-      return PortArchetype::Image;       // symbolic CHANNEL (e.g. depth_pro)
+    if(isChanDim(s[1]))
+      return PortArchetype::Image;       // NCHW
+    // (X4-h) NHWC: H and W are both concrete or both symbolic; moirai's
+    // weights_logits [?,?,128,4] (mixture weights) is not a picture.
+    if(isChanDim(s[3]) && (s[1] <= 0) == (s[2] <= 0))
+      return PortArchetype::Image;       // NHWC
+    // (X4-i) symbolic CHANNEL (e.g. depth_pro), but only behind a batch-like
+    // leading dim: UniAD's per-layer stacks [6,?,?,10] are not images.
+    // Also H must be symbolic when C is: a concrete H behind a symbolic C is a
+    // reshaped data tensor (moirai [?,?,128,4], e2pose [?,?,17,3]).
+    if(s[1] <= 0 && s[0] <= 1 && s[2] <= 0)
+      return PortArchetype::Image;
     // Concrete non-image channel (16/32/...) is a feature / recurrent-state map,
     // even when its spatial dims are symbolic (e.g. RVM r1i [1,16,-1,-1]).
     return PortArchetype::Unknown;
@@ -176,10 +197,15 @@ inline PortArchetype classifyPort(
   {
     if(specName)
       return PortArchetype::Spectrogram;
+    // (X4-c) HWC image with no batch dim ([128,128,3] minimal-hand detnet):
+    // two concrete spatial dims >= 16 in front of a colour channel.
+    if(!pointName && (s[2] == 3 || s[2] == 4) && s[0] >= 16 && s[1] >= 16)
+      return PortArchetype::Image;
     if(pointName || s[2] == 3 || s[1] == 3)
       return PortArchetype::PointSet;
     // [.,1,N] / [.,2,N] with a long last axis -> waveform; small front dims.
-    if((s[1] == 1 || s[1] == 2) && (s[2] <= 0 || s[2] > 32))
+    // (X4-d) the leading dim must look like a batch (UniAD bev [40000,1,256]).
+    if((s[1] == 1 || s[1] == 2) && (s[2] <= 0 || s[2] > 32) && s[0] <= 16)
       return PortArchetype::Waveform;
     if(audioName)
       return PortArchetype::Waveform;
@@ -266,42 +292,18 @@ inline ModelArchetype classifyModel(const ArchIO& io)
       return true; // foo_in -> foo_out
     return false;
   };
-  // Retag the OUTPUT side of a state pair too: a state output left as
-  // Sequence/Vector would otherwise drive NodeKind routing (silero's hn/cn made
-  // the whole model look like a SequenceProcessor).
-  auto retagPairedOutput = [&](const ArchPort& in)
-  {
-    for(auto& o : m.outputs)
-    {
-      if(o.arch == PortArchetype::RecurrentState)
-        continue; // already claimed by another state input (h->hn, then c->cn)
-      const auto& nm = in.name;
-      const bool named
-          = (!nm.empty() && nm.back() == 'i'
-             && o.name == nm.substr(0, nm.size() - 1) + "o")
-            || (endsWith(nm, "_in") && o.name == nm.substr(0, nm.size() - 3) + "_out")
-            || (o.name == nm + "n"); // h -> hn, c -> cn (silero / LSTM exports)
-      if(named || (o.arch != PortArchetype::Image && sameShape(in.shape, o.shape)))
-      {
-        o.arch = PortArchetype::RecurrentState;
-        return;
-      }
-    }
-  };
   for(size_t i = 0; i < m.inputs.size(); ++i)
   {
     auto& in = m.inputs[i];
     if(in.arch == PortArchetype::RecurrentState) // name-flagged (state/hidden/...)
     {
       m.stateful = true;
-      retagPairedOutput(in);
       continue;
     }
     if(nameStatePair(in.name)) // r#i/r#o, *_in/*_out — any shape, any index
     {
       in.arch = PortArchetype::RecurrentState;
       m.stateful = true;
-      retagPairedOutput(in);
       continue;
     }
     // Shape-matched state only for SECONDARY inputs: input 0 is the primary media
@@ -317,9 +319,113 @@ inline ModelArchetype classifyModel(const ArchIO& io)
       {
         in.arch = PortArchetype::RecurrentState;
         m.stateful = true;
-        retagPairedOutput(in);
         break;
       }
+    }
+  }
+
+  // Pair every state input with the output it is fed back from, once, for all
+  // the nodes (they used to each pair by first same-shape match, so silero's h
+  // and c both read hn). Two passes over ALL state inputs: names first, so a
+  // later input's name partner cannot be taken by an earlier input's shape
+  // match; then shape (wildcard-aware) among the outputs still free. Paired
+  // outputs are retagged too: a state output left as Sequence/Vector would
+  // otherwise drive the NodeKind routing (silero's hn/cn made the whole model
+  // look like a SequenceProcessor).
+  auto lower = [](std::string s)
+  {
+    for(char& c : s)
+      c = (char)std::tolower((unsigned char)c);
+    return s;
+  };
+  auto namePartner = [&](const std::string& in, const std::string& out)
+  {
+    if(in.empty() || out.empty())
+      return false;
+    if((in.back() == 'i' || in.back() == 'I') && out.size() == in.size()
+       && (out.back() == 'o' || out.back() == 'O')
+       && out.compare(0, out.size() - 1, in, 0, in.size() - 1) == 0)
+      return true; // r1i -> r1o
+    if(endsWith(in, "_in") && out == in.substr(0, in.size() - 3) + "_out")
+      return true; // foo_in -> foo_out
+    const auto li = lower(in), lo = lower(out);
+    return lo == li + "n"                 // h -> hn, state -> stateN
+           || lo == "new_" + li           // h -> new_h
+           || lo == li + "_new"           // h -> h_new
+           || lo == li + "_out"           // h -> h_out
+           || lo == "next_" + li          // h -> next_h
+           || (li.starts_with("past_") && lo == "present_" + li.substr(5));
+  };
+  {
+    std::vector<char> claimed(m.outputs.size(), 0);
+    auto claim = [&](size_t i, size_t o)
+    {
+      m.inputs[i].state_pair = (int)o;
+      m.outputs[o].state_pair = (int)i;
+      m.outputs[o].arch = PortArchetype::RecurrentState;
+      claimed[o] = 1;
+    };
+    for(size_t i = 0; i < m.inputs.size(); ++i)
+    {
+      if(m.inputs[i].arch != PortArchetype::RecurrentState)
+        continue;
+      for(size_t o = 0; o < m.outputs.size(); ++o)
+        if(!claimed[o] && namePartner(m.inputs[i].name, m.outputs[o].name))
+        {
+          claim(i, o);
+          break;
+        }
+    }
+    for(size_t i = 0; i < m.inputs.size(); ++i)
+    {
+      if(m.inputs[i].arch != PortArchetype::RecurrentState
+         || m.inputs[i].state_pair >= 0)
+        continue;
+      for(size_t o = 0; o < m.outputs.size(); ++o)
+        if(!claimed[o] && m.outputs[o].arch != PortArchetype::Image
+           && sameShape(m.inputs[i].shape, m.outputs[o].shape))
+        {
+          claim(i, o);
+          break;
+        }
+    }
+  }
+
+  // (X4-e) Audio fingerprints for bare rank-2 float inputs, which shape alone
+  // reads as Latent:
+  //  - a sample-rate control input (silero `sr`) => the first rank-2/3 float
+  //    input is the waveform;
+  //  - CREPE: [B,1024] frames -> [B,360] pitch bins.
+  {
+    bool has_sr = false;
+    for(auto& p : m.inputs)
+      if(p.name == "sr" || p.name == "sample_rate" || p.name == "sampling_rate")
+        has_sr = true;
+    const bool crepe = m.inputs.size() == 1 && m.outputs.size() == 1
+                       && m.inputs[0].shape.size() == 2 && m.inputs[0].shape[1] == 1024
+                       && m.outputs[0].shape.size() == 2 && m.outputs[0].shape[1] == 360;
+    if(has_sr || crepe)
+      for(auto& p : m.inputs)
+        if(p.arch == PortArchetype::Latent || p.arch == PortArchetype::Sequence)
+        {
+          p.arch = PortArchetype::Waveform;
+          break;
+        }
+  }
+
+  // (X4-f) SAM / EdgeSAM prompt decoder: image_embeddings + point_coords. No
+  // node hosts the encoder->decoder chain; refuse instead of GeometryProcessor.
+  {
+    bool emb = false, pts = false;
+    for(auto& p : m.inputs)
+    {
+      emb |= p.name == "image_embeddings";
+      pts |= p.name == "point_coords" || p.name == "point_labels";
+    }
+    if(emb && pts)
+    {
+      m.suggested = NodeKind::Unknown;
+      return m;
     }
   }
 
@@ -356,13 +462,29 @@ inline ModelArchetype classifyModel(const ArchIO& io)
         o.arch = audio_arch;
   }
 
+  // An LLM / VLM decoder step (a KV cache: past_key_values.*, cache_key_N)
+  // stays with TextToken, which refuses it with a clear reason, even when its
+  // first input is inputs_embeds rather than the token ids.
+  const bool kvCache = std::any_of(m.inputs.begin(), m.inputs.end(), [](auto& p) {
+    return p.name.starts_with("past_key_values.") || p.name.starts_with("cache_key")
+           || p.name.starts_with("cache_value");
+  });
+  // (X4-g) the primary input: first one that is media, not a control/state/aux.
+  auto primaryIn = [&]
+  {
+    for(auto& p : m.inputs)
+      if(p.arch != PortArchetype::Scalar && p.arch != PortArchetype::RecurrentState
+         && p.arch != PortArchetype::Unknown)
+        return p.arch;
+    return PortArchetype::Unknown;
+  };
   const bool audioIn = hasIn(PortArchetype::Waveform) || hasIn(PortArchetype::Spectrogram);
   const bool audioOut = hasOut(PortArchetype::Waveform) || hasOut(PortArchetype::Spectrogram);
 
   if(hasIn(PortArchetype::PointSet))
     m.suggested = NodeKind::GeometryProcessor;
-  else if(hasIn(PortArchetype::TokenSeq))
-    m.suggested = NodeKind::TextToken;
+  else if(primaryIn() == PortArchetype::TokenSeq || (hasIn(PortArchetype::TokenSeq) && kvCache))
+    m.suggested = NodeKind::TextToken; // which refuses the KV-cache decoders
   else if(audioIn)
     m.suggested = audioOut ? NodeKind::AudioProcessor : NodeKind::AudioAnalyzer;
   else if(hasIn(PortArchetype::Image))
