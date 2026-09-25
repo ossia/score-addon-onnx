@@ -35,6 +35,14 @@ struct Options
 {
   std::string provider = "default";
   int device_id = 0;
+  // CUDA runs convolutions and matmuls in TF32 by default on Ampere and
+  // newer: a 10-bit mantissa, a noise floor near -60 dB. Harmless for images,
+  // audible for audio, and a model that boosts part of the spectrum turns it
+  // into a howl (deep-music-enhancer: +40 dB above 13 kHz).
+  bool tf32 = true;
+
+  // For the audio nodes: full float32 precision.
+  static Options precise() { return {.tf32 = false}; }
 };
 
 static Ort::SessionOptions create_session_options(const Options& opts)
@@ -123,7 +131,8 @@ try
         "cudnn_conv_use_max_workspace",
         "cudnn_conv1d_pad_to_nc1d",
         "enable_cuda_graph",
-        "enable_skip_layer_norm_strict_mode"};
+        "enable_skip_layer_norm_strict_mode",
+        "use_tf32"};
     const std::vector values{
         device_id_str,
         "kNextPowerOfTwo",
@@ -132,7 +141,8 @@ try
         "1",
         "1",
         "0",
-        "1"};
+        "1",
+        opts.tf32 ? "1" : "0"};
     Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
         cuda_option_v2, keys.data(), values.data(), keys.size()));
     // FIXME release options
@@ -305,8 +315,10 @@ struct OnnxRunContext
   // from a buffer has no base directory, so without it the external data of a
   // model (model.onnx_data next to model.onnx) is looked up in the process's
   // working directory and not found.
-  explicit OnnxRunContext(std::string_view bytes, std::string_view model_path = {})
-      : env(make_env("ossia"))
+  explicit OnnxRunContext(
+      std::string_view bytes, std::string_view model_path = {}, Options o = {})
+      : opts(std::move(o))
+      , env(make_env("ossia"))
       , session_options(withModelFolder(create_session_options(opts), model_path))
       , session(env, bytes.data(), bytes.size(), session_options)
   {

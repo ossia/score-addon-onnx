@@ -711,6 +711,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     tests/test_aux_inputs.cpp
     tests/test_audio_processor.cpp
     tests/test_audio_overlap.cpp
+    tests/test_audio_precision.cpp
     tests/test_audio_mel.cpp
     tests/test_audio_block.cpp
     tests/test_audio_rt.cpp

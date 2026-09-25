@@ -245,7 +245,8 @@ makeTokenPipeline(const std::string& path, double host_rate)
     if(!f)
       throw std::runtime_error("cannot read the file");
     const std::string bytes{std::istreambuf_iterator<char>(f), {}};
-    P.ctx = std::make_shared<Onnx::OnnxRunContext>(bytes, path);
+    P.ctx = std::make_shared<Onnx::OnnxRunContext>(
+        bytes, path, Onnx::Options::precise());
   }
   P.spec = P.ctx->readModelSpec();
   const auto io = toArchIO(P.spec);
