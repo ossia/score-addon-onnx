@@ -197,13 +197,7 @@ makeTokenPipeline(const std::string& path, double host_rate)
   auto& P = *pp;
   P.path = path;
   P.host_rate = host_rate;
-  {
-    std::ifstream f(path, std::ios::binary);
-    if(!f)
-      throw std::runtime_error("cannot read the file");
-    const std::string bytes{std::istreambuf_iterator<char>(f), {}};
-    P.ctx = std::make_shared<Onnx::OnnxRunContext>(bytes, path);
-  }
+  P.ctx = Onnx::loadRunContext(path, Onnx::Options::precise());
   P.spec = P.ctx->readModelSpec();
   const auto io = Onnx::toArchIO(P.spec);
   P.arch = Onnx::classifyModel(io);
