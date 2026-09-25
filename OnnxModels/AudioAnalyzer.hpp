@@ -19,6 +19,7 @@
 #include <halp/controls.hpp>
 #include <halp/meta.hpp>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -38,6 +39,74 @@ enum class AnalyzerReduce
   Argmax,  // value0 = argmax index, value1 = max value
   FirstTwo, // value0 = out[0], value1 = out[1]
   MeanPeak, // value0 = mean, value1 = peak
+};
+
+struct AudioAnalyzer;
+
+// What the node's model and settings resolve to: the session, the I/O
+// routing, the resampler and ring, the recurrent state and the inference
+// scratch. Built by a worker job, never on the audio thread; the audio thread
+// swaps the new one in and hands the old one back to the worker to be freed.
+// (The model itself runs inline: analyzers are small, and their controls
+// should follow the audio closely.)
+struct AnalyzerBuildParams
+{
+  std::string path; // the model file, read again on the worker
+  double host_rate = 48000.0;
+  int host_channels = 0;
+  std::size_t max_frames = 4096;
+  int rate_override = 0;
+
+  bool sameSettings(const AnalyzerBuildParams& o) const noexcept
+  {
+    return host_rate == o.host_rate && host_channels == o.host_channels
+           && max_frames == o.max_frames && rate_override == o.rate_override;
+  }
+};
+
+struct AnalyzerStatePort
+{
+  int in_index = 0;
+  int out_index = -1;
+  std::vector<int64_t> shape;
+  std::vector<float> data;
+};
+
+struct AnalyzerPipeline
+{
+  AnalyzerBuildParams params;
+  std::shared_ptr<Onnx::OnnxRunContext> ctx;
+  Onnx::ModelSpec spec;
+  Onnx::ModelArchetype arch;
+  std::string refusal; // non-empty: the model is not something this node runs
+
+  double model_rate = 16000.0;
+  int wave_in_index = -1;
+  Onnx::WaveformShape in_shape;
+  Onnx::WaveformInput audio_in;
+  std::vector<float> staged;
+  std::vector<float> out_scratch;
+  std::vector<float> flat; // the primary output, as floats
+  // The other inputs (sr, lengths, masks, flags, scalars), typed as declared.
+  std::vector<Onnx::AuxPlan> aux;
+  std::vector<std::vector<uint8_t>> aux_store;
+  std::vector<std::vector<int64_t>> aux_shapes;
+  bool normalize_frames = false; // CREPE: zero mean, unit variance per frame
+  std::vector<AnalyzerStatePort> states;
+  std::vector<int64_t> ishape;
+  std::vector<Ort::Value> ins, outs;
+};
+
+struct AnalyzerJob
+{
+  enum class Kind : uint8_t
+  {
+    Build,
+    Dispose
+  } kind = Kind::Build;
+  AnalyzerBuildParams build;
+  std::shared_ptr<Onnx::OnnxRunContext> ctx; // Build: reuse this session
+  std::shared_ptr<AnalyzerPipeline> pipeline; // Dispose: its last owner
 };
 
 struct AudioAnalyzer : OnnxObject
@@ -83,43 +152,25 @@ public:
   void prepare(halp::setup info);
   void operator()(int frames);
 
+  struct worker
+  {
+    std::function<void(std::unique_ptr<AnalyzerJob>)> request;
+    static std::function<void(AudioAnalyzer&)> work(std::unique_ptr<AnalyzerJob> job);
+  } worker;
+
 private:
-  std::shared_ptr<Onnx::OnnxRunContext> ctx;
-  Onnx::ModelSpec spec;
-  Onnx::ModelArchetype arch;
-  std::string lastModelPath;
+  std::shared_ptr<AnalyzerPipeline> pipe;
+  bool building = false;
+  AnalyzerBuildParams requested;
 
   double host_rate = 48000.0;
   int host_in_channels = 0;
   std::size_t max_frames = 4096;
 
-  double model_rate = 16000.0;
-  int wave_in_index = -1;
-  Onnx::WaveformShape in_shape;
-
-  Onnx::WaveformInput audio_in;
-  std::vector<float> staged;
-  std::vector<float> out_scratch;
-  // The other inputs (sr, lengths, masks, flags, scalars), typed as declared.
-  std::vector<Onnx::AuxPlan> aux;
-  std::vector<std::vector<uint8_t>> aux_store;
-  std::vector<std::vector<int64_t>> aux_shapes;
-  // A rank-4 input (CLAP's mel_fusion) needs a frontend we don't have.
-  bool unsupported_input = false;
-  int lastRateOverride = 0;
-  bool normalize_frames = false; // CREPE: zero mean, unit variance per frame
-
-  struct StatePort
-  {
-    int in_index = 0;
-    int out_index = -1;
-    std::vector<int64_t> shape;
-    std::vector<float> data;
-  };
-  std::vector<StatePort> states;
-
-  void reloadModel();
-  void resolveIO();
+  AnalyzerBuildParams currentParams() const;
+  void requestBuild(const AnalyzerBuildParams& p, bool reuse_session);
+  void install(std::shared_ptr<AnalyzerPipeline> p);
+  void dispose(std::shared_ptr<AnalyzerPipeline> p);
   void zeroStates();
   void runBlock();
   void reduceOutputs(const std::vector<float>& flat, int primary_out);

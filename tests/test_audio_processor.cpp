@@ -101,6 +101,11 @@ struct AudioHarness
     node.inputs.audio.channels = 2;
     node.outputs.audio.samples = outs;
     node.outputs.audio.channels = 2;
+    // The model loads on the worker; here it runs right away.
+    node.worker.request = [this](std::unique_ptr<OnnxModels::AudioInferJob> job) {
+      if(auto done = OnnxModels::AudioProcessor::worker::work(std::move(job)))
+        done(node);
+    };
   }
   void run(int ticks)
   {
@@ -159,6 +164,10 @@ TEST_CASE("Audio Analyzer: CREPE finds a quiet tone's pitch", "[onnx][audio]")
   a.prepare({.rate = 16000., .input_channels = 1, .frames = 512});
   a.inputs.model.file.bytes = bytes;
   a.inputs.model.file.filename = model;
+  a.worker.request = [&](std::unique_ptr<OnnxModels::AnalyzerJob> job) {
+    if(auto done = OnnxModels::AudioAnalyzer::worker::work(std::move(job)))
+      done(a);
+  };
   std::vector<float> block(512);
   float* ch[1]{block.data()};
   a.inputs.audio.samples = ch;

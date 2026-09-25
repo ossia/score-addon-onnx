@@ -282,6 +282,18 @@ struct WaveformShape
     return w;
   }
 
+  // Same, into an existing vector (no allocation once it has the capacity).
+  void tensorShapeInto(int64_t n, std::vector<int64_t>& out) const
+  {
+    switch(layout)
+    {
+      case WaveLayout::BNC1: out.assign({1, (int64_t)channels, n}); return;
+      case WaveLayout::BN:   out.assign({1, n}); return;
+      case WaveLayout::N:    out.assign({n}); return;
+    }
+    out.assign({1, (int64_t)channels, n});
+  }
+
   std::vector<int64_t> tensorShape(int64_t n) const
   {
     switch(layout)

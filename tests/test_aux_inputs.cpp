@@ -347,6 +347,10 @@ struct AnalyzerHarness
     chans[0] = block.data();
     node.inputs.audio.samples = chans;
     node.inputs.audio.channels = 1;
+    node.worker.request = [this](std::unique_ptr<OnnxModels::AnalyzerJob> job) {
+      if(auto done = OnnxModels::AudioAnalyzer::worker::work(std::move(job)))
+        done(node);
+    };
   }
 };
 }
@@ -370,7 +374,9 @@ TEST_CASE("Audio Analyzer: CLAP's rank-4 input is refused, not retried", "[onnx]
   AnalyzerHarness a{clap};
   for(int i = 0; i < 8; i++)
     a.node(512);
-  CHECK(!a.node.inputs.model.current_model_invalid);
+  // Refused once at load (disabled until another file), not run and failing
+  // on every block.
+  CHECK(a.node.inputs.model.current_model_invalid);
   CHECK(a.node.outputs.data.value.empty());
 }
 

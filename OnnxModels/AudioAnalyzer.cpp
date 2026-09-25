@@ -1,5 +1,7 @@
 #include "AudioAnalyzer.hpp"
 
+#include <OnnxModels/JobPool.hpp>
+
 #include <Onnx/helpers/AudioRate.hpp>
 #include <Onnx/helpers/OnnxContext.hpp>
 #include <Onnx/helpers/TensorToTexture.hpp>
@@ -10,6 +12,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
 
 namespace OnnxModels
 {
@@ -67,10 +72,7 @@ void normalizeFrames(std::vector<float>& x, int channels)
 }
 } // namespace
 
-AudioAnalyzer::AudioAnalyzer() noexcept
-{
-  staged.reserve(48000);
-}
+AudioAnalyzer::AudioAnalyzer() noexcept = default;
 
 AudioAnalyzer::~AudioAnalyzer() = default;
 
@@ -79,125 +81,183 @@ void AudioAnalyzer::prepare(halp::setup info)
   host_rate = info.rate > 0 ? info.rate : 48000.0;
   host_in_channels = info.input_channels;
   max_frames = info.frames > 0 ? (std::size_t)info.frames : 4096;
-  lastModelPath.clear();
-  ctx.reset();
+  // The next tick sees settings that differ from the pipeline's, and builds
+  // one for the new host config.
 }
 
-void AudioAnalyzer::reloadModel()
-{
-  ctx = std::make_shared<Onnx::OnnxRunContext>(
-      inputs.model.file.bytes, inputs.model.file.filename);
-  spec = ctx->readModelSpec();
-  arch = Onnx::classifyModel(toArchIO(spec));
-  lastModelPath = inputs.model.file.filename;
-  resolveIO();
-}
+static void buildPipeline(AnalyzerPipeline& P);
 
-void AudioAnalyzer::resolveIO()
+// Worker side of a build: the session (from the file, since the port's
+// mapping may be gone by now; or the running one, for a settings change),
+// then everything buildPipeline() derives from it.
+static std::shared_ptr<AnalyzerPipeline>
+makePipeline(const AnalyzerBuildParams& bp, std::shared_ptr<Onnx::OnnxRunContext> ctx)
 {
-  wave_in_index = -1;
-  states.clear();
-
-  for(int i = 0; i < (int)arch.inputs.size(); ++i)
+  auto P = std::make_shared<AnalyzerPipeline>();
+  P->params = bp;
+  if(!ctx)
   {
-    const auto a = arch.inputs[i].arch;
+    std::ifstream f(bp.path, std::ios::binary);
+    if(!f)
+      throw std::runtime_error("cannot read the file");
+    const std::string bytes{std::istreambuf_iterator<char>(f), {}};
+    ctx = std::make_shared<Onnx::OnnxRunContext>(bytes, bp.path);
+  }
+  P->ctx = std::move(ctx);
+  P->spec = P->ctx->readModelSpec();
+  P->arch = Onnx::classifyModel(toArchIO(P->spec));
+  if(!P->spec.inputs.empty() && !P->spec.outputs.empty())
+    buildPipeline(*P);
+  return P;
+}
+
+static void buildPipeline(AnalyzerPipeline& P)
+{
+  const AnalyzerBuildParams& bp = P.params;
+  P.wave_in_index = -1;
+  P.states.clear();
+
+  for(int i = 0; i < (int)P.arch.inputs.size(); ++i)
+  {
+    const auto a = P.arch.inputs[i].arch;
     if(a == PortArchetype::Waveform || a == PortArchetype::Spectrogram)
     {
-      wave_in_index = i;
+      P.wave_in_index = i;
       break;
     }
   }
-  if(wave_in_index < 0)
+  if(P.wave_in_index < 0)
   {
-    for(int i = 0; i < (int)arch.inputs.size(); ++i)
+    for(int i = 0; i < (int)P.arch.inputs.size(); ++i)
     {
-      const auto a = arch.inputs[i].arch;
+      const auto a = P.arch.inputs[i].arch;
       if(a != PortArchetype::RecurrentState && a != PortArchetype::Scalar
          && a != PortArchetype::TokenSeq)
       {
-        wave_in_index = i;
+        P.wave_in_index = i;
         break;
       }
     }
   }
-  if(wave_in_index < 0)
-    wave_in_index = 0;
+  if(P.wave_in_index < 0)
+    P.wave_in_index = 0;
 
-  for(int i = 0; i < (int)arch.inputs.size(); ++i)
+  for(int i = 0; i < (int)P.arch.inputs.size(); ++i)
   {
-    if(arch.inputs[i].arch != PortArchetype::RecurrentState)
+    if(P.arch.inputs[i].arch != PortArchetype::RecurrentState)
       continue;
-    StatePort sp;
+    AnalyzerStatePort sp;
     sp.in_index = i;
-    sp.shape = spec.inputs[i].shape;
+    sp.shape = P.spec.inputs[i].shape;
     for(auto& d : sp.shape)
       if(d < 0)
         d = 1;
     // Paired once by classifyModel (names first, then free same-shape outputs).
-    sp.out_index = arch.inputs[i].state_pair;
+    sp.out_index = P.arch.inputs[i].state_pair;
     sp.data.assign((std::size_t)flatPositive(sp.shape), 0.f);
-    states.push_back(std::move(sp));
+    P.states.push_back(std::move(sp));
   }
 
-  std::vector<int> owned{wave_in_index};
-  for(const auto& s : states)
+  std::vector<int> owned{P.wave_in_index};
+  for(const auto& s : P.states)
     owned.push_back(s.in_index);
-  aux = Onnx::planAuxInputs(spec.inputs, owned, {.nparams = 1});
-  aux_store.resize(aux.size());
-  aux_shapes.resize(aux.size());
+  P.aux = Onnx::planAuxInputs(P.spec.inputs, owned, {.nparams = 1});
+  P.aux_store.resize(P.aux.size());
+  P.aux_shapes.resize(P.aux.size());
 
   // WaveformShape has no rank-4 layout: CLAP's mel_fusion [1,4,1001,64] would
   // be fed as [1,1,64] and fail on every block.
-  unsupported_input = spec.inputs[wave_in_index].shape.size() >= 4;
-  if(unsupported_input)
-    std::fprintf(
-        stderr,
-        "Audio Analyzer: %s takes a rank-4 input (%s), which needs a spectrogram "
-        "frontend; not supported\n",
-        std::string(inputs.model.file.filename).c_str(),
-        spec.inputs[wave_in_index].name.c_str());
+  if(P.spec.inputs[P.wave_in_index].shape.size() >= 4)
+  {
+    P.refusal = "takes a rank-4 input (" + P.spec.inputs[P.wave_in_index].name
+                + "), which needs a spectrogram frontend; not supported";
+    return;
+  }
 
-  in_shape
-      = Onnx::WaveformShape::fromInputShape(spec.inputs[wave_in_index].shape);
-  lastRateOverride = inputs.model_rate.value;
-  model_rate = lastRateOverride > 0
-                   ? (double)lastRateOverride
-                   : Onnx::audioModelRate(*ctx, inputs.model.file.filename, 16000.);
-  normalize_frames = isCrepe(spec);
+  P.in_shape
+      = Onnx::WaveformShape::fromInputShape(P.spec.inputs[P.wave_in_index].shape);
+  P.model_rate = bp.rate_override > 0
+                   ? (double)bp.rate_override
+                   : Onnx::audioModelRate(*P.ctx, bp.path, 16000.);
+  P.normalize_frames = isCrepe(P.spec);
 
-  const int hc = host_in_channels > 0 ? host_in_channels : 1;
-  const int64_t block = in_shape.block > 0 ? in_shape.block : 1024;
-  audio_in.prepare(in_shape, host_rate, model_rate, block, block, hc,
-                   max_frames);
-  staged.reserve((std::size_t)in_shape.channels * block + 16);
+  const int hc = bp.host_channels > 0 ? bp.host_channels : 1;
+  const int64_t block = P.in_shape.block > 0 ? P.in_shape.block : 1024;
+  P.audio_in.prepare(P.in_shape, bp.host_rate, P.model_rate, block, block, hc,
+                     bp.max_frames);
+  P.staged.reserve((std::size_t)P.in_shape.channels * block + 16);
 }
 
 void AudioAnalyzer::zeroStates()
 {
-  for(auto& s : states)
+  if(!pipe)
+    return;
+  auto& P = *pipe;
+  for(auto& s : P.states)
     std::fill(s.data.begin(), s.data.end(), 0.f);
-  audio_in.reset();
+  P.audio_in.reset();
+}
+
+AnalyzerBuildParams AudioAnalyzer::currentParams() const
+{
+  return {
+      .path = std::string(inputs.model.file.filename),
+      .host_rate = host_rate,
+      .host_channels = host_in_channels,
+      .max_frames = max_frames,
+      .rate_override = inputs.model_rate.value};
+}
+
+void AudioAnalyzer::requestBuild(const AnalyzerBuildParams& p, bool reuse_session)
+{
+  building = true;
+  requested = p;
+  auto job = JobPool<AnalyzerJob>::instance().acquire();
+  job->kind = AnalyzerJob::Kind::Build;
+  job->build = p;
+  job->ctx = reuse_session && pipe ? pipe->ctx : nullptr;
+  worker.request(std::move(job));
+}
+
+void AudioAnalyzer::install(std::shared_ptr<AnalyzerPipeline> p)
+{
+  std::swap(pipe, p);
+  dispose(std::move(p));
+}
+
+void AudioAnalyzer::dispose(std::shared_ptr<AnalyzerPipeline> p)
+{
+  if(!p)
+    return;
+  auto job = JobPool<AnalyzerJob>::instance().acquire();
+  job->kind = AnalyzerJob::Kind::Dispose;
+  job->pipeline = std::move(p);
+  worker.request(std::move(job));
 }
 
 void AudioAnalyzer::operator()(int frames)
 try
 {
-  if(!available)
-    return;
-  if(inputs.model.current_model_invalid)
-    return;
-  if(inputs.model.file.bytes.empty())
+  if(!available || inputs.model.current_model_invalid
+     || inputs.model.file.bytes.empty())
     return;
 
-  if(!ctx || lastModelPath != inputs.model.file.filename)
+  // A new file, or new settings: a pipeline is built on the worker; the
+  // running one (if any) keeps analysing until it arrives.
+  if(!building)
   {
-    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
-      return;
+    if(!pipe || pipe->params.path != inputs.model.file.filename)
+    {
+      if(!pipe || requested.path != inputs.model.file.filename)
+        requestBuild(currentParams(), false);
+    }
+    else if(!pipe->params.sameSettings(currentParams()))
+      requestBuild(currentParams(), true);
   }
-  if(spec.inputs.empty() || spec.outputs.empty() || unsupported_input)
+  if(!pipe || !pipe->refusal.empty() || pipe->spec.inputs.empty()
+     || pipe->spec.outputs.empty())
     return;
-  if(inputs.model_rate.value != lastRateOverride)
-    resolveIO(); // re-prepares the resampler for the new rate
+  auto& P = *pipe;
 
   if(inputs.reset.value)
   {
@@ -207,17 +267,17 @@ try
 
   const int hc = inputs.audio.channels;
   if(hc > 0 && frames > 0)
-    audio_in.push(inputs.audio.samples, hc, (std::size_t)frames);
+    P.audio_in.push(inputs.audio.samples, hc, (std::size_t)frames);
 
   // A block that fails is reported and skipped; while the same failure
   // repeats, the blocks are dropped instead of run (see FailureLog).
   int guard = 0;
   if(!failures.ready())
   {
-    while(audio_in.ready() && guard++ < 32)
-      audio_in.fill(staged);
+    while(P.audio_in.ready() && guard++ < 32)
+      P.audio_in.fill(P.staged);
   }
-  while(audio_in.ready() && guard++ < 32)
+  while(P.audio_in.ready() && guard++ < 32)
   {
     try
     {
@@ -240,30 +300,93 @@ catch(...)
   failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
+std::function<void(AudioAnalyzer&)>
+AudioAnalyzer::worker::work(std::unique_ptr<AnalyzerJob> job)
+{
+  // Back to the lock-free pool, emptied, whatever path we exit through.
+  struct Recycle
+  {
+    std::unique_ptr<AnalyzerJob>& j;
+    ~Recycle()
+    {
+      if(j)
+      {
+        j->ctx.reset();
+        j->pipeline.reset();
+      }
+      JobPool<AnalyzerJob>::instance().release(std::move(j));
+    }
+  } recycle{job};
+  if(!job)
+    return {};
+  if(job->kind == AnalyzerJob::Kind::Dispose)
+  {
+    job->pipeline.reset(); // the session and the buffers are freed here
+    return {};
+  }
+  try
+  {
+    auto p = makePipeline(job->build, std::move(job->ctx));
+    return [p = std::move(p)](AudioAnalyzer& self) mutable
+    {
+      self.building = false;
+      if(p->params.path != self.inputs.model.file.filename)
+      {
+        self.dispose(std::move(p)); // another file was picked meanwhile
+        return;
+      }
+      if(!p->refusal.empty())
+      {
+        self.failures.failed(AudioAnalyzer::name(), p->params.path, p->refusal);
+        self.inputs.model.current_model_invalid = true;
+        self.dispose(std::move(p));
+        return;
+      }
+      self.failures.succeeded();
+      self.install(std::move(p));
+    };
+  }
+  catch(const std::exception& e)
+  {
+    return [what = std::string(e.what()), path = job->build.path](AudioAnalyzer& self)
+    {
+      self.building = false;
+      if(path != self.inputs.model.file.filename)
+        return;
+      self.failures.failed(AudioAnalyzer::name(), path, "cannot load the model: " + what);
+      self.inputs.model.current_model_invalid = true;
+    };
+  }
+}
+
 void AudioAnalyzer::runBlock()
 {
-  const int64_t n = audio_in.fill(staged);
+  auto& P = *pipe;
+  const int64_t n = P.audio_in.fill(P.staged);
   if(n <= 0)
     return;
-  if(normalize_frames)
-    normalizeFrames(staged, in_shape.channels);
+  if(P.normalize_frames)
+    normalizeFrames(P.staged, P.in_shape.channels);
 
-  const int nin = (int)spec.inputs.size();
-  std::vector<Ort::Value> ins;
-  ins.reserve(nin);
-  auto ishape = in_shape.tensorShape(n);
+  // On the audio thread: the pipeline's scratch (ins, outs, ishape, flat) is
+  // reused block after block.
+  const int nin = (int)P.spec.inputs.size();
+  auto& ins = P.ins;
+  ins.clear();
+  P.in_shape.tensorShapeInto(n, P.ishape);
+  const auto& ishape = P.ishape;
   const float param = inputs.param.value;
   const Onnx::AuxHost host{
-      .params = {&param, 1}, .sample_rate = model_rate, .primary_shape = ishape};
+      .params = {&param, 1}, .sample_rate = P.model_rate, .primary_shape = ishape};
   for(int i = 0; i < nin; ++i)
   {
-    if(i == wave_in_index)
+    if(i == P.wave_in_index)
     {
-      ins.emplace_back(Onnx::vec_to_tensor<float>(staged, ishape));
+      ins.emplace_back(Onnx::vec_to_tensor<float>(P.staged, ishape));
       continue;
     }
-    StatePort* sp = nullptr;
-    for(auto& s : states)
+    AnalyzerStatePort* sp = nullptr;
+    for(auto& s : P.states)
       if(s.in_index == i)
       {
         sp = &s;
@@ -278,21 +401,21 @@ void AudioAnalyzer::runBlock()
       // The other inputs, by their aux plan: Silero's sr gets the model rate
       // (as its int64), a bool flag false, a scalar the Param.
       std::size_t k = 0;
-      while(k < aux.size() && aux[k].index != i)
+      while(k < P.aux.size() && P.aux[k].index != i)
         ++k;
-      if(k < aux.size())
-        ins.emplace_back(Onnx::fillAux(aux[k], host, aux_store[k], aux_shapes[k]));
+      if(k < P.aux.size())
+        ins.emplace_back(Onnx::fillAux(P.aux[k], host, P.aux_store[k], P.aux_shapes[k]));
       else
         ins.emplace_back(nullptr);
     }
   }
 
-  const int nout = (int)spec.output_names_char.size();
-  std::vector<Ort::Value> outs;
-  outs.reserve(nout);
+  const int nout = (int)P.spec.output_names_char.size();
+  auto& outs = P.outs;
+  outs.clear();
   for(int i = 0; i < nout; ++i)
     outs.emplace_back(nullptr);
-  ctx->infer(spec, ins, outs);
+  P.ctx->infer(P.spec, ins, outs);
   failures.succeeded();
 
   // Choose the primary (non-state) output: the first output that is not paired
@@ -301,7 +424,7 @@ void AudioAnalyzer::runBlock()
   for(int o = 0; o < nout; ++o)
   {
     bool is_state = false;
-    for(auto& s : states)
+    for(auto& s : P.states)
       if(s.out_index == o)
       {
         is_state = true;
@@ -320,11 +443,11 @@ void AudioAnalyzer::runBlock()
   const int64_t cnt = (int64_t)info.GetElementCount();
   const TensorElemType odt = Onnx::fromOrtElementType(info.GetElementType());
   const float* f
-      = Onnx::toFloat(res.GetTensorData<uint8_t>(), cnt, odt, out_scratch);
-  std::vector<float> flat(f, f + cnt);
+      = Onnx::toFloat(res.GetTensorData<uint8_t>(), cnt, odt, P.out_scratch);
+  P.flat.assign(f, f + cnt);
 
   // Feed recurrent state back.
-  for(auto& s : states)
+  for(auto& s : P.states)
   {
     if(s.out_index < 0 || s.out_index >= nout)
       continue;
@@ -334,16 +457,16 @@ void AudioAnalyzer::runBlock()
     const TensorElemType sdt
         = Onnx::fromOrtElementType(sinfo.GetElementType());
     const float* sf
-        = Onnx::toFloat(sres.GetTensorData<uint8_t>(), scnt, sdt, out_scratch);
+        = Onnx::toFloat(sres.GetTensorData<uint8_t>(), scnt, sdt, P.out_scratch);
     s.data.assign(sf, sf + scnt);
   }
 
-  reduceOutputs(flat, primary);
+  reduceOutputs(P.flat, primary);
 }
 
 void AudioAnalyzer::reduceOutputs(const std::vector<float>& flat, int primary)
 {
-  outputs.data.value = flat;
+  outputs.data.value.assign(flat.begin(), flat.end());
   if(flat.empty())
     return;
 
