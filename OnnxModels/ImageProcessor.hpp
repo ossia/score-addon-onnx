@@ -50,6 +50,18 @@ struct InferJob
   Onnx::WriteMode wm = Onnx::WriteMode::DirectClamp;
   // Auto role of every model output, to route the secondary ones.
   std::vector<Onnx::ImageModelKind> out_kinds;
+
+  // A multi-input model (image pair, image + mask, image + scalars): the
+  // primary image above goes to input `image_index`, a second one to
+  // `aux_index` (-1: none), and Param 1 / 2 to `param_index`.
+  bool multi = false;
+  int image_index = 0;
+  int aux_index = -1;
+  boost::container::vector<float> aux_input;
+  std::vector<int64_t> aux_shape;
+  Onnx::TensorElemType aux_dt = Onnx::TensorElemType::Float;
+  int param_index[2] = {-1, -1};
+  float param_value[2] = {0.f, 0.f};
 };
 
 // Pixel value normalization applied to the input image before inference.

@@ -63,3 +63,12 @@ for name, op, v in (("cloud_plus1", "Add", 1.0), ("cloud_zero", "Mul", 0.0)):
          [helper.make_tensor_value_info("points", TensorProto.FLOAT, [1, "N", 3])],
          [helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, "N", 3])],
          [numpy_helper.from_array(np.array(v, np.float32), "v")])
+
+# An image-pair model of any size: the mean of its two images.
+save("pair_mean",
+     [helper.make_node("Add", ["img0", "img1"], ["sum"]),
+      helper.make_node("Mul", ["sum", "half"], ["out"])],
+     [helper.make_tensor_value_info("img0", TensorProto.FLOAT, [1, 3, "H", "W"]),
+      helper.make_tensor_value_info("img1", TensorProto.FLOAT, [1, 3, "H", "W"])],
+     [helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, 3, "H", "W"])],
+     [numpy_helper.from_array(np.array(0.5, np.float32), "half")])
