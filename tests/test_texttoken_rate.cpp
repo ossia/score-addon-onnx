@@ -201,7 +201,14 @@ struct QueuedHarness : Harness
   explicit QueuedHarness(const std::string& model)
       : Harness{model}
   {
+    // Loading a model and freeing the old one run right away; only the
+    // inference jobs wait, and are counted.
     node.worker.request = [this](std::unique_ptr<OnnxModels::TokenInferJob> job) {
+      if(job->kind != OnnxModels::TokenInferJob::Kind::Infer)
+      {
+        runJob(node, std::move(job));
+        return;
+      }
       dispatches++;
       queue.push_back(std::move(job));
     };
