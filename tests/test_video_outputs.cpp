@@ -14,6 +14,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <cstdlib>
+#include <new>
 #include <string>
 
 namespace
@@ -190,4 +192,52 @@ TEST_CASE("RVM: a slow synchronous run moves the model to the worker", "[onnx][v
     SKIP("this machine runs RVM at 512 px within the budget");
   v.run();
   CHECK(v.dispatches == 1);
+}
+
+// BUG-LEDGER V5: each frame copied every RVM state buffer (MBs at HD) into a
+// freshly emptied job on the render thread. The buffers now go round between
+// the node and the jobs: after the first frames, dispatching a frame makes no
+// large allocation. (Pointer identity cannot show it: malloc hands the same
+// block back after a free; so large allocations are counted instead.)
+namespace
+{
+thread_local bool g_countBig = false;
+thread_local int g_bigAllocs = 0;
+}
+void* operator new(std::size_t n)
+{
+  if(g_countBig && n >= 64 * 1024)
+    g_bigAllocs++;
+  if(void* p = std::malloc(n ? n : 1))
+    return p;
+  throw std::bad_alloc{};
+}
+void operator delete(void* p) noexcept
+{
+  std::free(p);
+}
+void operator delete(void* p, std::size_t) noexcept
+{
+  std::free(p);
+}
+
+TEST_CASE("RVM: the state buffers are reused from frame to frame", "[onnx][video]")
+{
+  if(!std::filesystem::exists(rvmModel()) || !std::filesystem::exists(bodyImage))
+    SKIP("model or image not found");
+  QueuedVideo v{bodyImage, rvmModel()};
+  v.node.inputs.resolution.value = {768, 512}; // the worker path
+  int big = 0;
+  for(int frame = 0; frame < 8; frame++)
+  {
+    g_bigAllocs = 0;
+    g_countBig = true;
+    v.run(); // the render thread's part: preprocessing + dispatch
+    g_countBig = false;
+    if(frame >= 3) // the first frames size the buffers
+      big += g_bigAllocs;
+    REQUIRE(v.queue.size() == 1);
+    v.complete();
+  }
+  CHECK(big == 0);
 }

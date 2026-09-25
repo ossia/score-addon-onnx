@@ -309,6 +309,24 @@ DecodedOutputs runInferAndThread(
 }
 } // namespace
 
+namespace
+{
+// dst = src, element by element, reusing dst's buffers' capacity.
+void copyStates(const std::vector<StateSlot>& src, std::vector<StateSlot>& dst)
+{
+  dst.resize(src.size());
+  for(std::size_t k = 0; k < src.size(); ++k)
+  {
+    dst[k].input_index = src[k].input_index;
+    dst[k].output_index = src[k].output_index;
+    dst[k].dtype = src[k].dtype;
+    dst[k].shape.assign(src[k].shape.begin(), src[k].shape.end());
+    dst[k].count = src[k].count;
+    dst[k].buffer.assign(src[k].buffer.begin(), src[k].buffer.end());
+  }
+}
+}
+
 VideoProcessor::VideoProcessor() noexcept
 {
   inputs.image.request_width = 512;
@@ -572,8 +590,12 @@ void VideoProcessor::dispatchInfer(
     job->param1 = inputs.param1.value;
     job->param0_input_index = param0InputIndex;
     job->param1_input_index = param1InputIndex;
-    job->states = states; // snapshot held states into the job (whole-vector
-                          // assignment: replaces any recycled leftovers)
+    // Snapshot the held states into the job. Copy-assigning into buffers that
+    // already have the capacity (the spare set from the last result, else the
+    // recycled job's) does not allocate in steady state.
+    if(spareStates && job->states.empty())
+      std::swap(job->states, *spareStates);
+    copyStates(states, job->states);
     job->out_kinds = out_kinds;
     job->gen = gen;
     worker.request(std::move(job));
@@ -625,14 +647,24 @@ VideoProcessor::worker::work(std::unique_ptr<VideoInferJob> job)
         job->kind, job->wm, job->out_kinds, half_buf, u8_buf, scratch);
 
     // Hand the UPDATED state buffers + decoded image back to the node. Adopting
-    // job->states on the node keeps the recurrent chain coherent across frames.
-    return [ds = std::move(ds), states = std::move(job->states), gen = job->gen](
+    // them keeps the recurrent chain coherent across frames. The lambda owns
+    // them by shared_ptr (a std::function must be copyable) and the node swaps
+    // with it: the node's previous buffers go back into the job, which returns
+    // to the pool, so the next frame's snapshot copies into buffers that
+    // already have the capacity instead of allocating MBs of RVM state on the
+    // render thread every frame.
+    auto st = std::make_shared<std::vector<StateSlot>>();
+    std::swap(*st, job->states);
+    return [ds = std::move(ds), st = std::move(st), gen = job->gen](
                VideoProcessor& self) mutable
     {
       self.inferenceInProgress = false;
       // Only adopt states from the current model, and not across a Reset.
-      if(gen == self.gen && self.states.size() == states.size())
-        self.states = std::move(states);
+      if(gen == self.gen && self.states.size() == st->size())
+      {
+        std::swap(self.states, *st);
+        self.spareStates = std::move(st); // keeps the old buffers for reuse
+      }
       applyDecoded(self, ds);
     };
   }

@@ -163,6 +163,9 @@ private:
 
   // Recurrent state slots (one per RecurrentState input), held across frames.
   std::vector<StateSlot> states;
+  // The buffers of the states before the last result, handed to the next
+  // job so its snapshot reuses their capacity (see worker::work).
+  std::shared_ptr<std::vector<StateSlot>> spareStates;
   // classifyImage's kind for every output, to route the non-primary ones.
   std::vector<Onnx::ImageModelKind> out_kinds;
   // Reset and model changes bump gen: a job dispatched before does not bring
