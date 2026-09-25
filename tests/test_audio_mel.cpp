@@ -340,6 +340,7 @@ TEST_CASE("Audio Processor: an STFT-bin input is refused once", "[onnx][audio][m
   node.prepare({.rate = 16000., .input_channels = 1, .output_channels = 1, .frames = 256});
   node.inputs.model.file.bytes = bytes;
   node.inputs.model.file.filename = model;
+  inlineWorker(node);
   std::vector<float> in(256, 0.1f), out(256, 1.f);
   float* ins[1]{in.data()};
   float* outs[1]{out.data()};
