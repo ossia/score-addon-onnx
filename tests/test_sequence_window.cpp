@@ -1,6 +1,7 @@
 // Sequence Processor: changing Window while running takes effect without a
-// model reload. RNNoise takes [?,100,42]: Sliding streams 42-value frames into its
-// 100-frame window, Passthrough feeds each payload on its own.
+// model reload. The fixture takes [?,8,3] (tests/data/sequence): Sliding
+// streams 3-value frames into its 8-frame window, Passthrough feeds each
+// payload on its own, zero-padded.
 #include <tests/TestPaths.hpp>
 #include <tests/TestWorker.hpp>
 #include <OnnxModels/SequenceProcessor.hpp>
@@ -23,7 +24,8 @@ void feed(OnnxModels::SequenceProcessor& p, int k)
 void load(OnnxModels::SequenceProcessor& p, const std::string& bytes)
 {
   p.inputs.model.file.bytes = bytes;
-  p.inputs.model.file.filename = name;
+  p.inputs.model.file.filename = model;
+  inlineWorker(p);
 }
 }
 
