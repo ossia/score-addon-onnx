@@ -280,7 +280,8 @@ avnd_addon_object(
     OnnxModels/PoseDetector_draw.cpp
     OnnxModels/PoseDetector_detect.cpp
     OnnxModels/PoseDetector_landmark.cpp
-    OnnxModels/PoseDetector_tracking.cpp)
+    OnnxModels/PoseDetector_tracking.cpp
+    OnnxModels/PoseDetector_mesh.cpp)
 
 avnd_addon_object(
   BASE score_addon_onnx_models
@@ -629,7 +630,9 @@ target_link_libraries(score_addon_onnx_models ${SCORE_ONNX_HELPER_LINK} score_on
 # #include these -O3 units -- they are already compiled here as their own lib.
 set(SCORE_ONNX_IMAGEOPS_SRC
     Onnx/helpers/ImageOps.cpp
-    Onnx/helpers/TensorToTexture.cpp)
+    Onnx/helpers/TensorToTexture.cpp
+    Onnx/helpers/MhrModel.cpp
+    Onnx/helpers/MeshOps.cpp)
 add_library(score_onnx_imageops STATIC ${SCORE_ONNX_IMAGEOPS_SRC})
 target_include_directories(score_onnx_imageops PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 # Own static lib, so it needs the C++ standard set independently of the base (same
@@ -692,6 +695,8 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     tests/test_rapidlib_models.cpp
     tests/test_text_segmentation.cpp
     tests/test_think_filter.cpp
+    tests/test_instanthmr_tables.cpp
+    tests/test_mhr_model.cpp
     # real object sources under test:
     RapidlibModels/Classifier.cpp
     RapidlibModels/Regressor.cpp
@@ -699,10 +704,13 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
   target_include_directories(score_addon_onnx_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
   )
+  # MHR (test_mhr_model) is C++20+ and lives in the -O3 helper lib.
+  target_compile_features(score_addon_onnx_tests PRIVATE cxx_std_23)
   target_link_libraries(score_addon_onnx_tests PRIVATE
     Catch2::Catch2WithMain
     rapidlib
     score_plugin_avnd
+    score_onnx_imageops
   )
   add_test(NAME score_addon_onnx_tests COMMAND score_addon_onnx_tests)
 
@@ -743,6 +751,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     OnnxModels/PoseDetector_detect.cpp
     OnnxModels/PoseDetector_landmark.cpp
     OnnxModels/PoseDetector_tracking.cpp
+    OnnxModels/PoseDetector_mesh.cpp
     OnnxModels/VideoProcessor.cpp
     OnnxModels/GeometryProcessor.cpp
     OnnxModels/ImageGenerator.cpp
@@ -754,6 +763,10 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     "${CMAKE_CURRENT_SOURCE_DIR}"
   )
   target_compile_features(score_addon_onnx_node_tests PRIVATE cxx_std_23)
+  # Each test file has its own file-local helpers (slurp, Harness, ...): they
+  # cannot share a unity translation unit (a CMAKE_UNITY_BUILD release tree).
+  set_target_properties(score_addon_onnx_tests score_addon_onnx_node_tests
+                        PROPERTIES UNITY_BUILD OFF)
   target_compile_definitions(score_addon_onnx_node_tests PRIVATE
     SCORE_ONNX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
   target_link_libraries(score_addon_onnx_node_tests PRIVATE

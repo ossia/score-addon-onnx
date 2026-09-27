@@ -21,6 +21,7 @@ enum Bucket
   TensorBuild,  // legacy normalize pass (now folded into Warp; reads ~0)
   Infer,        // ORT session.Run
   Draw,         // fillCanvas (input->output copy) + ctx overlay rasterization
+  Mesh,         // body mesh evaluation (MHR forward pass per person)
   Total,        // whole processed frame
   NBuckets
 };
@@ -29,7 +30,7 @@ inline const char* name(int b)
 {
   static const char* n[]
       = {"readspec", "warp:det", "warp:crop", "resize",
-         "tensorbuild", "infer", "draw", "TOTAL"};
+         "tensorbuild", "infer", "draw", "mesh", "TOTAL"};
   return n[b];
 }
 } // namespace Onnx::prof

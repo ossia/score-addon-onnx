@@ -12,8 +12,11 @@ namespace OnnxModels
 // fresh detection -> new id. Without this the tracker is frozen, not aged.
 void PoseDetector::ageTracker()
 {
-  m_track_in.clear();
-  m_tracker.update(m_track_in);
+  // An empty list, NOT m_track_in.clear(): m_track_in's elements (and their
+  // keypoint / 3D payload vectors) are reused across frames by emitInstances,
+  // and clearing would free them, re-allocating on the next detection frame.
+  static const std::vector<Onnx::Track::Detection> no_detections;
+  m_tracker.update(no_detections);
 }
 
 // Rebuild m_instances from the still-live, recently-seen tracker tracks (their
@@ -47,6 +50,16 @@ bool PoseDetector::reEmitCoasted(PoseWorkflow draw)
     p.keypoints.reserve(tk.kpts_smooth.size());
     for(const auto& k : tk.kpts_smooth)
       p.keypoints.push_back({k.x, k.y, k.z, k.score});
+    // The 3D payload coasts with the id too (its last smoothed value, held
+    // still — there is no motion model for it), so a CameraXYZ / BodyParams
+    // consumer doesn't see the instance lose its 3D on a dropout frame while
+    // its 2D keypoints are still shown.
+    p.world.reserve(tk.world_smooth.size());
+    for(const auto& k : tk.world_smooth)
+      p.world.push_back({k.x, k.y, k.z, k.score});
+    p.translation = tk.translation_smooth;
+    p.body_params = tk.params_smooth;
+    p.rig_offset = tk.rig_offset_smooth;
     if(has_box)
       p.box = {bb.cx - bb.w * 0.5f, bb.cy - bb.h * 0.5f, bb.w, bb.h};
     p.mean_confidence = tk.score;
@@ -85,8 +98,10 @@ void PoseDetector::holdOrPassthrough(const Onnx::ImageView& src)
     ++m_hold_frames;
     ++m_lost_frames; // still counts toward passthrough's sustained-loss reset
     outputs.detection.value = m_last_single_pose;
-    drawSkeleton(*m_last_single_pose, m_last_single_draw);
-    generateGeometryOutput(*m_last_single_pose, m_last_single_draw);
+    // The held pose's mesh is still in its slot (a hold evaluates nothing).
+    drawSkeleton(*m_last_single_pose, m_last_single_draw, m_single_mesh);
+    generateGeometryOutput(
+        *m_last_single_pose, m_last_single_draw, m_single_mesh);
     // Keep m_had_detection true: a held subject should re-acquire at the lenient
     // (exit) detector threshold, not snap back to the strict enter threshold.
     return;
@@ -94,10 +109,65 @@ void PoseDetector::holdOrPassthrough(const Onnx::ImageView& src)
   passthrough(src);
 }
 
-void PoseDetector::applySmoothing(DetectedPose& pose)
+void PoseDetector::resetSmoothers()
+{
+  m_smoother.reset();
+  m_world_smoother.reset();
+  m_trans_smoother.reset();
+  m_params_smoother.reset();
+  m_offset_smoother.reset();
+  // The confidence-weighted hold below blends toward this; a stale pose from
+  // before a loss / another model must not leak into the next acquisition.
+  m_prev_smoothed_kps.clear();
+}
+
+void PoseDetector::smooth3D(DetectedPose& pose)
+{
+  const Smoothing3D p3
+      = smoothing3D(inputs.smoothing_amount.value, m_params_beta);
+  const float dt = Onnx::kNominalFrameDt;
+  if(!pose.world.empty())
+  {
+    m_world_smoother.configure(p3.world_min_cutoff, p3.world_beta);
+    Onnx::smoothXYZ(m_world_smoother, std::span<PoseKeypoint>(pose.world), dt);
+  }
+  if(!pose.translation.empty())
+  {
+    m_trans_smoother.configure(p3.trans_min_cutoff, p3.trans_beta);
+    Onnx::smoothParams(
+        m_trans_smoother, std::span<float>(pose.translation), {}, dt);
+  }
+  if(!pose.body_params.empty())
+  {
+    m_params_smoother.configure(p3.params_min_cutoff, p3.params_beta);
+    Onnx::smoothParams(
+        m_params_smoother, std::span<float>(pose.body_params),
+        m_params_angle_mask, dt);
+  }
+  // The pelvis in the rig frame comes from the same joint head as world:
+  // same tuning. The mesh origin is then translation - rig_offset, both
+  // smoothed, so the mesh follows exactly the translation the keypoints use.
+  if(!pose.rig_offset.empty())
+  {
+    m_offset_smoother.configure(p3.world_min_cutoff, p3.world_beta);
+    Onnx::smoothParams(
+        m_offset_smoother, std::span<float>(pose.rig_offset), {}, dt);
+  }
+}
+
+void PoseDetector::applySmoothing(DetectedPose& pose, bool conf_hold)
 {
   m_lost_frames = 0; // we have a pose this frame
-  if(!inputs.smoothing.value || pose.keypoints.empty())
+  if(!inputs.smoothing.value)
+  {
+    // Smoothing off: drop the filter state so switching it back on starts
+    // from the current pose instead of pulling toward the one before the
+    // toggle. Free when already clear.
+    resetSmoothers();
+    return;
+  }
+  smooth3D(pose); // metric 3D payload: its own real-unit filters
+  if(pose.keypoints.empty())
     return;
   const float amt
       = std::clamp(static_cast<float>(inputs.smoothing_amount.value), 0.f, 1.f);
@@ -145,7 +215,7 @@ void PoseDetector::applySmoothing(DetectedPose& pose)
     // Euro can't tame (its velocity term opens the cutoff on a teleport). Blend
     // toward the previous smoothed position by (1 - confidence), so an unsure
     // joint sticks and a confident one tracks freely.
-    if(have_prev)
+    if(have_prev && conf_hold)
     {
       const float w = std::clamp(k.confidence, 0.f, 1.f); // trust = confidence
       const auto& pk = m_prev_smoothed_kps[i];
@@ -316,7 +386,9 @@ void PoseDetector::runMultiInstance(
       = std::max(1, static_cast<int>(inputs.detector_cadence.value));
 
   // --- Gather this frame's ROIs (image px), then batch-landmark them. ---
+  // m_roi_scores parallels m_rois (not m_dets: an invalid rect is skipped).
   m_rois.clear();
+  m_roi_scores.clear();
 
   const bool use_track_rois = inputs.track_roi.value && roi_trackable
                               && !m_tracker.tracks().empty()
@@ -335,7 +407,10 @@ void PoseDetector::runMultiInstance(
       const Onnx::ROI::Rect r
           = roiRectFromKeypoints(draw, m_kp_scratch, W, H, mw, mh);
       if(rectValid(r, W, H))
+      {
         m_rois.push_back(r);
+        m_roi_scores.push_back(1.f); // a tracking ROI has no detector score
+      }
     }
     if(m_rois.empty())
       m_frames_since_detect = detect_cadence; // force re-detect next frame
@@ -367,7 +442,10 @@ void PoseDetector::runMultiInstance(
     {
       const Onnx::ROI::Rect r = detectionRect(role, d, W, H);
       if(rectValid(r, W, H))
+      {
         m_rois.push_back(r);
+        m_roi_scores.push_back(std::clamp(d.score, 0.f, 1.f));
+      }
     }
   }
 
@@ -438,6 +516,19 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
     // feeds ByteTrack's second association, so continuity isn't lost.
     cfg.new_track
         = std::clamp(static_cast<float>(inputs.min_confidence.value), 0.05f, 0.95f);
+    // Per-id 3D payload smoothing, same real-unit tuning as the single path.
+    {
+      const Smoothing3D p3
+          = smoothing3D(inputs.smoothing_amount.value, m_params_beta);
+      cfg.smooth_dt = Onnx::kNominalFrameDt;
+      cfg.world_min_cutoff = p3.world_min_cutoff;
+      cfg.world_beta = p3.world_beta;
+      cfg.trans_min_cutoff = p3.trans_min_cutoff;
+      cfg.trans_beta = p3.trans_beta;
+      cfg.params_min_cutoff = p3.params_min_cutoff;
+      cfg.params_beta = p3.params_beta;
+      cfg.params_angle_mask = m_params_angle_mask;
+    }
     m_tracker.configure(cfg);
 
     // One-line config trace (on change) so it's obvious WHY re-id is/ isn't
@@ -460,11 +551,22 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
       }
     }
 
-    m_track_in.clear();
-    m_track_in.reserve(m_instances.size());
-    for(const auto& pose : m_instances)
+    // Reuse m_track_in's elements (resize, then overwrite every field) instead
+    // of rebuilding them: each carries keypoint + 3D payload vectors whose
+    // capacity then survives from frame to frame (no steady-state allocation).
+    m_track_in.resize(m_instances.size());
+    for(size_t ii = 0; ii < m_instances.size(); ++ii)
     {
-      Onnx::Track::Detection td;
+      const auto& pose = m_instances[ii];
+      Onnx::Track::Detection& td = m_track_in[ii];
+      td.keypoints.clear();
+      td.embedding.clear(); // refilled by embedInstances when Re-ID is on
+      td.world.clear();
+      for(const auto& k : pose.world)
+        td.world.push_back({k.x, k.y, k.z, k.confidence});
+      td.translation.assign(pose.translation.begin(), pose.translation.end());
+      td.params.assign(pose.body_params.begin(), pose.body_params.end());
+      td.rig_offset.assign(pose.rig_offset.begin(), pose.rig_offset.end());
       // Tracker box (center form) from the pose bbox; keypoints (if any) feed
       // the OKS cue, otherwise the tracker leans on IoU + Re-ID. A non-finite
       // box (a NaN model coordinate reaching here) would poison the Kalman state
@@ -487,7 +589,6 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
         else // neutralize a NaN keypoint without breaking OKS's equal-size need
           td.keypoints.push_back({td.box.cx, td.box.cy, 0.f, 0.f});
       }
-      m_track_in.push_back(std::move(td));
     }
 
     if(cfg.use_reid)
@@ -510,6 +611,32 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
             m_instances[i].keypoints[k].x = tk.kpts_smooth[k].x;
             m_instances[i].keypoints[k].y = tk.kpts_smooth[k].y;
           }
+        // The per-id smoothed 3D payload. A payload this frame's decode lacked
+        // (e.g. a non-finite translation dropped) is filled with the track's
+        // last good one — the same hold the coasted re-emit gives. The world
+        // confidences are passed through the tracker unsmoothed.
+        auto& inst = m_instances[i];
+        if(!tk.world_smooth.empty()
+           && (inst.world.empty() || inst.world.size() == tk.world_smooth.size()))
+        {
+          inst.world.resize(tk.world_smooth.size());
+          for(size_t k = 0; k < tk.world_smooth.size(); ++k)
+          {
+            inst.world[k].x = tk.world_smooth[k].x;
+            inst.world[k].y = tk.world_smooth[k].y;
+            inst.world[k].z = tk.world_smooth[k].z;
+            inst.world[k].confidence = tk.world_smooth[k].score;
+          }
+        }
+        if(!tk.translation_smooth.empty())
+          inst.translation.assign(
+              tk.translation_smooth.begin(), tk.translation_smooth.end());
+        if(!tk.params_smooth.empty())
+          inst.body_params.assign(
+              tk.params_smooth.begin(), tk.params_smooth.end());
+        if(!tk.rig_offset_smooth.empty())
+          inst.rig_offset.assign(
+              tk.rig_offset_smooth.begin(), tk.rig_offset_smooth.end());
         // Smooth the bbox too: the tracker's Kalman box state is temporally
         // filtered, so emit it instead of the raw per-frame detection box.
         const auto bb = tk.box();
@@ -520,6 +647,11 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
       }
     }
   }
+
+  // Body meshes, from the smoothed per-id parameters (a coasted instance's
+  // held ones alike), BEFORE the remap: Mesh Keypoints rewrites the native
+  // MHR70 world / keypoints, which the remap then carries like the model's.
+  evaluateInstanceMeshes();
 
   // Remap every instance to the chosen target skeleton, AFTER tracking/
   // smoothing (which ran on the native layout). The overlay and every output
@@ -550,7 +682,9 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
     outputs.detection.value = m_instances[primary];
     // Geometry is the primary instance only, in every Data Format (box formats
     // included) — Poses Geometry is the per-instance outlet.
-    generateGeometryOutput(m_instances[primary], draw); // fills outputs.geometry
+    generateGeometryOutput(
+        m_instances[primary], draw,
+        m_inst_mesh[primary]); // fills outputs.geometry
   }
   else
   {
@@ -568,7 +702,7 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
       static_cast<int>(inputs.max_instances.value),
       1, 16);
   auto& pg = outputs.poses_geometry.value;
-  pg.clear();
+  bool filled = false; // else cleared below (not up front: see the fill)
   if(!m_instances.empty())
   {
     // Build every live instance's payload back-to-back into scratch, recording
@@ -577,11 +711,11 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
     // filter) never truncates the richer instances — shorter ones zero-pad.
     m_geom_scratch.clear();
     m_geom_ends.clear();
-    for(const auto& pose : m_instances)
+    for(size_t i = 0; i < m_instances.size(); ++i)
     {
       if(static_cast<int>(m_geom_ends.size()) >= max_inst)
         break;
-      appendGeometry(m_geom_scratch, pose, draw);
+      appendGeometry(m_geom_scratch, m_instances[i], draw, m_inst_mesh[i]);
       m_geom_ends.push_back(static_cast<int>(m_geom_scratch.size()));
     }
 
@@ -594,18 +728,27 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
 
     if(stride > 0)
     {
-      pg.assign(static_cast<size_t>(max_inst) * stride, 0.f);
+      // Each float is written once: the payloads, then zeros only where
+      // there is padding. A body mesh makes this block megabytes, so no full
+      // zero-fill before the copy;
+      // resize() keeps the capacity (and only initializes growth).
+      pg.resize(static_cast<size_t>(max_inst) * stride);
       begin = 0;
       for(size_t slot = 0; slot < m_geom_ends.size(); ++slot)
       {
         const int end = m_geom_ends[slot];
+        const auto dst = pg.begin() + slot * stride;
         std::copy(
-            m_geom_scratch.begin() + begin, m_geom_scratch.begin() + end,
-            pg.begin() + slot * stride);
+            m_geom_scratch.begin() + begin, m_geom_scratch.begin() + end, dst);
+        std::fill(dst + (end - begin), dst + stride, 0.f);
         begin = end;
       }
+      std::fill(pg.begin() + m_geom_ends.size() * stride, pg.end(), 0.f);
+      filled = true;
     }
   }
+  if(!filled)
+    pg.clear();
   outputs.count.value = static_cast<int>(m_instances.size());
 }
 

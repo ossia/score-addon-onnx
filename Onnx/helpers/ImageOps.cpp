@@ -113,23 +113,116 @@ inline void writeNorm(
   }
 }
 
+// Bilinear RGB sample with a CONSTANT border: each of the 4 taps that falls
+// outside the image reads `border` instead of the clamped edge pixel, as
+// cv2.warpAffine(..., BORDER_CONSTANT) does: a sample within one pixel of the
+// frame edge blends the edge pixel with the border colour, one further out is
+// pure border. The first test is written so that a NaN coordinate also lands
+// on the border rather than in the int cast below (UB).
+inline void bilinearRGBBorder(
+    const uint8_t* data, int srow, int schan, int w, int h, float sx, float sy,
+    const float border[3], float& R, float& G, float& B)
+{
+  if(!(sx > -1.f && sx < static_cast<float>(w) && sy > -1.f
+       && sy < static_cast<float>(h)))
+  {
+    R = border[0];
+    G = border[1];
+    B = border[2];
+    return;
+  }
+  const int x0 = static_cast<int>(std::floor(sx));
+  const int y0 = static_cast<int>(std::floor(sy));
+  const float fx = sx - x0, fy = sy - y0;
+  const bool x0in = x0 >= 0, x1in = x0 + 1 < w; // x0 < w, x0+1 >= 0 hold here
+  const bool y0in = y0 >= 0, y1in = y0 + 1 < h;
+  const uint8_t* r0 = y0in ? data + static_cast<size_t>(y0) * srow : nullptr;
+  const uint8_t* r1 = y1in ? data + static_cast<size_t>(y0 + 1) * srow : nullptr;
+  const auto lerp = [&](int ch) {
+    const float b = border[ch];
+    const float v00 = (r0 && x0in) ? r0[x0 * schan + ch] : b;
+    const float v10 = (r0 && x1in) ? r0[(x0 + 1) * schan + ch] : b;
+    const float v01 = (r1 && x0in) ? r1[x0 * schan + ch] : b;
+    const float v11 = (r1 && x1in) ? r1[(x0 + 1) * schan + ch] : b;
+    const float top = v00 + (v10 - v00) * fx, bot = v01 + (v11 - v01) * fx;
+    return top + (bot - top) * fy;
+  };
+  R = lerp(0);
+  G = lerp(1);
+  B = lerp(2);
+}
+
 template <TensorLayout L>
 void sampleAffineImpl(
     const ImageView& src, const Affine& a, int mw, int mh, const float m[3],
-    const float is[3], float* out)
+    const float is[3], float* out, const uint8_t* border_rgb)
 {
   const int schan = src.channels, srow = src.rowBytes();
   const int sw1 = src.w - 1, sh1 = src.h - 1, plane = mw * mh;
+  if(!border_rgb)
+  {
+    // Edge-clamped.
+    for(int y = 0; y < mh; ++y)
+    {
+      const float bx = a.m1 * y + a.m2, by = a.m4 * y + a.m5;
+      int idx = y * mw;
+      for(int x = 0; x < mw; ++x, ++idx)
+      {
+        float R, G, B;
+        bilinearRGB(
+            src.data, srow, schan, sw1, sh1, a.m0 * x + bx, a.m3 * x + by, R, G,
+            B);
+        writeNorm<L>(out, plane, idx, R, G, B, m, is);
+      }
+    }
+    return;
+  }
+
+  // Constant border. A sample whose 4 taps are all inside ([0,w-1]x[0,h-1];
+  // a tap exactly on w-1 has weight 0 on its right neighbour) is identical in
+  // both modes, so it takes the cheap clamped sampler. Per row, the sample
+  // positions are an affine function of x and the inside set is convex: if
+  // both row ends are inside, the whole row is (float evaluation of m0*x+bx is
+  // monotone in x, so no interior sample can round out of the interval). Only
+  // rows that actually straddle the frame edge pay the per-pixel test.
+  const float border[3]
+      = {static_cast<float>(border_rgb[0]), static_cast<float>(border_rgb[1]),
+         static_cast<float>(border_rgb[2])};
+  const float fw1 = static_cast<float>(sw1), fh1 = static_cast<float>(sh1);
+  const auto inside = [&](float sx, float sy) {
+    return sx >= 0.f && sx <= fw1 && sy >= 0.f && sy <= fh1;
+  };
   for(int y = 0; y < mh; ++y)
   {
     const float bx = a.m1 * y + a.m2, by = a.m4 * y + a.m5;
+    const float xl = static_cast<float>(mw - 1);
+    const bool row_inside
+        = inside(bx, by) && inside(a.m0 * xl + bx, a.m3 * xl + by);
     int idx = y * mw;
-    for(int x = 0; x < mw; ++x, ++idx)
+    if(row_inside)
     {
-      float R, G, B;
-      bilinearRGB(
-          src.data, srow, schan, sw1, sh1, a.m0 * x + bx, a.m3 * x + by, R, G, B);
-      writeNorm<L>(out, plane, idx, R, G, B, m, is);
+      for(int x = 0; x < mw; ++x, ++idx)
+      {
+        float R, G, B;
+        bilinearRGB(
+            src.data, srow, schan, sw1, sh1, a.m0 * x + bx, a.m3 * x + by, R, G,
+            B);
+        writeNorm<L>(out, plane, idx, R, G, B, m, is);
+      }
+    }
+    else
+    {
+      for(int x = 0; x < mw; ++x, ++idx)
+      {
+        const float sx = a.m0 * x + bx, sy = a.m3 * x + by;
+        float R, G, B;
+        if(inside(sx, sy))
+          bilinearRGB(src.data, srow, schan, sw1, sh1, sx, sy, R, G, B);
+        else
+          bilinearRGBBorder(
+              src.data, srow, schan, src.w, src.h, sx, sy, border, R, G, B);
+        writeNorm<L>(out, plane, idx, R, G, B, m, is);
+      }
     }
   }
 }
@@ -174,22 +267,23 @@ LetterboxInfo letterboxImpl(
 void sampleAffineToTensor(
     TensorLayout L, const ImageView& src, const Affine& a, int mw, int mh,
     const float mean[3], const float invstd[3], float* out,
-    prof::Bucket prof_bucket)
+    prof::Bucket prof_bucket, const uint8_t* border_rgb)
 {
   ONNX_PROF_SCOPE_VAR(prof_bucket);
+  const uint8_t* b = border_rgb;
   switch(L)
   {
     case TensorLayout::NchwRgb:
-      detail::sampleAffineImpl<TensorLayout::NchwRgb>(src, a, mw, mh, mean, invstd, out);
+      detail::sampleAffineImpl<TensorLayout::NchwRgb>(src, a, mw, mh, mean, invstd, out, b);
       break;
     case TensorLayout::NchwBgr:
-      detail::sampleAffineImpl<TensorLayout::NchwBgr>(src, a, mw, mh, mean, invstd, out);
+      detail::sampleAffineImpl<TensorLayout::NchwBgr>(src, a, mw, mh, mean, invstd, out, b);
       break;
     case TensorLayout::NhwcRgb:
-      detail::sampleAffineImpl<TensorLayout::NhwcRgb>(src, a, mw, mh, mean, invstd, out);
+      detail::sampleAffineImpl<TensorLayout::NhwcRgb>(src, a, mw, mh, mean, invstd, out, b);
       break;
     case TensorLayout::NchwGray:
-      detail::sampleAffineImpl<TensorLayout::NchwGray>(src, a, mw, mh, mean, invstd, out);
+      detail::sampleAffineImpl<TensorLayout::NchwGray>(src, a, mw, mh, mean, invstd, out, b);
       break;
   }
 }
