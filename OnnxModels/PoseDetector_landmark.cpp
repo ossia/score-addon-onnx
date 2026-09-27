@@ -11,6 +11,29 @@ struct LandmarkKp
   float x, y, z, conf;
 };
 
+// Upper bound on the landmark outputs fetched per inference (the Ort::Value
+// arrays below are fixed-size, no per-frame allocation). InstantHMR has 5
+// (mhr_params, shape_params, cam_trans, joints_2d, joints_3d); one spare.
+constexpr std::size_t kMaxLandmarkOutputs = 6;
+
+// Where decodeLandmark leaves a mesh-recovery model's extra 3D payload
+// (InstantHMR): the cached output indices, and the camera translation /
+// body-parameter sinks. Null members = not wanted / not available.
+struct HmrSink
+{
+  const Onnx::HmrOutputs* idx = nullptr;
+  std::vector<float>* translation = nullptr;
+  std::vector<float>* params = nullptr;
+  // The pelvis in the rig frame (DetectedPose::rig_offset): set together
+  // with translation, so translation - rig_offset is the raw cam_trans.
+  std::vector<float>* rig_offset = nullptr;
+};
+
+// InstantHMR regresses joints_2d directly in crop coordinates [-1,1]; a joint
+// placed beyond the padded crop (|u| > 1.25, i.e. well outside even the 1.2x
+// margin) is an extrapolation the model never saw supervised: no confidence.
+constexpr float kHmrCropLimit = 1.25f;
+
 // Layout + normalization for a landmark model's input crop (used by the fused
 // sampler to write the model input directly, no intermediate RGBA buffer).
 NormSpec landmarkNorm(const Onnx::ModelRole& role)
@@ -24,6 +47,14 @@ NormSpec landmarkNorm(const Onnx::ModelRole& role)
         Onnx::TensorLayout::NhwcRgb, {0.f, 0.f, 0.f}, {1.f, 1.f, 1.f});
   if(role.nhwc)
     return normAB(Onnx::TensorLayout::NhwcRgb, 1.f, 0.f);
+  // InstantHMR: ImageNet mean/std on RGB in [0,1] (upstream IMAGENET_MEAN /
+  // IMAGENET_STD) — the same numbers as the final fall-through, spelled out
+  // so a later reorder of the branches above can't change it.
+  if(role.kind == Onnx::ModelKind::InstantHmr)
+    return normMeanStd(
+        Onnx::TensorLayout::NchwRgb,
+        {0.485f * 255.f, 0.456f * 255.f, 0.406f * 255.f},
+        {0.229f * 255.f, 0.224f * 255.f, 0.225f * 255.f});
   if(role.kind == Onnx::ModelKind::MobileFaceNet)
     return normMeanStd(
         Onnx::TensorLayout::NchwRgb,
@@ -55,6 +86,36 @@ NormSpec landmarkNorm(const Onnx::ModelRole& role)
       {58.395f, 57.12f, 57.375f});
 }
 
+// Out-of-frame fill for a landmark crop (see Onnx::sampleAffineToTensor):
+// nullptr = edge clamp. A family trained on constant-padded crops returns its
+// pad colour here (InstantHMR: copyMakeBorder(BORDER_CONSTANT, 0) -> kBlackBorder).
+// Shared by the single-crop and batched paths so they can't disagree.
+constexpr uint8_t kBlackBorder[3] = {0, 0, 0};
+const uint8_t* landmarkBorder(const Onnx::ModelRole& role)
+{
+  if(role.kind == Onnx::ModelKind::InstantHmr)
+    return kBlackBorder;
+  return nullptr;
+}
+
+// The affine a landmark crop is sampled through; keypoints still map back
+// through the crop affine itself. Only InstantHMR differs (pixel-centre
+// resize, see instantHmrSampleAffine). Shared by both paths like the border.
+Onnx::Affine landmarkSampleAffine(const Onnx::ModelRole& role, const Onnx::Affine& M)
+{
+  return role.kind == Onnx::ModelKind::InstantHmr ? instantHmrSampleAffine(M) : M;
+}
+
+// A landmark model's second input, per element type: SimCC's int64 [N,2]
+// bbox (w,h of the crop), or InstantHMR's float [N,3] CLIFF box condition,
+// derived from the crop's own ROI (rectFromAffine: InstantHMR ROIs are never
+// rotated).
+bool isCliffInput(const Onnx::ModelSpec& spec)
+{
+  return spec.inputs.size() >= 2
+         && spec.inputs[1].elem_type == Onnx::TensorElemType::Float;
+}
+
 // Decode ONE instance's landmark outputs (a [1,...] outspan) into MODEL-PIXEL
 // keypoints. Shared by the single-crop and batched-slice paths. `world` (when
 // non-null) receives the model's world-space 3D keypoints in METERS
@@ -65,11 +126,17 @@ void decodeLandmark(
     const Onnx::ModelRole& role, const Onnx::ModelSpec& spec,
     std::span<Ort::Value> outspan, int mw, int mh, float min_conf,
     std::vector<LandmarkKp>& kps, std::vector<LandmarkKp>* world = nullptr,
-    bool crop_padded = false)
+    bool crop_padded = false, const HmrSink& hmr = {})
 {
   kps.clear();
   if(world)
     world->clear();
+  if(hmr.translation)
+    hmr.translation->clear();
+  if(hmr.rig_offset)
+    hmr.rig_offset->clear();
+  if(hmr.params)
+    hmr.params->clear();
   switch(role.kind)
   {
     case Onnx::ModelKind::BlazePoseLandmark:
@@ -302,6 +369,114 @@ void decodeLandmark(
       }
       break;
     }
+    case Onnx::ModelKind::InstantHmr:
+    {
+      // Outputs located once at load (HmrOutputs), each a [1,...] slice here.
+      // A slot that is missing, not float32 or too short is treated as absent.
+      if(!hmr.idx || !hmr.idx->valid())
+        break;
+      const auto& h = *hmr.idx;
+      auto floats = [&](int i, int64_t n) -> const float* {
+        if(i < 0 || i >= static_cast<int>(outspan.size()) || !outspan[i]
+           || !outspan[i].IsTensor())
+          return nullptr;
+        auto info = outspan[i].GetTensorTypeAndShapeInfo();
+        if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+           || static_cast<int64_t>(info.GetElementCount()) < n)
+          return nullptr;
+        return outspan[i].GetTensorData<float>();
+      };
+      const int K = h.num_keypoints;
+      const float* j2 = K > 0 ? floats(h.joints_2d, 2 * K) : nullptr;
+      if(!j2)
+        break;
+
+      // 2D: crop coords [-1,1] -> model px (upstream: (j + 1) * 0.5 * S); the
+      // caller's affine then maps them to the frame. No per-joint score: 1
+      // inside the padded crop, 0 beyond it or when non-finite (fp16 inside).
+      // The detector score multiplies it at the call site.
+      kps.reserve(K);
+      for(int k = 0; k < K; ++k)
+      {
+        const float u = j2[2 * k], v = j2[2 * k + 1];
+        if(!finitef(u) || !finitef(v))
+        {
+          kps.push_back({0.f, 0.f, 0.f, 0.f}); // keep the MHR70 index layout
+          continue;
+        }
+        const bool inside
+            = std::fabs(u) <= kHmrCropLimit && std::fabs(v) <= kHmrCropLimit;
+        kps.push_back(
+            {(u + 1.f) * 0.5f * mw, (v + 1.f) * 0.5f * mh, 0.f,
+             inside ? 1.f : 0.f});
+      }
+
+      // 3D: joints_3d is rig-local (X right, Y down, Z forward, metres) with
+      // an origin near the floor. world = pelvis-relative, the "hip-origin
+      // metres" BlazePose's world already means, pelvis = mid(L hip 9, R hip
+      // 10); the camera-space placement moves to translation = cam_trans +
+      // pelvis, so world + translation == joints_3d + cam_trans exactly.
+      const float* j3 = K > 10 ? floats(h.joints_3d, 3 * K) : nullptr;
+      float pel[3] = {0.f, 0.f, 0.f};
+      bool pel_ok = j3 != nullptr;
+      for(int c = 0; pel_ok && c < 3; ++c)
+      {
+        pel[c] = 0.5f * (j3[9 * 3 + c] + j3[10 * 3 + c]);
+        pel_ok = finitef(pel[c]);
+      }
+      if(pel_ok && world)
+      {
+        world->reserve(K);
+        for(int k = 0; k < K; ++k)
+        {
+          const float* p = j3 + 3 * k;
+          if(!finitef(p[0]) || !finitef(p[1]) || !finitef(p[2]))
+          {
+            world->push_back({0.f, 0.f, 0.f, 0.f});
+            kps[k].conf = 0.f;
+            continue;
+          }
+          world->push_back(
+              {p[0] - pel[0], p[1] - pel[1], p[2] - pel[2], kps[k].conf});
+          // Screen z: pelvis-relative depth in metres (RTMW3D's convention
+          // for a metric z), so XYZArray carries it too.
+          kps[k].z = p[2] - pel[2];
+        }
+      }
+      if(pel_ok && hmr.translation)
+      {
+        const float* ct = floats(h.cam_trans, 3);
+        if(ct && finitef(ct[0]) && finitef(ct[1]) && finitef(ct[2]))
+        {
+          hmr.translation->assign(
+              {ct[0] + pel[0], ct[1] + pel[1], ct[2] + pel[2]});
+          // The mesh (rig-local, origin = MHR joint 0) is placed at cam_trans,
+          // not at the pelvis: keep the pelvis offset so translation -
+          // rig_offset gives cam_trans back after both are smoothed.
+          if(hmr.rig_offset)
+            hmr.rig_offset->assign({pel[0], pel[1], pel[2]});
+        }
+      }
+
+      // Body parameters: mhr_params (204) ++ shape_params (45), as emitted.
+      // One non-finite entry drops the set for this frame (the tracker and
+      // the single-path hold keep the last good one).
+      if(hmr.params)
+      {
+        const float* mp = floats(h.mhr_params, kMhrPoseParams);
+        const float* sp = floats(h.shape_params, kMhrShapeParams);
+        if(mp)
+        {
+          auto& out = *hmr.params;
+          out.insert(out.end(), mp, mp + kMhrPoseParams);
+          if(sp)
+            out.insert(out.end(), sp, sp + kMhrShapeParams);
+          if(!std::all_of(out.begin(), out.end(), finitef))
+            out.clear();
+        }
+      }
+      break;
+    }
     case Onnx::ModelKind::XyScoreLandmark:
     {
       // Single [1,K,3] output, rows are (x, y, score). Units vary by family:
@@ -369,11 +544,14 @@ void decodeLandmark(
 float PoseDetector::landmarkKeypoints(
     const Onnx::ModelRole& role, const Onnx::ImageView& src,
     const Onnx::Affine& M, std::vector<PoseKeypoint>& out,
-    std::vector<PoseKeypoint>* out_world, bool crop_padded)
+    std::vector<PoseKeypoint>* out_world, bool crop_padded, float det_score)
 {
   out.clear();
   if(out_world)
     out_world->clear();
+  m_trans_scratch.clear();
+  m_params_scratch.clear();
+  m_offset_scratch.clear();
   auto& lctx = *this->ctx;
   const auto& spec = lctx.readModelSpec();
   if(spec.inputs.empty())
@@ -396,17 +574,34 @@ float PoseDetector::landmarkKeypoints(
   }
 
   Onnx::FloatTensor t = fusedAffineTensor(
-      spec.inputs[0], src, M, mw, mh, landmarkNorm(role), storage);
+      spec.inputs[0], src, landmarkSampleAffine(role, M), mw, mh,
+      landmarkNorm(role), storage, Onnx::prof::WarpCrop, landmarkBorder(role));
 
-  Ort::Value outs[5]{
+  Ort::Value outs[kMaxLandmarkOutputs]{
       Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
-      Ort::Value{nullptr}, Ort::Value{nullptr}};
-  const size_t n_out = std::min<size_t>(5, spec.output_names_char.size());
+      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr}};
+  const size_t n_out
+      = std::min<size_t>(kMaxLandmarkOutputs, spec.output_names_char.size());
 
   // Some RTMPose exports take a second [w,h] bbox input.
   std::array<int64_t, 2> bbox_wh{mw, mh};
   std::array<int64_t, 2> bbox_shape{1, 2};
-  if(spec.inputs.size() >= 2)
+  if(isCliffInput(spec))
+  {
+    // InstantHMR: the [1,3] CLIFF condition of this crop, in the full frame.
+    std::array<float, 3> cliff;
+    instantHmrCliff(
+        rectFromAffine(M, mw, mh), src.w, src.h, m_hmr_cliff_focal, cliff.data());
+    std::array<int64_t, 2> cliff_shape{1, 3};
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+    auto cliff_tensor = Ort::Value::CreateTensor<float>(
+        mem_info, cliff.data(), cliff.size(), cliff_shape.data(),
+        cliff_shape.size());
+    Ort::Value ins[2] = {std::move(t.value), std::move(cliff_tensor)};
+    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+  }
+  else if(spec.inputs.size() >= 2)
   {
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
@@ -424,16 +619,25 @@ float PoseDetector::landmarkKeypoints(
 
   auto outspan = std::span<Ort::Value>(outs, n_out);
 
-  std::vector<LandmarkKp> kps;
-  std::vector<LandmarkKp> wkps;
+  // Decode scratch reused across frames (decodeLandmark clears it), so a crop
+  // does not allocate. Function-local to this call site, so the batched path's
+  // own scratch (which calls in here in its fallback loop) never aliases it.
+  static thread_local std::vector<LandmarkKp> kps;
+  static thread_local std::vector<LandmarkKp> wkps;
   decodeLandmark(
       role, spec, outspan, mw, mh, static_cast<float>(inputs.min_confidence),
-      kps, out_world ? &wkps : nullptr, crop_padded);
+      kps, out_world ? &wkps : nullptr, crop_padded,
+      HmrSink{&m_hmr_out, &m_trans_scratch, &m_params_scratch, &m_offset_scratch});
 
   std::swap(storage, t.storage);
 
   if(kps.empty())
     return -1.f;
+
+  // A model with no per-joint confidence (InstantHMR: 1 = usable, 0 = not)
+  // takes its instance's detector score, and reports it as the mean.
+  const bool score_conf = role.kind == Onnx::ModelKind::InstantHmr;
+  const float cs = std::clamp(det_score, 0.f, 1.f);
 
   // Map model-pixel keypoints back through M -> image-normalized [0,1].
   const float iw = src.w, ih = src.h;
@@ -442,16 +646,19 @@ float PoseDetector::landmarkKeypoints(
   for(const auto& k : kps)
   {
     const Onnx::Vec2 p = Onnx::ROI::applyAffine(M, k.x, k.y);
-    out.push_back({p.x / iw, p.y / ih, k.z, k.conf});
-    sum_conf += k.conf;
+    const float c = score_conf ? k.conf * cs : k.conf;
+    out.push_back({p.x / iw, p.y / ih, k.z, c});
+    sum_conf += c;
   }
   // World coordinates are metric and crop-independent: no affine mapping.
   if(out_world)
   {
     out_world->reserve(wkps.size());
     for(const auto& k : wkps)
-      out_world->push_back({k.x, k.y, k.z, k.conf});
+      out_world->push_back({k.x, k.y, k.z, score_conf ? k.conf * cs : k.conf});
   }
+  if(score_conf)
+    return sum_conf > 0.f ? cs : -1.f; // every joint unusable: no pose
   return sum_conf / out.size();
 }
 
@@ -488,14 +695,37 @@ void PoseDetector::runLandmarkBatch(
   }
 
   const int N = static_cast<int>(rois.size());
+  // readModelSpec() rewrites a dynamic batch dim to 1 in `shape` (so single-
+  // image callers can feed it as-is): dynamic_batch is what says "any N". A
+  // graph declaring a dynamic batch it can't actually run (a hard-coded
+  // Reshape) throws once; it then stays per-crop for the model's lifetime.
   const int64_t batch_dim
       = (spec.inputs[0].shape.size() == 4) ? spec.inputs[0].shape[0] : 1;
-  const bool can_batch = N >= 2 && (batch_dim < 0 || batch_dim >= N);
+  const bool dynamic = spec.inputs[0].dynamic_batch || batch_dim < 0;
+  // On a GPU provider every change of the batch size re-plans the whole
+  // graph (even back to a size seen before), so a changing person count would
+  // stall the node. There the batch is padded to the largest count seen so far
+  // (grow-only, at most Max Instances). On the CPU the cost is per crop: no
+  // padding.
+  const bool pad = m_landmark_pad_batch && dynamic && !m_landmark_no_batch;
+  if(pad)
+    m_landmark_batch_cap = std::clamp(std::max(m_landmark_batch_cap, N), 1, 16);
+  const int NB = pad ? std::max(N, m_landmark_batch_cap) : N;
+  const bool can_batch
+      = NB >= 2 && !m_landmark_no_batch && (dynamic || batch_dim >= N);
   const float iw = src.w, ih = src.h;
 
+  // Detector score per ROI (the caller fills m_roi_scores in parallel with
+  // rois; 1 when it didn't): InstantHMR's joint confidence.
+  auto roiScore = [&](size_t i) {
+    return i < m_roi_scores.size() ? std::clamp(m_roi_scores[i], 0.f, 1.f) : 1.f;
+  };
+  const bool score_conf = role.kind == Onnx::ModelKind::InstantHmr;
+
+  // Same mapping as landmarkKeypoints (keep the two in step).
   auto pushFromKps = [&](const std::vector<LandmarkKp>& kps,
                          const std::vector<LandmarkKp>& wkps,
-                         const Onnx::Affine& M) {
+                         const Onnx::Affine& M, float det_score) {
     if(kps.empty())
       return;
     DetectedPose pose;
@@ -504,92 +734,156 @@ void PoseDetector::runLandmarkBatch(
     for(const auto& k : kps)
     {
       const Onnx::Vec2 p = Onnx::ROI::applyAffine(M, k.x, k.y);
-      pose.keypoints.push_back({p.x / iw, p.y / ih, k.z, k.conf});
-      sum += k.conf;
+      const float c = score_conf ? k.conf * det_score : k.conf;
+      pose.keypoints.push_back({p.x / iw, p.y / ih, k.z, c});
+      sum += c;
     }
+    if(score_conf && sum <= 0.f)
+      return; // every joint unusable: no pose
     // World coordinates are metric and crop-independent: no affine mapping.
     pose.world.reserve(wkps.size());
     for(const auto& k : wkps)
-      pose.world.push_back({k.x, k.y, k.z, k.conf});
-    pose.mean_confidence = sum / pose.keypoints.size();
+      pose.world.push_back(
+          {k.x, k.y, k.z, score_conf ? k.conf * det_score : k.conf});
+    pose.translation = m_trans_scratch;
+    pose.body_params = m_params_scratch;
+    pose.rig_offset = m_offset_scratch;
+    pose.mean_confidence
+        = score_conf ? det_score : sum / pose.keypoints.size();
     m_instances.push_back(std::move(pose));
   };
 
   // Fallback: one inference per ROI (fixed batch dim, or single instance).
-  if(!can_batch)
-  {
-    for(const auto& r : rois)
+  auto perCrop = [&] {
+    m_instances.clear();
+    for(size_t i = 0; i < rois.size(); ++i)
     {
-      const Onnx::Affine M = Onnx::ROI::rectToAffine(r, mw, mh);
+      const Onnx::Affine M = Onnx::ROI::rectToAffine(rois[i], mw, mh);
       const float mc = landmarkKeypoints(
-          role, src, M, m_kp_scratch, &m_world_scratch, /*crop_padded=*/true);
+          role, src, M, m_kp_scratch, &m_world_scratch, /*crop_padded=*/true,
+          roiScore(i));
       if(mc < 0.f || m_kp_scratch.empty())
         continue;
       DetectedPose pose;
       pose.keypoints = m_kp_scratch;
       pose.world = m_world_scratch;
+      pose.translation = m_trans_scratch;
+      pose.body_params = m_params_scratch;
+      pose.rig_offset = m_offset_scratch;
       pose.mean_confidence = mc;
       m_instances.push_back(std::move(pose));
     }
+  };
+  if(!can_batch)
+  {
+    perCrop();
     return;
   }
 
   // --- Batched: pack N crops into one [N,C,H,W] input buffer. ---
   const int CHW = 3 * mw * mh;
   m_batch_storage.resize(
-      static_cast<size_t>(N) * CHW, boost::container::default_init);
+      static_cast<size_t>(NB) * CHW, boost::container::default_init);
+  // Padding slots: zeros (decoded by nobody).
+  std::fill(
+      m_batch_storage.begin() + static_cast<size_t>(N) * CHW, m_batch_storage.end(),
+      0.f);
   const NormSpec ns = landmarkNorm(role);
+  const uint8_t* border = landmarkBorder(role);
   for(int b = 0; b < N; ++b)
   {
-    const Onnx::Affine M = Onnx::ROI::rectToAffine(rois[b], mw, mh);
+    const Onnx::Affine M = landmarkSampleAffine(
+        role, Onnx::ROI::rectToAffine(rois[b], mw, mh));
     // Sample+normalize the crop straight into its [N,C,H,W] slice.
     Onnx::sampleAffineToTensor(
         ns.layout, src, M, mw, mh, ns.mean.data(), ns.invstd.data(),
-        m_batch_storage.data() + static_cast<size_t>(b) * CHW);
+        m_batch_storage.data() + static_cast<size_t>(b) * CHW,
+        Onnx::prof::WarpCrop, border);
   }
 
-  std::vector<int64_t> in_shape = spec.inputs[0].shape;
-  if(in_shape.size() == 4)
-    in_shape[0] = N;
-  else
-    in_shape = {N, 3, mh, mw};
-  Ort::Value in0 = Onnx::vec_to_tensor<float>(m_batch_storage, in_shape);
+  // [N,C,H,W] (or [N,H,W,C]) with every dynamic dim resolved to what was just
+  // sampled, like finalizeTensor does for batch 1: a dynamic-H/W model would
+  // otherwise get a negative element count and throw on every multi-person
+  // frame.
+  const bool nhwc = ns.layout == Onnx::TensorLayout::NhwcRgb;
+  std::array<int64_t, 4> in_shape
+      = nhwc ? std::array<int64_t, 4>{NB, mh, mw, 3}
+             : std::array<int64_t, 4>{NB, 3, mh, mw};
+  if(spec.inputs[0].shape.size() == 4)
+    for(int d = 1; d < 4; ++d)
+      if(spec.inputs[0].shape[d] > 0)
+        in_shape[d] = spec.inputs[0].shape[d];
 
-  Ort::Value outs[5]{
+  Ort::Value outs[kMaxLandmarkOutputs]{
       Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
-      Ort::Value{nullptr}, Ort::Value{nullptr}};
-  const size_t n_out = std::min<size_t>(5, spec.output_names_char.size());
+      Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr}};
+  const size_t n_out
+      = std::min<size_t>(kMaxLandmarkOutputs, spec.output_names_char.size());
+  Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+      OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
-  if(spec.inputs.size() >= 2)
+  // Remember the model can't batch and redo this frame one crop at a time.
+  auto giveUp = [&] {
+    m_landmark_no_batch = true;
+    perCrop();
+  };
+
+  // The batched inference, tensor creation included: whatever throws
+  // (descriptor, shape, run) sends the model to the per-crop path for good.
+  try
   {
-    // SimCC's second [w,h] input, batched to [N,2].
-    m_bbox.resize(static_cast<size_t>(N) * 2);
-    for(int b = 0; b < N; ++b)
+    Ort::Value in0 = Ort::Value::CreateTensor<float>(
+        mem_info, m_batch_storage.data(), m_batch_storage.size(),
+        in_shape.data(), in_shape.size());
+    if(isCliffInput(spec))
     {
-      m_bbox[2 * b] = mw;
-      m_bbox[2 * b + 1] = mh;
+      // InstantHMR's CLIFF condition, one row per crop, batched to [N,3] in a
+      // reused member (no steady-state allocation).
+      m_cliff.resize(static_cast<size_t>(NB) * 3);
+      for(int b = 0; b < NB; ++b) // padding rows repeat the first crop's
+        instantHmrCliff(
+            rois[b < N ? b : 0], src.w, src.h, m_hmr_cliff_focal,
+            m_cliff.data() + 3 * b);
+      std::array<int64_t, 2> cshape{NB, 3};
+      Ort::Value ins[2] = {
+          std::move(in0), Ort::Value::CreateTensor<float>(
+                              mem_info, m_cliff.data(), m_cliff.size(),
+                              cshape.data(), cshape.size())};
+      lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
     }
-    std::array<int64_t, 2> bshape{N, 2};
-    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
-        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
-    auto bbox_tensor = Ort::Value::CreateTensor<int64_t>(
-        mem_info, m_bbox.data(), m_bbox.size(), bshape.data(), bshape.size());
-    Ort::Value ins[2] = {std::move(in0), std::move(bbox_tensor)};
-    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+    else if(spec.inputs.size() >= 2)
+    {
+      // SimCC's second [w,h] input, batched to [N,2].
+      m_bbox.resize(static_cast<size_t>(NB) * 2);
+      for(int b = 0; b < NB; ++b)
+      {
+        m_bbox[2 * b] = mw;
+        m_bbox[2 * b + 1] = mh;
+      }
+      std::array<int64_t, 2> bshape{NB, 2};
+      Ort::Value ins[2] = {
+          std::move(in0), Ort::Value::CreateTensor<int64_t>(
+                              mem_info, m_bbox.data(), m_bbox.size(),
+                              bshape.data(), bshape.size())};
+      lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+    }
+    else
+    {
+      Ort::Value ins[1] = {std::move(in0)};
+      lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+    }
   }
-  else
+  catch(const Ort::Exception&)
   {
-    Ort::Value ins[1] = {std::move(in0)};
-    lctx.infer(spec, ins, std::span<Ort::Value>(outs, n_out));
+    giveUp();
+    return;
   }
 
-  // Decode each instance from its [1,...] slice of the batched outputs. The
-  // decoders see exactly the single-instance shapes they already handle.
-  Ort::AllocatorWithDefaultOptions alloc;
-  std::vector<LandmarkKp> kps;
-  std::vector<LandmarkKp> wkps;
-  // Bytes per ONNX scalar element, for the type-preserving slice below. 0 = a
-  // type we don't slice (the decoder's own dtype guard then rejects the slot).
+  // How each output splits into per-instance [1,...] slices, resolved once
+  // per frame (not per instance). The slices are non-owning views into the
+  // batched outputs: no per-instance buffer, no copy.
+  // Bytes per ONNX scalar element. 0 = a type we don't slice (the decoder's
+  // own dtype guard then rejects the null slot).
   const auto elemSize = [](ONNXTensorElementDataType t) -> size_t {
     switch(t)
     {
@@ -613,51 +907,80 @@ void PoseDetector::runLandmarkBatch(
         return 0;
     }
   };
+  struct OutSlice
+  {
+    std::vector<int64_t> shape; // the slice's shape (leading dim 1 if batched)
+    ONNXTensorElementDataType type{};
+    std::uint8_t* data = nullptr;
+    size_t per = 0;   // elements per slice
+    size_t esz = 0;   // bytes per element (0: not sliced)
+    bool batched = false;
+  };
+  static thread_local std::array<OutSlice, kMaxLandmarkOutputs> slices;
+  for(size_t j = 0; j < n_out; ++j)
+  {
+    auto& o = slices[j];
+    o.esz = 0;
+    if(!outs[j] || !outs[j].IsTensor())
+      continue;
+    auto info = outs[j].GetTensorTypeAndShapeInfo();
+    o.shape = info.GetShape();
+    const size_t total = info.GetElementCount();
+    // The model's DECLARED leading dim says whether this output follows the
+    // batch: dynamic -> it must have resolved to N (and divide evenly); a
+    // static N -> batched too; a static 1 with N >= 2 crops in means the graph
+    // does not really batch (every instance would read slice 0); another
+    // static value is a batch-independent constant, passed whole to every
+    // instance (e.g. a [num_keypoints, ...] table).
+    const int64_t decl0
+        = (j < spec.outputs.size() && !spec.outputs[j].shape.empty())
+              ? spec.outputs[j].shape[0]
+              : -1;
+    const bool follows = !o.shape.empty() && o.shape[0] == NB
+                         && (total % static_cast<size_t>(NB)) == 0;
+    if(!o.shape.empty() && (decl0 == 1 || (decl0 <= 0 && !follows)))
+    {
+      giveUp();
+      return;
+    }
+    o.batched = follows && (decl0 <= 0 || decl0 == NB);
+    o.per = o.batched ? total / static_cast<size_t>(NB) : total;
+    if(o.batched)
+      o.shape[0] = 1;
+    // Keep the source element type: relabelling an int64/fp16 output as
+    // float would read the wrong byte stride and defeat the decoders' dtype
+    // guards.
+    o.type = info.GetElementType();
+    o.esz = elemSize(o.type);
+    o.data = outs[j].GetTensorMutableData<std::uint8_t>();
+  }
+
+  // Decode each instance from its [1,...] slice of the batched outputs. The
+  // decoders see exactly the single-instance shapes they already handle.
+  static thread_local std::vector<LandmarkKp> kps; // reused decode scratch
+  static thread_local std::vector<LandmarkKp> wkps;
   for(int b = 0; b < N; ++b)
   {
-    Ort::Value sl[5]{
+    Ort::Value sl[kMaxLandmarkOutputs]{
         Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr},
-        Ort::Value{nullptr}, Ort::Value{nullptr}};
+        Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr}};
     for(size_t j = 0; j < n_out; ++j)
     {
-      auto info = outs[j].GetTensorTypeAndShapeInfo();
-      auto shp = info.GetShape();
-      const size_t total = info.GetElementCount();
-      // Treat as batched only if the model's DECLARED leading dim is the batch
-      // axis (dynamic, or == N), it resolved to N, and the buffer divides evenly.
-      // This avoids mis-slicing an output whose fixed leading dim coincidentally
-      // equals the instance count (e.g. a constant [num_keypoints, ...]).
-      const int64_t decl0
-          = (j < spec.outputs.size() && !spec.outputs[j].shape.empty())
-                ? spec.outputs[j].shape[0]
-                : -1;
-      const bool batched = !shp.empty() && shp[0] == N && (decl0 <= 0 || decl0 == N)
-                           && (total % static_cast<size_t>(N)) == 0;
-      const size_t per = batched ? total / static_cast<size_t>(N) : total;
-      if(batched)
-        shp[0] = 1;
-      // Preserve the source element type: re-creating every slice as float (as a
-      // prior version did) would relabel an int64/fp16 output as float and
-      // memcpy the wrong byte stride, silently defeating the decoders' dtype
-      // guards. Copy raw bytes at the true element size instead.
-      const ONNXTensorElementDataType et = info.GetElementType();
-      const size_t esz = elemSize(et);
-      if(esz == 0)
+      const auto& o = slices[j];
+      if(o.esz == 0)
         continue; // leave slot null; decoder skips an unsupported dtype
-      sl[j] = Ort::Value::CreateTensor(alloc, shp.data(), shp.size(), et);
-      std::memcpy(
-          sl[j].GetTensorMutableData<std::uint8_t>(),
-          outs[j].GetTensorData<std::uint8_t>()
-              + (batched ? static_cast<size_t>(b) * per : 0) * esz,
-          per * esz);
+      sl[j] = Ort::Value::CreateTensor(
+          mem_info, o.data + (o.batched ? static_cast<size_t>(b) * o.per : 0) * o.esz,
+          o.per * o.esz, o.shape.data(), o.shape.size(), o.type);
     }
     kps.clear();
     wkps.clear();
     decodeLandmark(
         role, spec, std::span<Ort::Value>(sl, n_out), mw, mh,
         static_cast<float>(inputs.min_confidence), kps, &wkps,
-        /*crop_padded=*/true);
-    pushFromKps(kps, wkps, Onnx::ROI::rectToAffine(rois[b], mw, mh));
+        /*crop_padded=*/true,
+        HmrSink{&m_hmr_out, &m_trans_scratch, &m_params_scratch, &m_offset_scratch});
+    pushFromKps(kps, wkps, Onnx::ROI::rectToAffine(rois[b], mw, mh), roiScore(b));
   }
 }
 
@@ -666,7 +989,8 @@ void PoseDetector::runLandmark(
     const Onnx::Affine& M, int track_id, bool crop_padded)
 {
   const float mean_conf = landmarkKeypoints(
-      role, src, M, m_kp_scratch, &m_world_scratch, crop_padded);
+      role, src, M, m_kp_scratch, &m_world_scratch, crop_padded,
+      m_landmark_score);
   if(!finitef(mean_conf) || mean_conf < 0.f || m_kp_scratch.empty())
   {
     holdOrPassthrough(src);
@@ -675,10 +999,13 @@ void PoseDetector::runLandmark(
 
   DetectedPose detected;
   detected.keypoints = m_kp_scratch;
-  detected.world = m_world_scratch; // metric coords: not smoothed/affine-mapped
+  detected.world = m_world_scratch; // metric coords: not affine-mapped
+  detected.translation = m_trans_scratch;
+  detected.body_params = m_params_scratch;
+  detected.rig_offset = m_offset_scratch;
   detected.mean_confidence = mean_conf;
   detected.track_id = track_id; // set BEFORE draw so the id-color applies
-  applySmoothing(detected);
+  applySmoothing(detected, role.kind != Onnx::ModelKind::InstantHmr);
   fillBoxFromKeypoints(detected);
   outputs.detection.value = std::move(detected);
   // Snapshot the NATIVE keypoints before finalizeSingle() remaps them in place,

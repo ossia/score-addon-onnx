@@ -31,7 +31,8 @@ enum class SourceSkeleton
   Hands21,
   FaceMesh468,
   Dlib68,
-  Ap10k17
+  Ap10k17,
+  Mhr70 // InstantHMR / SAM-3D-Body keypoints (appended: keep values stable)
 };
 
 // Requested output layout (Native = no remap, handled by the caller).
@@ -191,6 +192,137 @@ inline constexpr JointMap hands21_to_hand21[] = {
     direct(12), direct(13), direct(14), direct(15), direct(16), direct(17),
     direct(18), direct(19), direct(20)};
 
+// ============================ Source: MHR70 (InstantHMR) ============================
+// SAM-3D-Body "mhr70" order (instanthmr/skeleton.py):
+// 0 nose 1 Leye 2 Reye 3 Lear 4 Rear 5 Lsh 6 Rsh 7 Lel 8 Rel 9 Lhip 10 Rhip
+// 11 Lknee 12 Rknee 13 Lankle 14 Rankle 15 LBigToe 16 LSmallToe 17 LHeel
+// 18 RBigToe 19 RSmallToe 20 RHeel
+// 21-40 right hand, 42-61 left hand: per finger (thumb,index,middle,ring,pinky)
+//   base+0 tip, +1 first_joint, +2 second_joint, +3 third_joint
+// 41 Rwrist 62 Lwrist (note: the wrists are NOT at COCO slots 9/10 — those are
+//   the hips here)  63/64 L/R olecranon 65/66 L/R cubital fossa
+//   67/68 L/R acromion 69 neck
+//
+// Finger order: "first_joint" is next to the TIP: first = DIP, second = PIP,
+// third = MCP (thumb: first = IP, second = MCP, third = CMC). Matches
+// SAM-3D-Body's mhr70 skeleton links (wrist -> third -> second -> first -> tip;
+// its names are <finger>4/3/2 = tip/first/second).
+//
+// Neck 69 is a real joint at the base of the neck, where OpenPose puts Neck and
+// Human3.6M its Thorax, so those map to direct(69) instead of mid(5,6).
+// 63-68 (elbow/shoulder surface landmarks) have no counterpart in any target.
+inline constexpr JointMap mhr70_to_coco17[] = {
+    direct(0),  direct(1),  direct(2),  direct(3),  direct(4),  direct(5),
+    direct(6),  direct(7),  direct(8),  direct(62), direct(41), direct(9),
+    direct(10), direct(11), direct(12), direct(13), direct(14)};
+
+inline constexpr JointMap mhr70_to_coco18[] = {
+    direct(0),  direct(69), direct(6),  direct(8),  direct(41), direct(5),
+    direct(7),  direct(62), direct(10), direct(12), direct(14), direct(9),
+    direct(11), direct(13), direct(2),  direct(1),  direct(4),  direct(3)};
+
+// The one source besides BlazePose that fills BODY_25 completely (real neck,
+// both toes and the heel per foot).
+inline constexpr JointMap mhr70_to_body25[] = {
+    direct(0),  direct(69), direct(6),  direct(8),  direct(41), direct(5),
+    direct(7),  direct(62), mid(9, 10), direct(10), direct(12), direct(14),
+    direct(9),  direct(11), direct(13), direct(2),  direct(1),  direct(4),
+    direct(3),  direct(15), direct(16), direct(17), direct(18), direct(19),
+    direct(20)};
+
+// Head = ear midpoint like the COCO/BlazePose tables above; Neck = real joint.
+inline constexpr JointMap mhr70_to_halpe26[] = {
+    direct(0),  direct(1),  direct(2),  direct(3),  direct(4),  direct(5),
+    direct(6),  direct(7),  direct(8),  direct(62), direct(41), direct(9),
+    direct(10), direct(11), direct(12), direct(13), direct(14), mid(3, 4),
+    direct(69), mid(9, 10), direct(15), direct(18), direct(16), direct(19),
+    direct(17), direct(20)};
+
+// Same recipes as coco17_to_mpii16 with the neck joint as thorax; upper neck
+// blends nose toward it (== avg4(nose, nose, shoulders) with shoulders -> neck).
+inline constexpr JointMap mhr70_to_mpii16[] = {
+    direct(14), direct(12), direct(10), direct(9),  direct(11), direct(13),
+    mid(9, 10), direct(69), mid(0, 69), extrap(1, 2, 0), direct(41),
+    direct(8),  direct(6),  direct(5),  direct(7),  direct(62)};
+
+// Spine = midway pelvis -> thorax(neck); Neck blends nose toward the thorax.
+inline constexpr JointMap mhr70_to_h36m17[] = {
+    mid(9, 10), direct(10), direct(12), direct(14), direct(9), direct(11),
+    direct(13), avg4(69, 69, 9, 10), direct(69), mid(0, 69), extrap(1, 2, 0),
+    direct(5),  direct(7),  direct(62), direct(6), direct(8), direct(41)};
+
+// Right hand (the first MHR hand block) in MediaPipe/COCO-WholeBody order:
+// wrist, then per finger base -> tip = third, second, first, tip.
+inline constexpr JointMap mhr70_to_hand21[] = {
+    direct(41),                                         // WRIST
+    direct(24), direct(23), direct(22), direct(21),     // thumb CMC MCP IP TIP
+    direct(28), direct(27), direct(26), direct(25),     // index MCP PIP DIP TIP
+    direct(32), direct(31), direct(30), direct(29),     // middle
+    direct(36), direct(35), direct(34), direct(33),     // ring
+    direct(40), direct(39), direct(38), direct(37)};    // pinky
+
+inline constexpr const char* mhr70_names[] = {
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_hip", "right_hip", "left_knee", "right_knee", "left_ankle",
+    "right_ankle", "left_big_toe_tip", "left_small_toe_tip", "left_heel",
+    "right_big_toe_tip", "right_small_toe_tip", "right_heel",
+    "right_thumb_tip", "right_thumb_first_joint", "right_thumb_second_joint",
+    "right_thumb_third_joint", "right_index_tip", "right_index_first_joint",
+    "right_index_second_joint", "right_index_third_joint", "right_middle_tip",
+    "right_middle_first_joint", "right_middle_second_joint",
+    "right_middle_third_joint", "right_ring_tip", "right_ring_first_joint",
+    "right_ring_second_joint", "right_ring_third_joint", "right_pinky_tip",
+    "right_pinky_first_joint", "right_pinky_second_joint",
+    "right_pinky_third_joint", "right_wrist",
+    "left_thumb_tip", "left_thumb_first_joint", "left_thumb_second_joint",
+    "left_thumb_third_joint", "left_index_tip", "left_index_first_joint",
+    "left_index_second_joint", "left_index_third_joint", "left_middle_tip",
+    "left_middle_first_joint", "left_middle_second_joint",
+    "left_middle_third_joint", "left_ring_tip", "left_ring_first_joint",
+    "left_ring_second_joint", "left_ring_third_joint", "left_pinky_tip",
+    "left_pinky_first_joint", "left_pinky_second_joint",
+    "left_pinky_third_joint", "left_wrist",
+    "left_olecranon", "right_olecranon", "left_cubital_fossa",
+    "right_cubital_fossa", "left_acromion", "right_acromion", "neck"};
+
+// Native MHR70 drawing edges. Upstream SKELETON_EDGES body part (head-neck,
+// torso, arms to the wrists, legs, ankle-heel) + COCO-style face edges + the
+// foot (ankle-heel, then the heel/big-toe/small-toe triangle) + FULL finger
+// chains wrist -> MCP(third) -> PIP(second) -> DIP(first) -> tip. 63-68 get
+// no bones (dots only).
+// Layout, for per-part colouring: [0, kMhr70BodyBones) body/face/feet, then
+// 20 right-hand bones, then 20 left-hand bones (4 per finger, thumb first).
+inline constexpr Bone mhr70_bones[] = {
+    // head
+    {0, 69}, {0, 1}, {0, 2}, {1, 3}, {2, 4},
+    // torso
+    {69, 5}, {69, 6}, {5, 9}, {6, 10}, {9, 10},
+    // arms
+    {5, 7}, {7, 62}, {6, 8}, {8, 41},
+    // legs
+    {9, 11}, {11, 13}, {10, 12}, {12, 14},
+    // feet: ankle-heel + heel/big toe/small toe triangle
+    {13, 17}, {17, 15}, {15, 16}, {16, 17},
+    {14, 20}, {20, 18}, {18, 19}, {19, 20},
+    // right hand (wrist 41, finger blocks at 21 + 4f)
+    {41, 24}, {24, 23}, {23, 22}, {22, 21},
+    {41, 28}, {28, 27}, {27, 26}, {26, 25},
+    {41, 32}, {32, 31}, {31, 30}, {30, 29},
+    {41, 36}, {36, 35}, {35, 34}, {34, 33},
+    {41, 40}, {40, 39}, {39, 38}, {38, 37},
+    // left hand (wrist 62, finger blocks at 42 + 4f)
+    {62, 45}, {45, 44}, {44, 43}, {43, 42},
+    {62, 49}, {49, 48}, {48, 47}, {47, 46},
+    {62, 53}, {53, 52}, {52, 51}, {51, 50},
+    {62, 57}, {57, 56}, {56, 55}, {55, 54},
+    {62, 61}, {61, 60}, {60, 59}, {59, 58}};
+inline constexpr int kMhr70BodyBones = 26;
+inline constexpr int kMhr70HandBones = 20; // per hand
+static_assert(
+    std::size(mhr70_bones) == kMhr70BodyBones + 2 * kMhr70HandBones);
+static_assert(std::size(mhr70_names) == 70);
+
 // ============================ target metadata ============================
 inline constexpr const char* coco17_names[] = {
     "nose",      "left_eye",  "right_eye", "left_ear",  "right_ear",
@@ -305,6 +437,18 @@ inline std::span<const JointMap> mappingFor(SourceSkeleton s, TargetSkeleton t)
     case S::Hands21:
       return t == T::Hand21 ? std::span<const JointMap>(hands21_to_hand21)
                             : std::span<const JointMap>{};
+    case S::Mhr70:
+      switch(t)
+      {
+        case T::Coco17: return mhr70_to_coco17;
+        case T::OpenPoseCoco18: return mhr70_to_coco18;
+        case T::OpenPoseBody25: return mhr70_to_body25;
+        case T::Halpe26: return mhr70_to_halpe26;
+        case T::Mpii16: return mhr70_to_mpii16;
+        case T::H36m17: return mhr70_to_h36m17;
+        case T::Hand21: return mhr70_to_hand21; // right hand
+        default: return {};
+      }
     default: return {};
   }
 }
@@ -338,6 +482,32 @@ inline std::span<const char* const> namesFor(TargetSkeleton t)
     case TargetSkeleton::Mpii16: return mpii16_names;
     case TargetSkeleton::H36m17: return h36m17_names;
     case TargetSkeleton::Hand21: return hand21_names;
+    default: return {};
+  }
+}
+
+// Native (un-remapped) edges / names of a source layout, for drawing and
+// geometry when the Skeleton control is Native. Only the layouts whose native
+// table lives here: BlazePose-33 / FaceMesh / AP-10K draw from the node's own
+// tables and return empty (as does dlib-68 for names).
+inline std::span<const Bone> nativeEdges(SourceSkeleton s)
+{
+  switch(s)
+  {
+    case SourceSkeleton::Coco17: return coco17_bones;
+    case SourceSkeleton::Hands21: return hand21_bones;
+    case SourceSkeleton::Dlib68: return dlib68_bones;
+    case SourceSkeleton::Mhr70: return mhr70_bones;
+    default: return {};
+  }
+}
+inline std::span<const char* const> nativeNames(SourceSkeleton s)
+{
+  switch(s)
+  {
+    case SourceSkeleton::Coco17: return coco17_names;
+    case SourceSkeleton::Hands21: return hand21_names;
+    case SourceSkeleton::Mhr70: return mhr70_names;
     default: return {};
   }
 }

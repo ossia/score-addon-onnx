@@ -13,6 +13,10 @@ struct ModelSpec
     std::string name;
     std::vector<int64_t> shape;
     TensorElemType elem_type{TensorElemType::Float};
+    // The declared leading (batch) dim was dynamic. buildModelSpec rewrites a
+    // rank-4 input's -1 batch to 1 in `shape` (single-image callers feed it
+    // as-is), so this is the only record that the model takes any N.
+    bool dynamic_batch{false};
   };
   std::vector<Port> inputs;
   std::vector<Port> outputs;

@@ -56,6 +56,12 @@ enum class ModelKind : uint8_t
 
   // Appearance ReID (loaded in its own port; one image in, one feature vector out)
   ReidEmbedder,
+
+  // Stage-2, appended at the END rather than in the stage-2 block: ModelKind is
+  // never persisted (presets store PoseWorkflow), but tools index name tables
+  // by the raw value, so existing values must not shift.
+  InstantHmr, // NCHW 224 + cliff_cond [N,3] -> joints_2d [N,K,2], joints_3d
+              // [N,K,3], cam_trans, mhr_params, shape_params (MHR70, K=70)
 };
 
 struct ModelRole
@@ -107,7 +113,129 @@ inline bool nameContains(const std::string& s, const char* sub)
   });
   return a.find(b) != std::string::npos;
 }
+
+// InstantHMR's second input: the CLIFF box condition, [N,3] float
+// (cx, cy, scale of the detector box relative to the full frame). Recognised by
+// shape (rank 2, last dim 3) or by name. The PINTO mmpose "with_post" bbox
+// input is [1,2] and never matches; nor do PaddleDetection's im_shape /
+// scale_factor or RT-DETR's orig_target_sizes (all [N,2]).
+inline bool isCliffInput(const ModelIO::Port& p)
+{
+  return (p.shape.size() == 2 && p.shape[1] == 3) || nameContains(p.name, "cliff");
+}
+
+// Rank-3 [., K, last] with a known K.
+inline bool isKxN(const std::vector<int64_t>& s, int64_t last)
+{
+  return s.size() == 3 && s[1] > 0 && s[2] == last;
+}
 } // namespace detail
+
+// Output indices of an InstantHMR graph, resolved once at model load. -1 when
+// the graph has no such output. Order in the shipped HF file is mhr_params,
+// shape_params, cam_trans, joints_2d, joints_3d, but nothing here relies on it.
+struct HmrOutputs
+{
+  int joints_2d = -1;    // [N,K,2] crop coords in [-1,1]
+  int joints_3d = -1;    // [N,K,3] rig-local metres, Y down
+  int cam_trans = -1;    // [N,3] rig origin in camera space, metres
+  int mhr_params = -1;   // [N,204] root transl+rot, 130 joint angles, 68 scales
+  int shape_params = -1; // [N,45] MHR identity (20 body + 20 head + 5 hand)
+  int num_keypoints = 0; // K of joints_2d (70 for MHR70), 0 when unknown
+  // Upstream `instanthmr_distill_train/train_distill_mhr_only.py` export:
+  // 71 decoder queries (1 global + 70 2D), a SimCC 2D head (expectation already
+  // taken in-graph, so joints_2d is still [N,70,2]) and NO 3D head: FOUR
+  // outputs (mhr_params, shape_params, cam_trans, joints_2d). joints_3d must
+  // then come from the MHR skeleton forward pass on mhr_params, which the
+  // graph cannot contain. classify() leaves such a graph Unknown; this flag
+  // lets the loader say why instead of silently doing nothing.
+  bool mhr_only = false;
+
+  // Enough to run the InstantHmr decode (2D + 3D + camera placement).
+  bool valid() const noexcept
+  {
+    return joints_2d >= 0 && joints_3d >= 0 && cam_trans >= 0;
+  }
+};
+
+// By exact upstream name first (the torch.onnx.export output_names), then by
+// shape for whatever is still unresolved, never reusing an index. K is taken
+// from the name-resolved joints_2d when there is one, so a shape fallback for
+// joints_3d must agree with it.
+inline HmrOutputs resolveHmrOutputs(const ModelIO& spec)
+{
+  HmrOutputs h;
+  const int n = static_cast<int>(spec.outputs.size());
+  auto taken = [&](int i) {
+    return i == h.joints_2d || i == h.joints_3d || i == h.cam_trans
+           || i == h.mhr_params || i == h.shape_params;
+  };
+  for(int i = 0; i < n; ++i)
+  {
+    const auto& nm = spec.outputs[i].name;
+    if(nm == "joints_2d") h.joints_2d = i;
+    else if(nm == "joints_3d") h.joints_3d = i;
+    else if(nm == "cam_trans") h.cam_trans = i;
+    else if(nm == "mhr_params") h.mhr_params = i;
+    else if(nm == "shape_params") h.shape_params = i;
+  }
+  auto shapeOf = [&](int i) -> const std::vector<int64_t>& {
+    return spec.outputs[i].shape;
+  };
+  auto kOf = [&](int i) -> int64_t {
+    return i >= 0 && shapeOf(i).size() == 3 ? shapeOf(i)[1] : 0;
+  };
+  auto byShape = [&](int& slot, auto&& pred) {
+    if(slot >= 0)
+      return;
+    for(int i = 0; i < n; ++i)
+      if(!taken(i) && pred(shapeOf(i)))
+      {
+        slot = i;
+        return;
+      }
+  };
+  // 2D first, then a 3D with the same K (and vice-versa if only 3D was named).
+  if(h.joints_2d < 0)
+  {
+    const int64_t k3 = kOf(h.joints_3d);
+    byShape(h.joints_2d, [&](const auto& s) {
+      return detail::isKxN(s, 2) && (k3 <= 0 || s[1] == k3);
+    });
+  }
+  {
+    const int64_t k2 = kOf(h.joints_2d);
+    byShape(h.joints_3d, [&](const auto& s) {
+      return detail::isKxN(s, 3) && (k2 <= 0 || s[1] == k2);
+    });
+  }
+  auto vec = [](int64_t len) {
+    return [len](const std::vector<int64_t>& s) {
+      return s.size() == 2 && s[1] == len;
+    };
+  };
+  byShape(h.cam_trans, vec(3));
+  byShape(h.mhr_params, vec(204));
+  byShape(h.shape_params, vec(45));
+
+  const int64_t k = kOf(h.joints_2d) > 0 ? kOf(h.joints_2d) : kOf(h.joints_3d);
+  h.num_keypoints = k > 0 ? static_cast<int>(k) : 0;
+  h.mhr_only = h.joints_2d >= 0 && h.joints_3d < 0 && h.mhr_params >= 0;
+  return h;
+}
+
+// True for the train_distill_mhr_only.py 4-output export (see HmrOutputs::
+// mhr_only): recognised so the node can log "needs the MHR forward pass" rather
+// than report an unknown model. classify() returns Unknown for it on purpose.
+inline bool isInstantHmrMhrOnly(const ModelIO& spec)
+{
+  if(spec.inputs.size() != 2 || spec.inputs[0].shape.size() != 4
+     || !detail::isCliffInput(spec.inputs[1]))
+    return false;
+  const auto h = resolveHmrOutputs(spec);
+  return h.mhr_only && h.cam_trans >= 0 && h.shape_params >= 0
+         && h.num_keypoints >= 17;
+}
 
 // Classify an ONNX model purely from its declared input/output shapes & names.
 // See TWO_STAGE_ARCHITECTURE.md §5 for the decision table.
@@ -141,6 +269,37 @@ inline ModelRole classify(const ModelIO& spec)
     }
   }
   const int W = r.input_w, H = r.input_h;
+
+  // --- A-HMR) InstantHMR: image + CLIFF box condition -> 2D + 3D joints ------
+  // First, because it is the most specific signature and later rules must not
+  // shadow it. Requires ALL of: exactly two inputs, the second [N,3] (or named
+  // *cliff*), and among the outputs a rank-3 [.,K,2] AND a rank-3 [.,K,3] with
+  // the same static K >= 17. Why nothing else can land here:
+  //  - every other two-input pose family has an [N,2] second input (PINTO
+  //    mmpose with_post bbox, RT-DETR orig_target_sizes) -> not CLIFF;
+  //  - RTMPose/SimCC outputs end in >= 32 bins, never 2/3; RTMO and YOLO are
+  //    single-input; RetinaFace's [.,N,2] conf has no [.,N,3] sibling.
+  // K is matched rather than fixed to 70 so re-trained family members classify.
+  // A dynamic K (-1 on both) does NOT match: the shipped export has it static.
+  // The mhr-only 4-output variant (no [.,K,3]) falls through to Unknown on
+  // purpose; see isInstantHmrMhrOnly().
+  if(spec.inputs.size() == 2 && detail::isCliffInput(spec.inputs[1]))
+  {
+    for(const auto& a : spec.outputs)
+    {
+      if(!detail::isKxN(a.shape, 2) || a.shape[1] < 17)
+        continue;
+      for(const auto& b : spec.outputs)
+        if(detail::isKxN(b.shape, 3) && b.shape[1] == a.shape[1])
+        {
+          r.kind = ModelKind::InstantHmr;
+          r.stage = ModelStage::Landmark;
+          r.domain = ModelDomain::Body;
+          r.num_keypoints = static_cast<int>(a.shape[1]);
+          return r;
+        }
+    }
+  }
 
   // --- Output summary ---
   struct OutInfo

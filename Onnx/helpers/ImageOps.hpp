@@ -81,12 +81,19 @@ void warpAffine(
 
 // Fused affine-sample + normalize into `out` (3*mw*mh floats, caller-owned).
 // Samples src (RGBA, alpha ignored) bilinearly through `a` (output px -> src
-// px), edge-clamped; out = (sample - mean[c]) * invstd[c]. prof_bucket tags the
-// profiler (WarpDet for whole-frame, WarpCrop for ROI crops).
+// px); out = (sample - mean[c]) * invstd[c]. prof_bucket tags the profiler
+// (WarpDet for whole-frame, WarpCrop for ROI crops).
+// Out-of-frame handling: border_rgb == nullptr edge-clamps (replicates the
+// edge row/column). Non-null = a constant RGB border
+// (3 bytes, pre-normalization, e.g. {0,0,0} for the black copyMakeBorder pad a
+// model was trained on): every bilinear tap outside the image reads that
+// colour, as cv2.warpAffine(BORDER_CONSTANT) does, so a crop spilling over the
+// frame edge gets (border - mean) * invstd there instead of smeared edge pixels.
 void sampleAffineToTensor(
     TensorLayout L, const ImageView& src, const Affine& a, int mw, int mh,
     const float mean[3], const float invstd[3], float* out,
-    prof::Bucket prof_bucket = prof::WarpCrop);
+    prof::Bucket prof_bucket = prof::WarpCrop,
+    const uint8_t* border_rgb = nullptr);
 
 // Fused aspect-preserving letterbox + normalize into `out`. Pad band ->
 // (pad - mean[c]) * invstd[c]. Returns scale + pad for un-letterboxing.

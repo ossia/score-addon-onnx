@@ -61,6 +61,112 @@ static Onnx::ModelRole classifyModel(Onnx::OnnxRunContext& ctx)
   return role;
 }
 
+// Per-model InstantHMR setup, run each time a landmark model is loaded: the
+// output indices, the CLIFF form from the graph metadata, and the smoothing
+// kinds of its body parameters. Any other model clears all of it.
+void PoseDetector::loadInstantHmr(Onnx::OnnxRunContext& lctx, Onnx::ModelRole& role)
+{
+  m_hmr_out = {};
+  m_hmr_cliff_focal = false;
+  m_params_angle_mask.clear();
+  m_params_beta = 0.f;
+
+  const auto io = toModelIO(lctx.readModelSpec());
+  if(role.kind != Onnx::ModelKind::InstantHmr)
+  {
+    // The distilled 4-output export has no 3D head: its joints_3d must come
+    // from the MHR skeleton forward pass, which the graph does not contain.
+    // classify() leaves it Unknown (the node then does nothing); say why.
+    if(role.kind == Onnx::ModelKind::Unknown && Onnx::isInstantHmrMhrOnly(io))
+      std::fprintf(
+          stderr,
+          "[pose] %s: InstantHMR mhr-only export (no joints_3d output): not "
+          "supported, it needs the MHR body model forward pass. Export the "
+          "model with its 3D joint head.\n",
+          std::string(inputs.model.file.filename).c_str());
+    return;
+  }
+
+  m_hmr_out = Onnx::resolveHmrOutputs(io);
+
+  // Metadata written by upstream tools/pth_to_onnx.py. cliff_focal selects the
+  // CLIFF form the checkpoint was TRAINED with: a mismatch does not error, it
+  // silently misplaces the person in depth. Absent (the HF file) = pixel form.
+  const auto cf = lctx.metadataValue("cliff_focal");
+  m_hmr_cliff_focal = (cf == "true" || cf == "True" || cf == "1");
+  // image_size only matters when the graph's spatial dims are dynamic; static
+  // ones win in landmarkKeypoints / runLandmarkBatch anyway.
+  if(const auto is = lctx.metadataValue("image_size"); !is.empty())
+  {
+    int v = 0;
+    for(char c : is)
+    {
+      if(c < '0' || c > '9')
+      {
+        v = 0;
+        break;
+      }
+      v = v * 10 + (c - '0');
+    }
+    if(v >= 32 && v <= 4096)
+    {
+      const auto& s = lctx.readModelSpec().inputs[0].shape;
+      if(s.size() != 4 || s[2] <= 0)
+        role.input_h = v;
+      if(s.size() != 4 || s[3] <= 0)
+        role.input_w = v;
+    }
+  }
+
+  // body_params = mhr_params (204) ++ shape_params (45): the pose part's
+  // smoothing kinds come from setHmrParamKinds, the identity is static.
+  const int n_pose = m_hmr_out.mhr_params >= 0 ? kMhrPoseParams : 0;
+  const int n_shape = m_hmr_out.shape_params >= 0 ? kMhrShapeParams : 0;
+  m_params_angle_mask.assign(n_pose + n_shape, Onnx::ParamLinear);
+  for(int i = n_pose; i < n_pose + n_shape; ++i)
+    m_params_angle_mask[i] = Onnx::ParamStatic;
+  setHmrParamKinds();
+  m_params_beta = 2.0f; // upstream mhr_params beta, per rad/s
+}
+
+void PoseDetector::setHmrParamKinds()
+{
+  if(m_hmr_out.mhr_params < 0
+     || m_params_angle_mask.size() < size_t(Onnx::Mhr::kNumModelParams))
+    return;
+  // Angle (smoothed with unwrapping) only where the parameter is 2*pi-periodic:
+  // every coefficient it has in MHR's parameter transform is +-1 on a joint
+  // rotation (Onnx::Mhr::periodicParams). The spine bends / leans / twists and
+  // the limb and neck twists are spread over several joints with fractional
+  // weights (e.g. l_upleg_twist: 0.2..0.8 over 4 joints), so wrapping them
+  // would snap the mesh: they are linear, like the translations (0:3), the
+  // *_flexible size channels (130:136) and the bone scales (136:204).
+  if(m_mhr)
+  {
+    const auto periodic = Onnx::Mhr::periodicParams(*m_mhr);
+    for(int i = 0; i < Onnx::Mhr::kNumModelParams; ++i)
+      m_params_angle_mask[i] = periodic[i] ? Onnx::ParamAngle : Onnx::ParamLinear;
+    return;
+  }
+  // No body model loaded: the same derivation, computed once from Meta's MHR
+  // assets (identical at every LOD; checked against the file by the tests).
+  // Half-open ranges; 151 is scale_knee_knock, a unit knee rotation.
+  static constexpr std::pair<int, int> kPeriodic[]
+      = {{3, 7},   {8, 9},   {10, 11}, {12, 13}, {14, 15}, {16, 17},
+         {18, 24}, {25, 33}, {34, 37}, {38, 43}, {44, 47}, {48, 50},
+         {51, 54}, {55, 59}, {60, 63}, {64, 130}, {151, 152}};
+  for(int i = 0; i < Onnx::Mhr::kNumModelParams; ++i)
+    m_params_angle_mask[i] = Onnx::ParamLinear;
+  for(auto [a, b] : kPeriodic)
+    for(int i = a; i < b; ++i)
+      m_params_angle_mask[i] = Onnx::ParamAngle;
+}
+
+std::span<const std::uint8_t> PoseDetector::paramKindsForTest() const noexcept
+{
+  return m_params_angle_mask;
+}
+
 Onnx::ModelRole PoseDetector::roleForWorkflow(PoseWorkflow w) const
 {
   // Keep the real model's input dims/layout; override the kind by selection.
@@ -102,6 +208,9 @@ Onnx::ModelRole PoseDetector::roleForWorkflow(PoseWorkflow w) const
     case PoseWorkflow::RTMPoseFace:
       r.kind = K::SimccPose; r.stage = S::Landmark; r.domain = D::Face;
       break;
+    case PoseWorkflow::InstantHMR:
+      r.kind = K::InstantHmr; r.stage = S::Landmark; r.domain = D::Body;
+      break;
     case PoseWorkflow::BoxDetection:
       // Detection-only: the relevant model is the Detection Model; the box path
       // dispatches on m_detector_role directly, so leave the landmark role as-is.
@@ -140,7 +249,7 @@ void PoseDetector::passthrough(const Onnx::ImageView& src)
   ++m_lost_frames;
   if(m_lost_frames > 8)
   {
-    m_smoother.reset();
+    resetSmoothers(); // 2D + 3D filters and the confidence-hold history
     m_roi_smoother.reset();
     m_box_smoother.reset();
     m_tracking = false;
@@ -183,6 +292,9 @@ try
       pos = nl + 1;
     }
   }
+
+  // The body mesh file, parsed only when its name changes.
+  loadBodyModel();
 
   const bool have_landmark = !inputs.model.current_model_invalid
                              && inputs.model.file.bytes.size() >= 32;
@@ -240,7 +352,7 @@ try
     m_tracking = false;
     m_last_keypoints.clear();
     m_roi_smoother.reset();
-    m_smoother.reset();
+    resetSmoothers(); // 2D + 3D filters and the confidence-hold history
     m_box_smoother.reset();
     m_tracker.reset();
     m_lost_frames = 0;
@@ -248,6 +360,10 @@ try
     m_last_single_pose.reset();
     m_hold_frames = 0;
     m_had_detection = false;
+    // m_params_angle_mask / m_params_beta / m_hmr_out are NOT cleared here:
+    // they belong to the landmark model and are rebuilt by loadInstantHmr()
+    // every time one is loaded below (a Detection Model change reinits without
+    // reloading the landmark model, and must not lose them).
   }
 
   // Model construction is the only failure that should permanently invalidate
@@ -257,9 +373,8 @@ try
   {
     if(have_landmark && !this->ctx)
     {
-      this->ctx = std::make_unique<Onnx::OnnxRunContext>(
-          this->inputs.model.file.bytes, this->inputs.model.file.filename);
-      m_landmark_role = classifyModel(*this->ctx);
+      make();
+      return true;
     }
     if(have_det && !this->det_ctx)
     {
@@ -326,6 +441,7 @@ try
               || role.kind == Onnx::ModelKind::FaceMeshLandmark);
     Onnx::ROI::Rect rect;
     bool from_tracking = false;
+    m_landmark_score = 1.f; // a tracking ROI has no detector score
     if(can_track && m_tracking && !m_last_keypoints.empty())
     {
       // Derive the ROI from last frame's landmarks — no detector this frame.
@@ -351,6 +467,9 @@ try
         return;
       }
       rect = detectionRect(role, dets.front(), in_tex.width, in_tex.height);
+      // Models without per-joint confidence (InstantHMR) report the score of
+      // the detection they were cropped from.
+      m_landmark_score = std::clamp(dets.front().score, 0.f, 1.f);
       // Only reset the ROI smoother on a genuine RE-ACQUISITION (the previous
       // frame was a dropout, m_lost_frames>0) so we don't blend across the gap.
       // For a continuous top-down stream (which re-detects every frame, so
@@ -418,8 +537,17 @@ try
     {
       const int mw = role.input_w > 0 ? role.input_w : 256;
       const int mh = role.input_h > 0 ? role.input_h : 256;
-      const Onnx::Affine M = Onnx::ROI::wholeFrameAffine(
-          in_tex.width, in_tex.height, mw, mh);
+      m_landmark_score = 1.f;
+      // InstantHMR crops a person box and is conditioned on where that box
+      // sits in the frame: with no detector, the frame IS the box (upstream's
+      // square 1.2x crop of it, black outside), not the cover-crop the other
+      // landmark models get, so the crop and its CLIFF vector agree.
+      const Onnx::Affine M
+          = role.kind == Onnx::ModelKind::InstantHmr
+                ? Onnx::ROI::rectToAffine(
+                      instantHmrFrameRect(in_tex.width, in_tex.height, mw, mh),
+                      mw, mh)
+                : Onnx::ROI::wholeFrameAffine(in_tex.width, in_tex.height, mw, mh);
       runLandmark(role, draw, src, M);
       break;
     }

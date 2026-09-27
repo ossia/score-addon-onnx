@@ -14,6 +14,14 @@
 //   ONNX_TEST_AILIA         an ailia-models checkout (sample images, GANs)
 //   ONNX_TEST_POSE_PACKAGE  score's pose-detector package
 //   ONNX_TEST_PINTO_ZOO     a PINTO_model_zoo checkout
+//   ONNX_TEST_GAN_MODELS    fbanime-gan/, MobileStyleGAN.pytorch/ exports
+//   ONNX_TEST_INSTANTHMR    InstantHMR's instanthmr.onnx (huggingface.co/
+//                           momolesang/InstantHMR; SAM licence, not bundled)
+//   ONNX_TEST_MHR           MHR body models: bin/mhr_lod<L>.mhrbin
+//                           (tools/mhr_export.py) + ref/
+//   ONNX_TEST_INSTANTHMR_VIDEO  a folder of frame_NNNN.jpg, one person
+//   ONNX_TEST_DUMP_DIR      where the InstantHMR video test writes its parity
+//                           dump for the Python reference (off when unset)
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -69,5 +77,40 @@ inline std::string pintoZoo()
 inline std::string gan()
 {
   return env("ONNX_TEST_GAN_MODELS");
+}
+inline std::string instantHmr()
+{
+  return env("ONNX_TEST_INSTANTHMR");
+}
+inline std::string mhr()
+{
+  return env("ONNX_TEST_MHR");
+}
+inline std::string instantHmrVideo()
+{
+  return env("ONNX_TEST_INSTANTHMR_VIDEO");
+}
+inline std::string dumpDir()
+{
+  return env("ONNX_TEST_DUMP_DIR");
+}
+inline std::string mhrBin(int lod)
+{
+  const auto root = mhr();
+  return root.empty() ? root : root + "/bin/mhr_lod" + std::to_string(lod) + ".mhrbin";
+}
+
+inline std::string slurp(const std::filesystem::path& path)
+{
+  std::ifstream f(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(f), {}};
+}
+
+inline bool haveAll(std::initializer_list<std::string> paths)
+{
+  for(const auto& p : paths)
+    if(!std::filesystem::exists(p))
+      return false;
+  return true;
 }
 }

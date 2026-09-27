@@ -180,9 +180,126 @@ inline PoseWorkflow workflowForRole(const Onnx::ModelRole& r)
     case K::MultiClassDetector:
     case K::YoloxDetector:
       return PoseWorkflow::BoxDetection;
+    case K::InstantHmr:
+      return PoseWorkflow::InstantHMR;
     default:
       return PoseWorkflow::BlazePose;
   }
+}
+
+// One-Euro parameters for the 3D payload (DetectedPose::world / translation /
+// body_params), from the node's Smoothing Amount. Real units (Hz, beta per
+// metre/s or rad/s, stepped at Onnx::kNominalFrameDt): these are metric
+// signals, NOT the normalized [0,1] screen coordinates applySmoothing tunes
+// for, so the published per-signal settings are used as the anchor. At the
+// default Amount 0.5 they are exactly upstream InstantHMR's (smoothing.py):
+// joints_3d_local (min_cutoff 1.0 Hz, beta 4.0), cam_trans (0.6, 2.0), dcutoff
+// 1 Hz. The Amount then bends them the same way applySmoothing bends the 2D
+// ones: min_cutoff along the same exponential curve, beta along the same
+// linear (1 + 4*amt) ramp normalized to 1 at 0.5, so heavy smoothing still
+// opens up on fast motion.
+// body_params are generic (units unknown here), so their default is a pure
+// low-pass (beta 0) at the joints' cutoff; a model family that knows its
+// parameters passes its own beta anchor (params_beta, per unit/s at Amount
+// 0.5) and flags its angles / identity entries via the ParamKind mask.
+// InstantHMR: upstream's mhr_params (1.0 Hz, beta 2.0 per rad/s) and its
+// shape_params (0.3 Hz, beta 0) through ParamStatic.
+struct Smoothing3D
+{
+  float world_min_cutoff, world_beta;
+  float trans_min_cutoff, trans_beta;
+  float params_min_cutoff, params_beta;
+};
+inline Smoothing3D smoothing3D(float amount, float params_beta = 0.f) noexcept
+{
+  const float amt = std::clamp(amount, 0.f, 1.f);
+  const float mc = std::pow(0.02f / 5.0f, amt - 0.5f); // 1 at amt = 0.5
+  const float b = (1.0f + 4.0f * amt) / 3.0f;          // 1 at amt = 0.5
+  return {1.0f * mc, 4.0f * b, 0.6f * mc, 2.0f * b, 1.0f * mc, params_beta * b};
+}
+
+// --- InstantHMR (human mesh recovery) helpers, shared by the load, detect and
+//     landmark files (and the tests) ---
+
+// Upstream CROP_EXPAND: the person crop is the square max(bw,bh) * 1.2 around
+// the detector box centre (instanthmr/inference.py _preprocess).
+inline constexpr float kHmrCropExpand = 1.2f;
+// Sizes of the MHR parameter blocks InstantHMR emits (DetectedPose::body_params
+// = mhr_params ++ shape_params).
+inline constexpr int kMhrPoseParams = 204;
+inline constexpr int kMhrShapeParams = 45;
+
+// The CLIFF box condition of one crop, from the ROI rect the crop was sampled
+// with (image px). The rect is topdownRect(box, S, S, kHmrCropExpand), so its
+// centre is the detector box centre and max(w,h) / 1.2 is max(bw,bh): exactly
+// upstream's vector, but of the SMOOTHED ROI the crop really used, so crop and
+// condition can never disagree. W, H: full frame.
+//  pixel form (the shipped graph): [2cx/W - 1, 2cy/H - 1, max(bw,bh)/max(W,H)]
+//  angular form (metadata cliff_focal=true, newer tools/pth_to_onnx.py
+//  exports), f = 1.05 * diag:     [atan((cx-W/2)/f), atan((cy-H/2)/f), max/f]
+// The focal length (px) of InstantHMR's camera for a W x H frame: the one its
+// cam_trans places the person for, so every projection of the 3D payload
+// (Draw Mesh, Mesh Keypoints) must use it. Pixel CLIFF: the frame diagonal;
+// angular CLIFF (cliff_focal): 1.05 x the diagonal.
+inline float instantHmrFocal(int W, int H, bool angular) noexcept
+{
+  const float fw = static_cast<float>(W), fh = static_cast<float>(H);
+  return (angular ? 1.05f : 1.f) * std::sqrt(fw * fw + fh * fh);
+}
+
+inline void instantHmrCliff(
+    const Onnx::ROI::Rect& r, int W, int H, bool angular, float* out) noexcept
+{
+  const float side = std::max(r.w, r.h) / kHmrCropExpand;
+  const float fw = static_cast<float>(W), fh = static_cast<float>(H);
+  if(angular)
+  {
+    const float f = instantHmrFocal(W, H, true);
+    out[0] = std::atan((r.cx - 0.5f * fw) / f);
+    out[1] = std::atan((r.cy - 0.5f * fh) / f);
+    out[2] = side / f;
+  }
+  else
+  {
+    out[0] = 2.f * r.cx / fw - 1.f;
+    out[1] = 2.f * r.cy / fh - 1.f;
+    out[2] = side / std::max(fw, fh);
+  }
+}
+
+// The (unrotated) ROI rect an affine from rectToAffine(r, mw, mh) was built
+// from: rectToAffine at angle 0 is m0 = w/mw, m2 = cx - w/2 (and likewise in
+// y), so it inverts exactly. Lets the CLIFF builder work from the M every
+// landmark call already carries, with no rect threaded next to it.
+inline Onnx::ROI::Rect rectFromAffine(const Onnx::Affine& M, int mw, int mh) noexcept
+{
+  const float w = M.m0 * mw, h = M.m4 * mh;
+  return {M.m2 + 0.5f * w, M.m5 + 0.5f * h, w, h, 0.f};
+}
+
+// The affine InstantHMR's crop is SAMPLED with, from the crop affine M that
+// maps its keypoints back. Upstream resizes the square patch with
+// cv2.resize(INTER_LINEAR), which reads crop pixel u at the patch's
+// (u + 0.5) * s - 0.5 (pixel centres), while it maps the regressed joints back
+// with u * s (pixel corners), and so does M. Our sampler reads u * s, i.e.
+// (s - 1) / 2 source px (1 px for a 672 px square) off what the model was
+// trained on: shifting only the sampling reproduces upstream exactly, and the
+// back-map stays M. Axis-aligned M only (InstantHMR ROIs are never rotated).
+inline Onnx::Affine instantHmrSampleAffine(Onnx::Affine M) noexcept
+{
+  M.m2 += 0.5f * (M.m0 - 1.f);
+  M.m5 += 0.5f * (M.m4 - 1.f);
+  return M;
+}
+
+// InstantHMR's whole-frame ROI (no Detection Model): the frame itself is the
+// person box, cropped exactly as upstream crops a detector box (1.2x square,
+// black outside). The same rect then drives the CLIFF vector.
+inline Onnx::ROI::Rect instantHmrFrameRect(int W, int H, int mw, int mh) noexcept
+{
+  return Onnx::ROI::topdownRect(
+      Onnx::Rect{0.f, 0.f, static_cast<float>(W), static_cast<float>(H)}, mw,
+      mh, kHmrCropExpand);
 }
 
 // Normalization + layout for the fused samplers: out = (channel - mean)*invstd.
@@ -243,17 +360,20 @@ inline Onnx::FloatTensor finalizeTensor(
 
 // Fused: sample src through M (output px -> src px), normalize per `ns`, into a
 // reused float buffer, then finalize to an Ort tensor (batch forced to 1). No
-// intermediate RGBA buffer, no second normalize pass.
+// intermediate RGBA buffer, no second normalize pass. border_rgb: nullptr =
+// edge-clamped sampling (every existing caller), else the constant RGB colour
+// written where the crop leaves the frame (see Onnx::sampleAffineToTensor).
 inline Onnx::FloatTensor fusedAffineTensor(
     const Onnx::ModelSpec::Port& port, const Onnx::ImageView& src,
     const Onnx::Affine& M, int mw, int mh, const NormSpec& ns,
     boost::container::vector<float>& storage,
-    Onnx::prof::Bucket prof_bucket = Onnx::prof::WarpCrop)
+    Onnx::prof::Bucket prof_bucket = Onnx::prof::WarpCrop,
+    const uint8_t* border_rgb = nullptr)
 {
   storage.resize(static_cast<size_t>(3) * mw * mh, boost::container::default_init);
   Onnx::sampleAffineToTensor(
       ns.layout, src, M, mw, mh, ns.mean.data(), ns.invstd.data(),
-      storage.data(), prof_bucket);
+      storage.data(), prof_bucket, border_rgb);
   return finalizeTensor(
       port, storage, mw, mh, ns.layout == Onnx::TensorLayout::NhwcRgb);
 }

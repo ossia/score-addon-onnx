@@ -31,6 +31,15 @@ Onnx::ROI::Rect PoseDetector::detectionRect(
       return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::faceParams());
     case Onnx::ModelKind::MobileFaceNet:
       return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::mobileFaceParams());
+    case Onnx::ModelKind::InstantHmr:
+    {
+      // Upstream's crop: the square max(bw,bh) * 1.2 around the raw box
+      // centre (square because the input is 224x224). The CLIFF vector is
+      // derived back from this rect (instantHmrCliff), so the two stay tied.
+      const Onnx::Rect box{
+          det.box().x * W, det.box().y * H, det.w * W, det.h * H};
+      return Onnx::ROI::topdownRect(box, mw, mh, kHmrCropExpand);
+    }
     default:
     {
       const Onnx::Rect box{

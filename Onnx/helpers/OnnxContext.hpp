@@ -16,8 +16,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -45,7 +49,11 @@ struct Options
   static Options precise() { return {.tf32 = false}; }
 };
 
-static Ort::SessionOptions create_session_options(const Options& opts)
+// resolved (optional): receives the execution provider actually appended
+// ("cuda", "tensorrt", ..., "cpu"), after the SCORE_ONNX_FORCE_PROVIDER
+// override and the "default" pick; "cpu" when nothing else was available.
+static Ort::SessionOptions
+create_session_options(const Options& opts, std::string* resolved = nullptr)
 try
 {
   Ort::SessionOptions session_options;
@@ -229,18 +237,20 @@ try
   // FIXME RKNPU
   // FIXME ARMNN, etc.
 
+  if (resolved)
+    *resolved = contains(p, requested_provider) ? requested_provider : "cpu";
   return session_options;
 }
 catch (const std::exception& e)
 {
   std::fprintf(stderr, "Onnxruntime: falling back to CPU: %s\n", e.what());
-  return create_session_options(Options{.provider = "cpu", .device_id = 0});
+  return create_session_options(Options{.provider = "cpu", .device_id = 0}, resolved);
 }
 
 catch (...)
 {
   std::fprintf(stderr, "OnnxRuntime: falling back to CPU: unknown error\n");
-  return create_session_options(Options{.provider = "cpu", .device_id = 0});
+  return create_session_options(Options{.provider = "cpu", .device_id = 0}, resolved);
 }
 
 // Session creation with a fallback: some fp16 exports (e.g. the FastVLM-0.5B
@@ -303,6 +313,9 @@ inline TensorElemType fromOrtElementType(ONNXTensorElementDataType t) noexcept
 struct OnnxRunContext
 {
   Options opts;
+  // The execution provider the session was created for ("cuda", "cpu", ...;
+  // see create_session_options). ORT may still place single nodes on the CPU.
+  std::string provider;
   Ort::Env env;
 
   Ort::SessionOptions session_options;
@@ -319,7 +332,8 @@ struct OnnxRunContext
       std::string_view bytes, std::string_view model_path = {}, Options o = {})
       : opts(std::move(o))
       , env(make_env("ossia"))
-      , session_options(withModelFolder(create_session_options(opts), model_path))
+      , session_options(
+            withModelFolder(create_session_options(opts, &provider), model_path))
       , session(env, bytes.data(), bytes.size(), session_options)
   {
     // The session (and therefore its I/O spec) is immutable for the context's
@@ -333,6 +347,47 @@ struct OnnxRunContext
   // `const auto&` to stay allocation-free; the worker threads hold the context
   // alive via shared_ptr, so the reference (and its name char*) stay valid.
   const ModelSpec& readModelSpec() const noexcept { return m_spec; }
+
+  // Transparent comparator: lookups by string_view don't build a std::string.
+  using MetadataMap = std::map<std::string, std::string, std::less<>>;
+
+  // The graph's custom metadata (ModelProto.metadata_props, e.g. InstantHMR's
+  // `cliff_focal` / `image_size`). Read once (call_once, for the worker threads
+  // sharing a context) and cached: later calls return the same map by
+  // reference, without allocating. An unreadable block yields an empty map.
+  const MetadataMap& metadata() const
+  {
+    std::call_once(m_metadata_once, [this] {
+      try
+      {
+        Ort::AllocatorWithDefaultOptions alloc;
+        Ort::ModelMetadata md = session.GetModelMetadata();
+        auto keys = md.GetCustomMetadataMapKeysAllocated(alloc);
+        for(auto& k : keys)
+        {
+          if(!k)
+            continue;
+          auto v = md.LookupCustomMetadataMapAllocated(k.get(), alloc);
+          m_metadata.emplace(k.get(), v ? v.get() : "");
+        }
+      }
+      catch(...)
+      {
+        m_metadata.clear();
+      }
+    });
+    return m_metadata;
+  }
+
+  // One custom metadata value, or `fallback` when the key is absent. The
+  // returned view points into the cached map (valid for the context's life).
+  std::string_view
+  metadataValue(std::string_view key, std::string_view fallback = {}) const
+  {
+    const auto& md = metadata();
+    const auto it = md.find(key);
+    return it != md.end() ? std::string_view(it->second) : fallback;
+  }
 
 private:
   static Ort::SessionOptions
@@ -372,7 +427,10 @@ private:
       if (auto& tensor = spec.inputs.back();
           tensor.shape.size() == 4) // NCHW or NHCW
         if (tensor.shape[0] == -1)
+        {
           tensor.shape[0] = 1;
+          tensor.dynamic_batch = true;
+        }
 
       spec.input_names.push_back(std::move(name));
     }
@@ -411,8 +469,9 @@ private:
   }
 
   ModelSpec m_spec; // built once in the ctor; returned by readModelSpec()
-  std::mutex m_error_mutex;
-  std::string m_last_error;
+  // Lazily-read custom metadata (see metadata()); mutable: filled on first use.
+  mutable std::once_flag m_metadata_once;
+  mutable MetadataMap m_metadata;
 
 public:
   void infer(

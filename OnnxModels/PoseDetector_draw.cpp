@@ -302,6 +302,36 @@ static Rgba getHandColor(int idx)
     return Onnx::rgb8(255, 100, 255); // Pinky - magenta
 }
 
+// MHR70 (InstantHMR) joint colours: the body parts in the COCO palette,
+// the feet in a lighter leg colour, each finger of both hands in the hand
+// palette (getHandColor), the wrists in their arm's colour. The MHR hand
+// blocks store each finger tip-first (tip, DIP, PIP, MCP; thumb tip, IP, MCP,
+// CMC), so the finger is (idx - block) / 4.
+static Rgba getMhr70Color(int idx)
+{
+  if(idx <= 4)
+    return Colors::head;
+  if(idx == 5 || idx == 6 || idx == 9 || idx == 10 || idx == 69)
+    return Colors::torso; // shoulders, hips, neck
+  if(idx == 7 || idx == 62 || idx == 63 || idx == 65 || idx == 67)
+    return Colors::left_arm; // elbow, wrist, olecranon, cubital fossa, acromion
+  if(idx == 8 || idx == 41 || idx == 64 || idx == 66 || idx == 68)
+    return Colors::right_arm;
+  if(idx == 11 || idx == 13)
+    return Colors::left_leg;
+  if(idx == 12 || idx == 14)
+    return Colors::right_leg;
+  if(idx >= 15 && idx <= 17)
+    return Onnx::lighter(Colors::left_leg, 120);
+  if(idx >= 18 && idx <= 20)
+    return Onnx::lighter(Colors::right_leg, 120);
+  if(idx >= 21 && idx <= 40)
+    return getHandColor(1 + 4 * ((idx - 21) / 4));
+  if(idx >= 42 && idx <= 61)
+    return getHandColor(1 + 4 * ((idx - 42) / 4));
+  return Colors::torso;
+}
+
 // Get color for BlazeFace keypoints
 static Rgba getBlazeFaceColor(int idx)
 {
@@ -435,6 +465,8 @@ void PoseDetector::drawOnePose(
         return Colors::face;
       case PoseWorkflow::AnimalPose:
         return getAP10KColor(idx);
+      case PoseWorkflow::InstantHMR:
+        return getMhr70Color(idx);
       default:
         return getCOCOColor(idx);
     }
@@ -568,6 +600,34 @@ void PoseDetector::drawOnePose(
       case PoseWorkflow::AnimalPose:
         drawConnections(animalSkeleton(num_kps), num_kps);
         break;
+      case PoseWorkflow::InstantHMR:
+      {
+        // MHR70: body bones coloured by their first joint (getMhr70Color), the
+        // finger chains by finger — mhr70_bones lists 4 bones per finger,
+        // thumb first, right hand then left, after kMhr70BodyBones.
+        const auto bones = Onnx::Skel::nativeEdges(Onnx::Skel::SourceSkeleton::Mhr70);
+        for(int i = 0; i < static_cast<int>(bones.size()); ++i)
+        {
+          const auto& b = bones[i];
+          if(b.a < 0 || b.b < 0 || b.a >= num_kps || b.b >= num_kps)
+            continue;
+          if(kps[b.a].confidence <= 0.f || kps[b.b].confidence <= 0.f)
+            continue;
+          const float conf = std::min(kps[b.a].confidence, kps[b.b].confidence);
+          if(conf < min_conf)
+            continue;
+          const int hb = i - Onnx::Skel::kMhr70BodyBones;
+          const bool hand = hb >= 0;
+          const Rgba base
+              = use_track_color ? track_color
+                : hand ? getHandColor(1 + 4 * ((hb % Onnx::Skel::kMhr70HandBones) / 4))
+                       : getColor(b.a);
+          ov.lineWidth(hand ? 1.f : 2.f);
+          ov.color(Onnx::withAlpha(base, safeAlpha(conf)));
+          ov.line(toPoint(b.a), toPoint(b.b));
+        }
+        break;
+      }
       default:
         drawConnections(skeletonByCount(num_kps), num_kps);
         break;
@@ -626,6 +686,16 @@ void PoseDetector::drawOnePose(
     else if(workflow == PoseWorkflow::MobileFaceNet)
     {
       radius = 2; // Small for 68 face landmarks
+    }
+    else if(workflow == PoseWorkflow::InstantHMR && !m_remap_active)
+    {
+      // Native MHR70 indices only (a remapped layout keeps the default):
+      // body 4, feet 3, finger joints 2 (the 42 hand points would otherwise
+      // blot the hands out), the bone-less olecranon/cubital/acromion 3.
+      if(i >= 21 && i <= 61 && i != 41)
+        radius = 2;
+      else if((i >= 15 && i <= 20) || (i >= 63 && i <= 68))
+        radius = 3;
     }
 
     ov.fillCircle(toPoint(i), static_cast<float>(radius));
@@ -688,6 +758,8 @@ sourceFor(PoseWorkflow wf, int num_kps)
     case PoseWorkflow::ViTPose:
     case PoseWorkflow::YOLOPose:
       return (num_kps == 21) ? S::Hands21 : S::Coco17;
+    case PoseWorkflow::InstantHMR:
+      return S::Mhr70;
     default: return std::nullopt; // BlazeFace/RTMPoseFace/Animal/Box: no remap
   }
 }
@@ -705,18 +777,32 @@ void PoseDetector::setRemapState(PoseWorkflow wf, int num_kps)
 
 void PoseDetector::remapPose(DetectedPose& pose)
 {
-  if(Onnx::Skel::remap<PoseKeypoint>(
+  // `world` shares the keypoints' native joint order, so it goes through the
+  // same table (a per-joint linear combination, as valid for metric xyz as for
+  // screen xy); a world set of another size is left untouched. The swaps rotate
+  // buffers through m_remap_scratch, so steady state reuses capacity.
+  const size_t native = pose.keypoints.size();
+  if(!Onnx::Skel::remap<PoseKeypoint>(
          m_remap_src, m_active_target,
-         std::span<const PoseKeypoint>(
-             pose.keypoints.data(), pose.keypoints.size()),
+         std::span<const PoseKeypoint>(pose.keypoints.data(), native),
          m_remap_scratch))
-    std::swap(pose.keypoints, m_remap_scratch); // reuse old buffer next call
+    return;
+  std::swap(pose.keypoints, m_remap_scratch);
+  if(!pose.world.empty() && pose.world.size() == native
+     && Onnx::Skel::remap<PoseKeypoint>(
+         m_remap_src, m_active_target,
+         std::span<const PoseKeypoint>(pose.world.data(), pose.world.size()),
+         m_remap_scratch))
+    std::swap(pose.world, m_remap_scratch);
 }
 
 void PoseDetector::finalizeSingle(PoseWorkflow wf)
 {
   if(!outputs.detection.value)
     return;
+  // Body mesh from the smoothed parameters, before the remap (Mesh Keypoints
+  // rewrites the native MHR70 joints, which the remap then carries).
+  evaluateSingleMesh(*outputs.detection.value);
   setRemapState(
       wf, static_cast<int>(outputs.detection.value->keypoints.size()));
   if(m_remap_active)
@@ -744,8 +830,8 @@ void PoseDetector::finalizeSingle(PoseWorkflow wf)
     }
   }
 
-  drawSkeleton(*outputs.detection.value, wf);
-  generateGeometryOutput(*outputs.detection.value, wf);
+  drawSkeleton(*outputs.detection.value, wf, m_single_mesh);
+  generateGeometryOutput(*outputs.detection.value, wf, m_single_mesh);
 
   // Record the finished pose so a transient miss next frame can re-emit it
   // (holdOrPassthrough) instead of blanking.
@@ -755,7 +841,8 @@ void PoseDetector::finalizeSingle(PoseWorkflow wf)
   m_had_detection = true;
 }
 
-void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
+void PoseDetector::drawSkeleton(
+    const DetectedPose& pose, PoseWorkflow workflow, int mesh_slot)
 {
   ONNX_PROF_SCOPE(Draw);
   auto& in_tex = inputs.image.texture;
@@ -768,6 +855,8 @@ void PoseDetector::drawSkeleton(const DetectedPose& pose, PoseWorkflow workflow)
   fillCanvas(
       dst, reinterpret_cast<const unsigned char*>(in_tex.bytes), w, h,
       skeleton_only);
+  if(mesh_slot >= 0) // under the skeleton: the ctx overlay draws on top
+    drawMeshes(dst, w, h, std::span<const int>(&mesh_slot, 1));
   {
     Overlay ov(dst, w, h);
     drawOnePose(ov, pose, workflow, w, h);
@@ -788,6 +877,7 @@ void PoseDetector::drawAllSkeletons(PoseWorkflow workflow)
   fillCanvas(
       dst, reinterpret_cast<const unsigned char*>(in_tex.bytes), w, h,
       skeleton_only);
+  drawMeshes(dst, w, h, m_inst_mesh);
   {
     Overlay ov(dst, w, h);
     for(const auto& pose : m_instances)
@@ -796,10 +886,49 @@ void PoseDetector::drawAllSkeletons(PoseWorkflow workflow)
   outputs.image.texture.changed = true;
 }
 
+// Draw Mesh: every listed slot's mesh into one z-buffered layer (people
+// occlude each other), blended once onto the output image under the skeleton.
+// Projection = InstantHMR's camera: f = instantHmrFocal (the frame diagonal,
+// x1.05 for the angular CLIFF form), principal point at the centre, the camera
+// the meshes were placed for. Per-track colour, like
+// the skeleton; an untracked person is drawn in a neutral light blue.
+void PoseDetector::drawMeshes(
+    unsigned char* dst, int w, int h, std::span<const int> slots)
+{
+  if(!inputs.draw_mesh.value || !m_mhr || w <= 0 || h <= 0)
+    return;
+  bool any = false;
+  for(const int s : slots)
+    any = any
+          || (s >= 0 && s < static_cast<int>(m_mesh_slots.size())
+              && m_mesh_slots[s].has_verts);
+  if(!any)
+    return;
+  m_mesh_raster.begin(w, h);
+  const float f = instantHmrFocal(w, h, m_hmr_cliff_focal);
+  for(const int s : slots)
+  {
+    if(s < 0 || s >= static_cast<int>(m_mesh_slots.size()))
+      continue;
+    const auto& ms = m_mesh_slots[s];
+    if(!ms.has_verts)
+      continue;
+    const Rgba c = ms.track_id >= 0 ? getTrackColor(ms.track_id)
+                                    : Onnx::rgb8(150, 190, 255);
+    const uint8_t rgb[3]
+        = {uint8_t(std::clamp(c.r, 0.f, 1.f) * 255.f),
+           uint8_t(std::clamp(c.g, 0.f, 1.f) * 255.f),
+           uint8_t(std::clamp(c.b, 0.f, 1.f) * 255.f)};
+    m_mesh_raster.draw(ms.verts, m_mhr->faces(), f, 0.5f * w, 0.5f * h, rgb);
+  }
+  m_mesh_raster.composite(dst, w * 4, 0.6f);
+}
+
 // Append one pose's flattened geometry (current Data Format) to `out`. Does NOT
 // clear — the caller owns the buffer (single-pose clears; multi accumulates).
 void PoseDetector::appendGeometry(
-    std::vector<float>& out, const DetectedPose& pose, PoseWorkflow workflow)
+    std::vector<float>& out, const DetectedPose& pose, PoseWorkflow workflow,
+    int mesh_slot)
 {
   const auto& kps = pose.keypoints;
   const float min_conf = inputs.min_confidence;
@@ -824,6 +953,57 @@ void PoseDetector::appendGeometry(
       out.push_back(kp.z);
       out.push_back(kp.confidence);
     }
+    return;
+  }
+
+  // The parametric body record, like Flattened, is not a keypoint layout: it
+  // must not fall into the box fallback below (a box is not body params). A
+  // model without body params emits nothing, so the Poses Geometry stride is
+  // just translation + params of the models that have them.
+  // The 3 leading floats are the body model's RIG ORIGIN in camera space
+  // (translation - rig_offset; InstantHMR: its cam_trans), not `translation`
+  // (the pelvis): a consumer evaluating the rig-local mesh from body_params
+  // places it at mesh + these 3, exactly like the node's own mesh. Without a
+  // rig_offset they are the translation as is (zero if absent).
+  if(format == KeypointOutputFormat::BodyParams)
+  {
+    if(pose.body_params.empty())
+      return;
+    out.reserve(out.size() + 3 + pose.body_params.size());
+    const bool has_t = pose.translation.size() >= 3;
+    const bool has_off = has_t && pose.rig_offset.size() >= 3;
+    for(int i = 0; i < 3; ++i)
+      out.push_back(
+          has_t ? pose.translation[i] - (has_off ? pose.rig_offset[i] : 0.f)
+                : 0.f);
+    out.insert(out.end(), pose.body_params.begin(), pose.body_params.end());
+    return;
+  }
+
+  // The body mesh, like BodyParams, is not a keypoint layout either. No mesh
+  // for this pose (no Body Model, a model without body parameters, a failed
+  // evaluation) emits nothing, so every emitted payload has the file's fixed
+  // length and the Poses Geometry stride is that length. The per-vertex work
+  // runs in the -O3 MeshOps kernels; the buffer grows once, then is reused.
+  if(isMeshFormat(format))
+  {
+    if(mesh_slot < 0 || mesh_slot >= static_cast<int>(m_mesh_slots.size())
+       || !m_mhr)
+      return;
+    const auto& ms = m_mesh_slots[mesh_slot];
+    if(!ms.has_verts)
+      return;
+    const bool gl = inputs.mesh_space.value == MeshSpace::OpenGL;
+    const auto faces = m_mhr->faces();
+    const size_t base = out.size();
+    if(format == KeypointOutputFormat::MeshVertices)
+    {
+      out.resize(base + ms.verts.size());
+      Onnx::MeshOps::writeVertices(ms.verts, gl, out.data() + base);
+      return;
+    }
+    out.resize(base + faces.size() * 3);
+    Onnx::MeshOps::writeTriangles(ms.verts, faces, gl, out.data() + base);
     return;
   }
 
@@ -900,19 +1080,31 @@ void PoseDetector::appendGeometry(
     }
 
     case KeypointOutputFormat::WorldXYZArray:
+    case KeypointOutputFormat::CameraXYZArray:
     {
       // World-space xyz (meters, hip-origin) when the model provides it
       // (BlazePose family); screen xyz otherwise so the output stays usable
-      // with any landmark model.
+      // with any landmark model. CameraXYZArray adds the model's camera
+      // translation (camera-space metres); with no translation it IS
+      // WorldXYZArray, so the fallback chain is camera -> world -> screen.
+      // Same Min Confidence filter (and so the same lengths) in every case.
       const auto& src_kps = pose.world.empty() ? kps : pose.world;
-      out.reserve(src_kps.size() * 3);
+      float tx = 0.f, ty = 0.f, tz = 0.f;
+      if(format == KeypointOutputFormat::CameraXYZArray && !pose.world.empty()
+         && pose.translation.size() >= 3)
+      {
+        tx = pose.translation[0];
+        ty = pose.translation[1];
+        tz = pose.translation[2];
+      }
+      out.reserve(out.size() + src_kps.size() * 3);
       for (const auto& kp : src_kps)
       {
         if (kp.confidence >= min_conf)
         {
-          out.push_back(kp.x);
-          out.push_back(kp.y);
-          out.push_back(kp.z);
+          out.push_back(kp.x + tx);
+          out.push_back(kp.y + ty);
+          out.push_back(kp.z + tz);
         }
       }
       break;
@@ -1038,6 +1230,17 @@ void PoseDetector::appendGeometry(
           break;
         }
 
+        case PoseWorkflow::InstantHMR:
+        {
+          // Native MHR70 bones: body, feet, then every finger chain.
+          const auto bones
+              = Onnx::Skel::nativeEdges(Onnx::Skel::SourceSkeleton::Mhr70);
+          out.reserve(out.size() + bones.size() * 6);
+          for(const auto& b : bones)
+            addLine(b.a, b.b);
+          break;
+        }
+
         case PoseWorkflow::BoxDetection:
           // Unreachable: a box-only detection has no keypoints, so it took the
           // box branch above. A box detector WITH keypoints has no bone table.
@@ -1055,16 +1258,19 @@ void PoseDetector::appendGeometry(
     case KeypointOutputFormat::BoxXYWH:
     case KeypointOutputFormat::BoxX1Y1X2Y2:
     case KeypointOutputFormat::Flattened:
+    case KeypointOutputFormat::BodyParams:
+    case KeypointOutputFormat::MeshTriangles:
+    case KeypointOutputFormat::MeshVertices:
       break; // handled above, before the keypoint early-out
   }
 }
 
 void PoseDetector::generateGeometryOutput(
-    const DetectedPose& pose, PoseWorkflow workflow)
+    const DetectedPose& pose, PoseWorkflow workflow, int mesh_slot)
 {
   auto& out = outputs.geometry.value;
   out.clear();
-  appendGeometry(out, pose, workflow);
+  appendGeometry(out, pose, workflow, mesh_slot);
 }
 
 } // namespace OnnxModels

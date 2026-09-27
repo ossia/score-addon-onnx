@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <span>
 #include <vector>
 
 // Multi-instance pose tracker — assigns a persistent track_id to each detected
@@ -58,6 +59,18 @@ struct Detection
   float score;
   std::vector<Keypoint> keypoints;  // may be empty -> OKS skipped for this det
   std::vector<float> embedding;     // L2-normalized ReID feature, or empty
+  // Optional 3D payload, opaque to association: carried per track id (so a
+  // coasted frame can re-emit it), One-Euro smoothed per id when smoothing is
+  // on. Each may be empty (every 2D model). Units are the caller's; the
+  // PoseDetector passes metres (world, translation) and the model's own units
+  // (params, radians for the angle entries).
+  std::vector<Keypoint> world;     // metric joints (x,y,z,score), native order
+  std::vector<float> translation;  // camera-space origin of `world` (3)
+  std::vector<float> params;       // parametric body model params
+  // Rig-local position of world's origin in the body model's frame (3): the
+  // body model's rig origin sits at translation - rig_offset. Smoothed with
+  // the world joints' tuning (it comes from the same metric joint head).
+  std::vector<float> rig_offset;
 };
 
 // Association motion gate: how to reject an implausible single-frame jump.
@@ -85,6 +98,19 @@ struct Config
   bool smooth = true;
   float smooth_min_cutoff = 1.0f;
   float smooth_beta = 0.3f;
+  // 3D payload smoothing (Detection::world / translation / params), in REAL
+  // units: cutoffs in Hz, beta per unit/second, stepped at smooth_dt seconds
+  // (see OneEuro.hpp smoothParams). Defaults = upstream InstantHMR's
+  // joints_3d_local / cam_trans settings at 30 fps.
+  float smooth_dt = kNominalFrameDt;
+  float world_min_cutoff = 1.0f, world_beta = 4.0f;
+  float trans_min_cutoff = 0.6f, trans_beta = 2.0f;
+  float params_min_cutoff = 1.0f, params_beta = 0.0f;
+  // One Onnx::ParamKind per `params` entry: an angle (radians, filtered with
+  // unwrapping), a static identity parameter, or linear. Empty = all linear. Caller-owned storage (a span keeps Config
+  // trivially copyable: configure() runs every frame and must not allocate);
+  // it must outlive the next update().
+  std::span<const std::uint8_t> params_angle_mask;
   // Appearance ReID (StrongSORT / Deep-OC-SORT style)
   bool use_reid = false;    // blend appearance cosine into the cost
   float w_emb = 0.25f;      // appearance weight
@@ -291,6 +317,17 @@ struct Tracklet
   std::vector<Keypoint> kpts;        // last observed, motion-compensated
   std::vector<Keypoint> kpts_smooth; // One-Euro output (owned by this id)
   PoseSmoother smoother;             // 2 filters per keypoint (x,y)
+  // Last 3D payload (Detection::world/translation/params), smoothed when
+  // Config::smooth (raw copy otherwise) — what a coasted frame re-emits. The
+  // assignments reuse capacity, so a live track allocates nothing per frame.
+  std::vector<Keypoint> world_smooth;
+  std::vector<float> translation_smooth;
+  std::vector<float> params_smooth;
+  std::vector<float> rig_offset_smooth;
+  PoseSmoother world_smoother;       // 3 filters per joint (x,y,z)
+  PoseSmoother translation_smoother; // 1 per component
+  PoseSmoother params_smoother;      // 1 per param
+  PoseSmoother rig_offset_smoother;  // 1 per component
   std::vector<float> embedding;      // EMA of L2-normalized ReID features
   // Multi-shot appearance reservoir frozen into the gallery on death: slot 0 is
   // the peak-confidence view, the rest are interval samples (round-robin).
@@ -581,6 +618,66 @@ private:
     return c;
   }
 
+  // Carry (and, with Config::smooth, One-Euro) the detection's 3D payload into
+  // the track. A detection WITHOUT a given payload keeps the track's previous
+  // one and its filter state: a model that emits 3D only on some frames (e.g.
+  // a non-finite translation dropped by the decoder) still coasts on the last
+  // good value instead of blinking to nothing. A changed size resets that
+  // filter (PoseSmoother::ensure) — a different model, not the same signal.
+  void updatePayload(Tracklet& t, const Detection& d)
+  {
+    const float dt = _cfg.smooth_dt > 0.f ? _cfg.smooth_dt : kNominalFrameDt;
+    if(!d.world.empty())
+    {
+      t.world_smooth = d.world;
+      if(_cfg.smooth)
+      {
+        t.world_smoother.configure(_cfg.world_min_cutoff, _cfg.world_beta);
+        smoothXYZ(t.world_smoother, std::span<Keypoint>(t.world_smooth), dt);
+      }
+      else
+        t.world_smoother.reset(); // re-enabling starts clean, not from stale state
+    }
+    if(!d.translation.empty())
+    {
+      t.translation_smooth = d.translation;
+      if(_cfg.smooth)
+      {
+        t.translation_smoother.configure(_cfg.trans_min_cutoff, _cfg.trans_beta);
+        smoothParams(
+            t.translation_smoother, std::span<float>(t.translation_smooth), {},
+            dt);
+      }
+      else
+        t.translation_smoother.reset();
+    }
+    if(!d.params.empty())
+    {
+      t.params_smooth = d.params;
+      if(_cfg.smooth)
+      {
+        t.params_smoother.configure(_cfg.params_min_cutoff, _cfg.params_beta);
+        smoothParams(
+            t.params_smoother, std::span<float>(t.params_smooth),
+            _cfg.params_angle_mask, dt);
+      }
+      else
+        t.params_smoother.reset();
+    }
+    if(!d.rig_offset.empty())
+    {
+      t.rig_offset_smooth = d.rig_offset;
+      if(_cfg.smooth)
+      {
+        t.rig_offset_smoother.configure(_cfg.world_min_cutoff, _cfg.world_beta);
+        smoothParams(
+            t.rig_offset_smoother, std::span<float>(t.rig_offset_smooth), {}, dt);
+      }
+      else
+        t.rig_offset_smoother.reset();
+    }
+  }
+
   // Greedy bipartite matching over a track list and detection list.
   void associate(
       const std::vector<int>& tk, const std::vector<int>& dk,
@@ -603,9 +700,16 @@ private:
           pairs.push_back({c, ti, di});
       }
     }
-    std::stable_sort(
-        pairs.begin(), pairs.end(),
-        [](const Pair& a, const Pair& b) { return a.c < b.c; });
+    // std::sort with an explicit (cost, track, detection) tie-break instead of
+    // std::stable_sort: stable_sort grabs a temporary buffer on every call (a
+    // heap allocation per frame even for one pair). The candidates were pushed
+    // in ascending (ti, di) order — tk and dk are ascending index lists — so
+    // this tie-break reproduces the stable order exactly.
+    std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
+      if(a.c != b.c)
+        return a.c < b.c;
+      return a.ti != b.ti ? a.ti < b.ti : a.di < b.di;
+    });
     for(const auto& p : pairs)
     {
       if(t_match[p.ti] >= 0 || d_used[p.di])
@@ -655,6 +759,8 @@ private:
     {
       t.kpts_smooth = d.keypoints;
     }
+
+    updatePayload(t, d);
 
     // EMA the per-track appearance embedding (kept L2-normalized).
     if(!d.embedding.empty())
@@ -755,6 +861,7 @@ private:
     _kf.initiate(boxToXyah(d.box), t.mean, t.cov);
     t.kpts = d.keypoints;
     t.kpts_smooth = d.keypoints;
+    updatePayload(t, d); // fresh filters: the first sample passes through
     t.embedding = d.embedding;
     t.score = d.score;
     t.hits = 1;
