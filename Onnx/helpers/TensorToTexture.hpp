@@ -59,12 +59,11 @@ inline OutSpec makeOutSpec(const std::vector<int64_t>& shape)
 
 // --- defined in TensorToTexture.cpp (compiled -O3) ----
 
-// Convert `count` elements of arbitrary `e` to float. Returns `data` cast in
-// place when e == Float (zero copy); otherwise fills `scratch` and returns its
-// data(). fp16/bf16 are unpacked in software.
+// `count` elements of type `e` as float: `data` itself for float32 (no copy),
+// else converted into `scratch` (which only grows). An element type of unknown
+// size (fp8, int4, complex, string) reads as zeros rather than past the buffer.
 const float* toFloat(
-    const void* data, int64_t count, TensorElemType e,
-    std::vector<float>& scratch);
+    const void* data, int64_t count, TensorElemType e, std::vector<float>& scratch);
 
 // RGB(A) tensor -> RGBA8 destination (4 bytes/pixel, alpha forced 255 unless the
 // tensor has a 4th channel). channels==1 is broadcast to gray RGB.

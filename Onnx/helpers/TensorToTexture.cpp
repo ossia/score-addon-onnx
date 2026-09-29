@@ -7,49 +7,6 @@ namespace Onnx
 {
 namespace
 {
-// IEEE half (binary16) -> float32. Branchless-ish; handles subnormals/inf/nan.
-inline float halfToFloat(uint16_t h) noexcept
-{
-  const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-  const uint32_t exp = (h >> 10) & 0x1Fu;
-  const uint32_t mant = h & 0x3FFu;
-  uint32_t bits;
-  if(exp == 0)
-  {
-    if(mant == 0)
-      bits = sign; // +/-0
-    else
-    {
-      // subnormal: normalize
-      int e = -1;
-      uint32_t m = mant;
-      do { m <<= 1; ++e; } while((m & 0x400u) == 0);
-      m &= 0x3FFu;
-      bits = sign | ((uint32_t)(127 - 15 - e) << 23) | (m << 13);
-    }
-  }
-  else if(exp == 0x1Fu)
-  {
-    bits = sign | 0x7F800000u | (mant << 13); // inf / nan
-  }
-  else
-  {
-    bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-  }
-  float f;
-  std::memcpy(&f, &bits, sizeof(f));
-  return f;
-}
-
-template <typename T>
-void copyAs(const void* src, int64_t n, std::vector<float>& out)
-{
-  const T* p = static_cast<const T*>(src);
-  out.resize(n);
-  for(int64_t i = 0; i < n; ++i)
-    out[i] = static_cast<float>(p[i]);
-}
-
 // Compile-time per-pixel value -> [0,255] mapping.
 template <WriteMode M>
 inline float mapPixel(float v, float mn, float inv_range) noexcept
@@ -225,49 +182,40 @@ void dispatchMode(WriteMode m, Impl&& impl)
 const float* toFloat(
     const void* data, int64_t count, TensorElemType e, std::vector<float>& scratch)
 {
+  if(e == TensorElemType::Float)
+    return static_cast<const float*>(data);
+  if(count <= 0)
+    return scratch.data();
+  if((int64_t)scratch.size() < count)
+    scratch.resize((std::size_t)count);
+  float* o = scratch.data();
+  auto convert = [&]<typename T>(auto&& f) {
+    const T* p = static_cast<const T*>(data);
+    for(int64_t i = 0; i < count; ++i)
+      o[i] = f(p[i]);
+  };
+  auto cast = [](auto v) { return static_cast<float>(v); };
   switch(e)
   {
-    case TensorElemType::Float:
-      return static_cast<const float*>(data);
-    case TensorElemType::Float16:
-    {
-      const uint16_t* p = static_cast<const uint16_t*>(data);
-      scratch.resize(count);
-      for(int64_t i = 0; i < count; ++i)
-        scratch[i] = halfToFloat(p[i]);
-      return scratch.data();
-    }
-    case TensorElemType::BFloat16:
-    {
-      const uint16_t* p = static_cast<const uint16_t*>(data);
-      scratch.resize(count);
-      for(int64_t i = 0; i < count; ++i)
-      {
-        const uint32_t bits = (uint32_t)p[i] << 16;
-        float f;
-        std::memcpy(&f, &bits, sizeof(f));
-        scratch[i] = f;
-      }
-      return scratch.data();
-    }
-    case TensorElemType::Double:  copyAs<double>(data, count, scratch); return scratch.data();
-    case TensorElemType::Uint8:   copyAs<uint8_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Int8:    copyAs<int8_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Uint16:  copyAs<uint16_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Int16:   copyAs<int16_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Uint32:  copyAs<uint32_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Int32:   copyAs<int32_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Uint64:  copyAs<uint64_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Int64:   copyAs<int64_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Bool:    copyAs<uint8_t>(data, count, scratch); return scratch.data();
-    case TensorElemType::Unknown:
+    case TensorElemType::Float16:  convert.template operator()<uint16_t>(halfToFloat); break;
+    case TensorElemType::BFloat16: convert.template operator()<uint16_t>(bfloat16ToFloat); break;
+    case TensorElemType::Double:   convert.template operator()<double>(cast); break;
+    case TensorElemType::Uint8:    convert.template operator()<uint8_t>(cast); break;
+    case TensorElemType::Int8:     convert.template operator()<int8_t>(cast); break;
+    case TensorElemType::Uint16:   convert.template operator()<uint16_t>(cast); break;
+    case TensorElemType::Int16:    convert.template operator()<int16_t>(cast); break;
+    case TensorElemType::Uint32:   convert.template operator()<uint32_t>(cast); break;
+    case TensorElemType::Int32:    convert.template operator()<int32_t>(cast); break;
+    case TensorElemType::Uint64:   convert.template operator()<uint64_t>(cast); break;
+    case TensorElemType::Int64:    convert.template operator()<int64_t>(cast); break;
+    case TensorElemType::Bool:
+      convert.template operator()<uint8_t>([](uint8_t b) { return b ? 1.f : 0.f; });
+      break;
     default:
-      // Unknown element types (fp8 / int4 / complex / string) have an element
-      // size we don't know — reinterpreting `count` of them as float32 would
-      // read up to 8x past the buffer. Emit a defined zero plane instead.
-      scratch.assign(count > 0 ? (std::size_t)count : 0u, 0.f);
-      return scratch.data();
+      std::fill_n(o, count, 0.f);
+      break;
   }
+  return o;
 }
 
 void writeRgb(const float* data, const OutSpec& s, WriteMode m, uint8_t* dst)

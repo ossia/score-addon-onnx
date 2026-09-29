@@ -1,11 +1,12 @@
 #pragma once
 // Modality-agnostic model classifier: the shared keystone for the specialized
-// ONNX node set (see docs/onnx-node-set-PLAN.md). Generalises classifyImage to
+// ONNX node set. Generalises classifyImage to
 // audio / video / sequence / geometry / generative by tagging every input and
 // output port with a PortArchetype (from shape + name + dtype), detecting
 // recurrent statefulness, and suggesting which specialized node should host the
 // model. Dependency-free (reuses Onnx::detail::nameContains); standalone-testable.
 #include <Onnx/helpers/ModelRole.hpp>  // detail::nameContains
+#include <Onnx/helpers/ModelSpec.hpp>
 #include <Onnx/helpers/TensorType.hpp> // TensorElemType
 
 #include <cctype>
@@ -55,6 +56,18 @@ struct ArchIO
   std::vector<Port> inputs, outputs;
 };
 
+inline ArchIO toArchIO(const ModelSpec& s)
+{
+  ArchIO io;
+  io.inputs.reserve(s.inputs.size());
+  io.outputs.reserve(s.outputs.size());
+  for(const auto& p : s.inputs)
+    io.inputs.push_back({p.name, p.shape, p.elem_type});
+  for(const auto& p : s.outputs)
+    io.outputs.push_back({p.name, p.shape, p.elem_type});
+  return io;
+}
+
 struct ArchPort
 {
   std::string name;
@@ -79,14 +92,6 @@ namespace detail
 {
 inline bool isChanDim(int64_t d) noexcept { return d == 1 || d == 3 || d == 4; }
 
-inline int64_t flatPos(const std::vector<int64_t>& s)
-{ // product of positive dims (treat dynamic as 1)
-  int64_t p = 1;
-  for(auto d : s)
-    if(d > 0)
-      p *= d;
-  return p;
-}
 inline bool isIntType(TensorElemType t) noexcept
 {
   switch(t)
@@ -157,7 +162,7 @@ inline PortArchetype classifyPort(
         dynamic = true;
     // rank-2 [1,-1] is a dynamic token sequence; a rank-1 dynamic [-1] is a
     // batch-length scalar list, not tokens.
-    if(flatPos(s) > 1 || (dynamic && rank == 2))
+    if(flatSize(s) > 1 || (dynamic && rank == 2))
       return PortArchetype::TokenSeq;
   }
 
@@ -311,7 +316,7 @@ inline ModelArchetype classifyModel(const ArchIO& io)
     // image input is an image-pair (flow/inpaint/stereo), never recurrent state.
     if(i == 0 || in.arch == PortArchetype::Image)
       continue;
-    if(detail::flatPos(in.shape) <= 1)
+    if(flatSize(in.shape) <= 1)
       continue;
     for(const auto& out : m.outputs)
     {

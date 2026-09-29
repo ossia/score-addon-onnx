@@ -310,6 +310,27 @@ inline TensorElemType fromOrtElementType(ONNXTensorElementDataType t) noexcept
   }
 }
 
+inline ONNXTensorElementDataType toOrtElementType(TensorElemType t) noexcept
+{
+  switch(t)
+  {
+    case TensorElemType::Float16:  return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+    case TensorElemType::BFloat16: return ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
+    case TensorElemType::Double:   return ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE;
+    case TensorElemType::Uint8:    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+    case TensorElemType::Int8:     return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
+    case TensorElemType::Uint16:   return ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16;
+    case TensorElemType::Int16:    return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16;
+    case TensorElemType::Uint32:   return ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32;
+    case TensorElemType::Int32:    return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
+    case TensorElemType::Uint64:   return ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64;
+    case TensorElemType::Int64:    return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+    case TensorElemType::Bool:     return ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;
+    case TensorElemType::Float:
+    default:                       return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+  }
+}
+
 struct OnnxRunContext
 {
   Options opts;
@@ -450,20 +471,6 @@ private:
 
       spec.output_names.push_back(std::move(name));
     }
-    spec.input_names_char.resize(spec.input_names.size());
-    spec.output_names_char.resize(spec.output_names.size());
-    std::transform(
-        std::begin(spec.input_names),
-        std::end(spec.input_names),
-        std::begin(spec.input_names_char),
-        [&](const std::string& str) { return str.c_str(); });
-
-    std::transform(
-        std::begin(spec.output_names),
-        std::end(spec.output_names),
-        std::begin(spec.output_names_char),
-        [&](const std::string& str) { return str.c_str(); });
-
     spec.rebuildCharPointers();
     return spec;
   }
@@ -496,9 +503,25 @@ public:
   }
 };
 
-inline ModelSpec readModelSpec(std::string_view model_path)
+// The I/O of a model given as raw bytes (not a path).
+inline ModelSpec readModelSpec(std::string_view model_bytes)
 {
-  OnnxRunContext ctx{model_path};
+  OnnxRunContext ctx{model_bytes};
   return ctx.readModelSpec();
+}
+
+// A session for the model file at `path`, read on the calling thread (a
+// worker: the nodes' file ports may have unmapped the file by then).
+inline std::shared_ptr<OnnxRunContext>
+loadRunContext(const std::string& path, Options o = {})
+{
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if(!f)
+    throw std::runtime_error("cannot read the file");
+  std::string bytes((std::size_t)f.tellg(), '\0');
+  f.seekg(0);
+  if(!f.read(bytes.data(), (std::streamsize)bytes.size()))
+    throw std::runtime_error("cannot read the file");
+  return std::make_shared<OnnxRunContext>(bytes, path, std::move(o));
 }
 }

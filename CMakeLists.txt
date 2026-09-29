@@ -129,8 +129,8 @@ if(COMMAND score_common_setup)
 endif()
 
 avnd_addon_init(NAME score_addon_onnx_models)
-# Its .cpp files each define the same file-local helpers (floatToHalf, snapDim,
-# ...), which collide when a unity build merges them into one translation unit.
+# The generated <object>_avnd.cpp files cannot share a translation unit
+# (score::custom_factories is specialized after its first instantiation).
 set_target_properties(score_addon_onnx_models PROPERTIES UNITY_BUILD OFF)
 
 # C++ standard. Avendish sets cxx_std_23 on its per-object targets, but its
@@ -292,18 +292,17 @@ avnd_addon_object(
   SOURCES
     OnnxModels/DepthAnything2.hpp
     OnnxModels/DepthAnything2.cpp)
-  
-  
+
 avnd_score_plugin_add(
   BASE_TARGET
     score_addon_onnx_models
   SOURCES
-  OnnxModels/ImageProcessor.hpp
-  OnnxModels/ImageProcessor.cpp
+    OnnxModels/ImageProcessor.hpp
+    OnnxModels/ImageProcessor.cpp
   TARGET
-  image_processor
+    image_processor
   MAIN_CLASS
-  ImageProcessor
+    ImageProcessor
   NAMESPACE
     OnnxModels
 )
@@ -697,6 +696,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     tests/test_think_filter.cpp
     tests/test_instanthmr_tables.cpp
     tests/test_mhr_model.cpp
+    tests/test_tensor_type_conversions.cpp
     # real object sources under test:
     RapidlibModels/Classifier.cpp
     RapidlibModels/Regressor.cpp
