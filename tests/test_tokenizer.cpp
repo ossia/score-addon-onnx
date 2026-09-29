@@ -48,11 +48,15 @@ struct Harness
       runJob(node, std::move(job));
     }
   }
+  // Two ticks: the first one may only load the tokenizer.
   std::vector<int> tokenize(const std::string& text)
   {
     node.inputs.text.value = text;
-    node();
-    complete();
+    for(int i = 0; i < 2; i++)
+    {
+      node();
+      complete();
+    }
     return node.outputs.tokens.value;
   }
 };
@@ -110,11 +114,17 @@ TEST_CASE("Tokenizer node: text in, ids out, on the worker", "[onnx][tokenizer]"
   h.node.inputs.tokenizer.file.filename = bpeMerged;
   h.node.inputs.special.value = false;
 
-  // Nothing runs on the processing thread: the ids come from the worker.
+  // Nothing runs on the processing thread: the tokenizer loads, and the ids
+  // come, from the worker.
   h.node.inputs.text.value = "hello world";
   h.node();
   CHECK(h.node.outputs.tokens.value.empty());
   REQUIRE(h.jobs.size() == 1);
+  CHECK(isLoadJob(*h.jobs.front()));
+  h.complete();
+  h.node();
+  REQUIRE(h.jobs.size() == 1);
+  CHECK(h.jobs.front()->text == "hello world");
   h.complete();
   CHECK(h.node.outputs.tokens.value == helloWorld);
 
@@ -148,13 +158,14 @@ TEST_CASE("Tokenizer node: another file replaces the tokenizer", "[onnx][tokeniz
   auto job = std::move(h.jobs.front());
   h.jobs.pop_front();
   runJob(h.node, std::move(job));
-  CHECK(h.node.outputs.tokens.value == helloWorldBytes);
   REQUIRE(h.jobs.size() == 1);
-  CHECK(h.jobs.front()->path.empty());
-  REQUIRE(h.jobs.front()->dispose);
-  CHECK(h.jobs.front()->dispose->path() == bpeMerged);
-  CHECK(h.jobs.front()->dispose.use_count() == 1);
+  REQUIRE(isDisposeJob(*h.jobs.front()));
+  CHECK(h.jobs.front()->load.model->path() == bpeMerged);
+  CHECK(h.jobs.front()->load.model.use_count() == 1);
   h.complete();
+  h.node();
+  h.complete();
+  CHECK(h.node.outputs.tokens.value == helloWorldBytes);
 }
 
 TEST_CASE("Tokenizer node: a file it cannot use gives no ids", "[onnx][tokenizer]")
@@ -162,7 +173,8 @@ TEST_CASE("Tokenizer node: a file it cannot use gives no ids", "[onnx][tokenizer
   Harness h;
   h.node.inputs.tokenizer.file.filename = SCORE_ONNX_TEST_DATA_DIR "/audio/make_fixtures.py";
   CHECK(h.tokenize("hello").empty());
-  // Not retried until an input changes.
+  // Not retried until the file changes.
+  h.node.inputs.text.value = "hello world";
   h.node();
   CHECK(h.jobs.empty());
 }

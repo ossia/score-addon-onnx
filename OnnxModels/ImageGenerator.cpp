@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 
 namespace OnnxModels
 {
@@ -218,41 +219,49 @@ bool ImageGenerator::chainCompatible(
          || (synth_in.size() == 3 && synth_in[1] > 1 && synth_in[2] == w);
 }
 
-void ImageGenerator::reloadModel()
+namespace
 {
-  ++gen;
-  ctx = std::make_shared<Onnx::OnnxRunContext>(
-      inputs.model.file.bytes, inputs.model.file.filename);
-  spec = ctx->readModelSpec();
-  lastModelPath = inputs.model.file.filename;
-
-  if(!inputs.mapping_model.file.filename.empty()
-     && !inputs.mapping_model.file.bytes.empty())
+// Worker side of a change of files: the sessions, read from the files (the
+// ports' mappings may be gone by now), and what z is built from.
+std::shared_ptr<const GenModel> makeGenModel(const GenFiles& files)
+{
+  auto m = std::make_shared<GenModel>();
+  m->ctx = Onnx::loadRunContext(files.model.path);
+  m->spec = m->ctx->readModelSpec();
+  if(!files.mapping.path.empty())
   {
-    map_ctx
-        = std::make_shared<Onnx::OnnxRunContext>(
-            inputs.mapping_model.file.bytes, inputs.mapping_model.file.filename);
-    map_spec = map_ctx->readModelSpec();
+    try
+    {
+      m->map_ctx = Onnx::loadRunContext(files.mapping.path);
+    }
+    catch(const std::exception& e)
+    {
+      throw std::runtime_error(files.mapping.path + ": " + e.what());
+    }
+    m->map_spec = m->map_ctx->readModelSpec();
   }
-  else
-  {
-    map_ctx.reset();
-    map_spec = {};
-  }
-  lastMappingPath = inputs.mapping_model.file.filename;
 
   // The latent size we build z from is the FIRST stage's first-input flat size:
   // the mapping net when present, else the synthesis net.
-  const Onnx::ModelSpec& first = map_ctx ? map_spec : spec;
-  latent_dim
+  const Onnx::ModelSpec& first = m->map_ctx ? m->map_spec : m->spec;
+  m->latent_dim
       = first.inputs.empty() ? 0 : (int)flatNonBatch(first.inputs[0].shape);
 
   const int owned[]{0};
-  synth_aux = Onnx::planAuxInputs(spec.inputs, owned, {.seeded_noise = true});
-  map_aux = map_ctx ? Onnx::planAuxInputs(map_spec.inputs, owned, {.seeded_noise = true})
-                    : std::vector<Onnx::AuxPlan>{};
+  m->synth_aux = Onnx::planAuxInputs(m->spec.inputs, owned, {.seeded_noise = true});
+  if(m->map_ctx)
+    m->map_aux
+        = Onnx::planAuxInputs(m->map_spec.inputs, owned, {.seeded_noise = true});
+  return m;
+}
+}
 
-  // Invalidate the cached latent so the next frame regenerates.
+// New files: a job of the previous chain brings nothing back, and the next
+// frame regenerates with an Auto mapping of its own.
+void ImageGenerator::modelInstalled()
+{
+  failures.succeeded();
+  ++gen;
   produced = false;
   autoMode.reset();
 }
@@ -267,38 +276,24 @@ try
   if(inputs.model.file.bytes.empty())
     return;
 
-  // (Re)load on either model port changing. A failure is reported once and
-  // the node waits for another file on either port (it cannot tell which
-  // one is at fault, so it marks neither invalid).
-  if(lastModelPath != inputs.model.file.filename
-     || lastMappingPath != inputs.mapping_model.file.filename || (!ctx && !loadFailed))
-  {
-    try
-    {
-      reloadModel();
-      loadFailed = false;
-      failures.succeeded();
-    }
-    catch(const std::exception& e)
-    {
-      lastModelPath = inputs.model.file.filename;
-      lastMappingPath = inputs.mapping_model.file.filename;
-      ctx.reset();
-      map_ctx.reset();
-      spec = {};
-      loadFailed = true;
-      failures.failed(
-          name(), inputs.model.file.filename,
-          std::string("cannot load the model: ") + e.what());
-      return;
-    }
-  }
-  if(!ctx)
+  // New files load on the worker; the running chain, if any, keeps running
+  // until they arrive. Files that fail are not loaded again until another
+  // file is picked on either port (which one is at fault is unknown).
+  const bool mapped = !inputs.mapping_model.file.bytes.empty();
+  if(const auto& r = models.requested();
+     !r.model.is(inputs.model)
+     || (mapped ? !r.mapping.is(inputs.mapping_model) : !r.mapping.path.empty()))
+    models.request(
+        worker, GenFiles{
+                    ModelFile::of(inputs.model),
+                    mapped ? ModelFile::of(inputs.mapping_model) : ModelFile{}});
+  if(!models.model())
     return;
+  const GenModel& m = *models.model();
 
-  if(spec.inputs.empty() || spec.outputs.empty())
+  if(m.spec.inputs.empty() || m.spec.outputs.empty())
     return;
-  if(latent_dim <= 0)
+  if(m.latent_dim <= 0)
     return;
   if(!failures.ready())
     return; // the last frames failed the same way: backing off
@@ -319,6 +314,12 @@ void ImageGenerator::runGenerate()
 {
   if(inferenceInProgress)
     return; // a generation is in flight; latest-wins, drop this frame
+
+  const GenModel& m = *models.model();
+  const auto& spec = m.spec;
+  const auto& map_spec = m.map_spec;
+  const auto& map_ctx = m.map_ctx;
+  const int latent_dim = m.latent_dim;
 
   // Build z (seed + user overlay + scale). param1/param2 overlay the tail of the
   // latent generically (truncation psi / class-label style knobs) when there is
@@ -362,7 +363,7 @@ void ImageGenerator::runGenerate()
   // Pooled job: lock-free acquire; recycled vectors keep their capacity so
   // the assignments below don't allocate in steady state.
   auto job = JobPool<GenJob>::instance().acquire();
-  job->synth_ctx = ctx;
+  job->synth_ctx = m.ctx;
   job->map_ctx = map_ctx;
   job->z.assign(z_vector.begin(), z_vector.end());
   job->z_shape = std::move(z_shape);
@@ -372,8 +373,8 @@ void ImageGenerator::runGenerate()
   job->output_index = 0;
   job->wm = autoMode.value_or(resolveWriteMode(inputs.output_mode.value));
   job->pick_auto = inputs.output_mode.value == GenOutputMode::Auto && !autoMode;
-  job->synth_aux = synth_aux;
-  job->map_aux = map_aux;
+  job->synth_aux = m.synth_aux;
+  job->map_aux = m.map_aux;
   job->seed = (uint32_t)inputs.seed.value;
   job->scale = inputs.scale.value;
   job->params[0] = inputs.param1.value;
@@ -401,6 +402,16 @@ ImageGenerator::worker::work(std::unique_ptr<GenJob> job)
       JobPool<GenJob>::instance().release(std::move(j));
     }
   } recycle{job};
+
+  if(job && job->load.active())
+    return ModelLoader<const GenModel, GenJob, GenFiles>::work<&ImageGenerator::models, ImageGenerator>(
+        job->load, [](const GenFiles& files) { return makeGenModel(files); },
+        [](ImageGenerator& self) { self.modelInstalled(); },
+        [](ImageGenerator& self, std::string_view what) {
+      self.failures.failed(
+          ImageGenerator::name(), self.models.requested().model.path,
+          std::string("cannot load the model: ").append(what));
+    });
 
   if(!job || !job->synth_ctx)
     return [](ImageGenerator& self) { self.inferenceInProgress = false; };

@@ -104,7 +104,8 @@ std::string rvmModel()
 const std::string bodyImage
     = TestPaths::images() + "/body.jpg";
 
-// Jobs wait until complete() is called, as on a busy worker.
+// Inference jobs wait until complete() is called, as on a busy worker; the
+// model loads right away.
 struct QueuedVideo : Harness
 {
   std::vector<std::unique_ptr<OnnxModels::VideoInferJob>> queue;
@@ -113,6 +114,8 @@ struct QueuedVideo : Harness
       : Harness{img, model, 1}
   {
     node.worker.request = [this](std::unique_ptr<OnnxModels::VideoInferJob> job) {
+      if(isModelJob(*job))
+        return runJob(node, std::move(job));
       dispatches++;
       queue.push_back(std::move(job));
     };

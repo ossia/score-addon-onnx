@@ -1,4 +1,5 @@
 #pragma once
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <Onnx/helpers/AuxInputs.hpp>
@@ -113,17 +114,7 @@ struct SeqPipeline
 
 struct SeqInferJob
 {
-  // Infer runs the model; Build makes a pipeline for build_path; Dispose frees
-  // `pipeline` here, off the processing thread.
-  enum class Kind : uint8_t
-  {
-    Infer,
-    Build,
-    Dispose
-  } kind = Kind::Infer;
-  std::string build_path;
-  std::size_t build_bytes = 0;
-  std::shared_ptr<SeqPipeline> pipeline;
+  ModelJob<SeqPipeline> load;
 
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   std::vector<float> input;        // primary input, flattened [1,T,F]/[1,D]
@@ -225,12 +216,11 @@ public:
   }
 
   // Public for applyResult() (a free function in the .cpp, reached from the
-  // worker completion lambda).
+  // worker completion lambda). The installed model of `models`.
   std::shared_ptr<SeqPipeline> pipe;
 
 private:
-  bool building = false;
-  std::string requested; // the file the last build was for
+  ModelLoader<SeqPipeline, SeqInferJob> models;
   bool inferenceInProgress = false;
   Onnx::WindowMode resolvedWindow = Onnx::WindowMode::Passthrough;
   SeqWindowMode lastWindowMode{};
@@ -239,9 +229,7 @@ private:
   uint32_t gen = 0;
 
   void reportError(std::string_view what);
-  void requestBuild();
-  void install(std::shared_ptr<SeqPipeline> p);
-  void dispose(std::shared_ptr<SeqPipeline> p);
+  void modelInstalled();
 
   void resolveWindow();
   void resetState();

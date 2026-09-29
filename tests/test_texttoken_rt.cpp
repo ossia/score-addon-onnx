@@ -54,11 +54,12 @@ TEST_CASE("Text Token: the model loads and a text encoder runs on the worker", "
   d.node.inputs.tokens.value = {5, 6, 7};
   d.node(64);
   REQUIRE(d.jobs.size() == 1);
-  CHECK(d.jobs.front()->kind == Job::Kind::Build);
-  CHECK(d.complete() == Job::Kind::Build);
+  CHECK(isLoadJob(*d.jobs.front()));
+  d.complete();
 
   d.node(64);
   REQUIRE(d.jobs.size() == 1);
+  CHECK(!isModelJob(*d.jobs.front()));
   CHECK(d.jobs.front()->kind == Job::Kind::Infer); // not run inline
   CHECK(d.node.outputs.data.value.empty());
   CHECK(d.complete() == Job::Kind::Infer);
@@ -71,7 +72,7 @@ TEST_CASE("Text Token: a replaced utterance is freed on the worker", "[onnx][tex
   Deferred d{SCORE_ONNX_TEST_DATA_DIR "/tts/sidecar/tts.onnx"};
   d.node.inputs.tokens.value = {1, 2};
   d.node(64);
-  d.complete(); // Build
+  d.complete(); // the load
   d.node(64);
   CHECK(d.complete() == Job::Kind::Infer); // the first utterance
   CHECK(d.jobs.empty());

@@ -2,6 +2,7 @@
 // Text -> token ids, with a Hugging Face tokenizer.json. Feeds the Text Token
 // Processor (CLIP's text encoder) or anything else that takes token ids.
 #include <Onnx/helpers/TextTokenizer.hpp>
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <halp/controls.hpp>
@@ -16,11 +17,11 @@
 
 namespace OnnxModels
 {
+// The tokenizer loads on the worker (`load`), and encodes `text` there.
 struct TokenizeJob
 {
-  std::shared_ptr<Onnx::TextTokenizer> tokenizer; // the current one, if any
-  std::shared_ptr<Onnx::TextTokenizer> dispose;   // only freed here
-  std::string path;
+  ModelJob<const Onnx::TextTokenizer> load;
+  std::shared_ptr<const Onnx::TextTokenizer> tokenizer;
   std::string text;
   bool special = true;
 };
@@ -69,10 +70,11 @@ public:
   void operator()();
 
 private:
-  std::shared_ptr<Onnx::TextTokenizer> m_tokenizer;
-  std::string m_path, m_text;
+  ModelLoader<const Onnx::TextTokenizer, TokenizeJob> m_tokenizers;
+  // What the last ids were asked for, whatever came of it.
+  uint32_t m_tokenizer_gen = 0, m_encoded_gen = 0;
+  std::string m_text;
   bool m_special = true;
-  bool m_requested = false; // what the last job was asked, whatever came of it
   bool m_busy = false;
   FailureLog m_failures;
 };

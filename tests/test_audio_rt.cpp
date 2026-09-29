@@ -42,13 +42,23 @@ struct Deferred
     node.worker.request = [this](std::unique_ptr<Job> job) { jobs.push_back(std::move(job)); };
   }
   void tick() { node(512); }
+  enum class What
+  {
+    Load,
+    Dispose,
+    Infer
+  };
+  static What what(const Job& j)
+  {
+    return isLoadJob(j) ? What::Load : isDisposeJob(j) ? What::Dispose : What::Infer;
+  }
   // Runs the oldest queued job on "the worker" and applies its result.
-  Job::Kind complete()
+  What complete()
   {
     REQUIRE(!jobs.empty());
     auto job = std::move(jobs.front());
     jobs.pop_front();
-    const auto kind = job->kind;
+    const auto kind = what(*job);
     runJob(node, std::move(job));
     return kind;
   }
@@ -68,13 +78,13 @@ TEST_CASE("Audio Processor: the model loads on the worker", "[onnx][audio]")
   Deferred d;
   d.tick();
   REQUIRE(d.jobs.size() == 1);
-  CHECK(d.jobs.front()->kind == Job::Kind::Build);
-  CHECK(d.jobs.front()->build.path == d.name);
+  CHECK(Deferred::what(*d.jobs.front()) == Deferred::What::Load);
+  CHECK(d.jobs.front()->load.key.file.path == d.name);
   CHECK(d.silent()); // nothing to play until the pipeline arrives
   d.tick();
   CHECK(d.jobs.size() == 1); // not requested twice
 
-  CHECK(d.complete() == Job::Kind::Build);
+  CHECK(d.complete() == Deferred::What::Load);
   for(int i = 0; i < 4; i++)
     d.tick();
   CHECK(d.jobs.empty()); // a light model: run inline
@@ -95,22 +105,22 @@ TEST_CASE("Audio Processor: a settings change is prepared on the worker", "[onnx
   d.tick();
   REQUIRE(d.jobs.size() == 1);
   auto& build = *d.jobs.front();
-  CHECK(build.kind == Job::Kind::Build);
-  CHECK(build.ctx != nullptr); // reused, not loaded again
-  const auto session = build.ctx;
+  CHECK(Deferred::what(build) == Deferred::What::Load);
+  REQUIRE(build.load.model != nullptr); // the running pipeline, whose session is reused
+  const auto session = build.load.model->ctx;
 
   // Meanwhile the running pipeline keeps playing.
   d.tick();
   CHECK_FALSE(d.silent());
 
-  CHECK(d.complete() == Job::Kind::Build);
+  CHECK(d.complete() == Deferred::What::Load);
+  CHECK(d.node.sessionForTest() == session.get()); // not loaded again
   // The old pipeline goes back to the worker, as its last owner.
   REQUIRE(d.jobs.size() == 1);
-  CHECK(d.jobs.front()->kind == Job::Kind::Dispose);
-  REQUIRE(d.jobs.front()->pipeline);
-  CHECK(d.jobs.front()->pipeline.use_count() == 1);
-  CHECK(d.jobs.front()->pipeline->ctx == session); // the same session
-  CHECK(d.complete() == Job::Kind::Dispose);
+  CHECK(Deferred::what(*d.jobs.front()) == Deferred::What::Dispose);
+  REQUIRE(d.jobs.front()->load.model);
+  CHECK(d.jobs.front()->load.model.use_count() == 1);
+  CHECK(d.complete() == Deferred::What::Dispose);
 }
 
 // Same for the Audio Analyzer, which has no other worker job.
@@ -132,7 +142,7 @@ TEST_CASE("Audio Analyzer: the model loads on the worker", "[onnx][audio][analyz
 
   node(512);
   REQUIRE(jobs.size() == 1);
-  CHECK(jobs.front()->kind == OnnxModels::AnalyzerJob::Kind::Build);
+  CHECK(isLoadJob(*jobs.front()));
   CHECK(node.outputs.data.value.empty());
   auto done = OnnxModels::AudioAnalyzer::worker::work(std::move(jobs.front()));
   jobs.pop_front();

@@ -8,6 +8,7 @@
 // or VAD probability). The node's kind is FIXED audio-analyzer, so the audio
 // input is treated as a waveform even when classifyModel mistags it (Silero-VAD's
 // bare [1,512] 'input').
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <Onnx/helpers/AudioIO.hpp>
@@ -46,17 +47,18 @@ struct AudioAnalyzer;
 
 // What the node's model and settings resolve to: the session, the I/O
 // routing, the resampler and ring, the recurrent state and the inference
-// scratch. Built by a worker job, never on the audio thread; the audio thread
-// swaps the new one in and hands the old one back to the worker to be freed.
-// (The model itself runs inline: analyzers are small, and their controls
+// scratch. Built on the worker (ModelLoader keyed on the file and the
+// settings), never on the audio thread. (The model itself runs inline: analyzers are small, and their controls
 // should follow the audio closely.)
 struct AnalyzerBuildParams
 {
-  std::string path; // the model file, read again on the worker
+  ModelFile file; // the model file, read again on the worker
   double host_rate = 48000.0;
   int host_channels = 0;
   std::size_t max_frames = 4096;
   int rate_override = 0;
+
+  bool operator==(const AnalyzerBuildParams&) const noexcept = default;
 };
 
 struct AnalyzerStatePort
@@ -93,14 +95,7 @@ struct AnalyzerPipeline
 
 struct AnalyzerJob
 {
-  enum class Kind : uint8_t
-  {
-    Build,
-    Dispose
-  } kind = Kind::Build;
-  AnalyzerBuildParams build;
-  std::shared_ptr<Onnx::OnnxRunContext> ctx; // Build: reuse this session
-  std::shared_ptr<AnalyzerPipeline> pipeline; // Dispose: its last owner
+  ModelJob<AnalyzerPipeline, AnalyzerBuildParams> load;
 };
 
 struct AudioAnalyzer : OnnxObject
@@ -153,9 +148,8 @@ public:
   } worker;
 
 private:
-  std::shared_ptr<AnalyzerPipeline> pipe;
-  bool building = false;
-  AnalyzerBuildParams requested;
+  ModelLoader<AnalyzerPipeline, AnalyzerJob, AnalyzerBuildParams> models;
+  std::shared_ptr<AnalyzerPipeline> pipe; // the installed model of `models`
 
   double host_rate = 48000.0;
   int host_in_channels = 0;
@@ -163,9 +157,6 @@ private:
 
   AnalyzerBuildParams currentParams() const;
   bool sameSettings(const AnalyzerBuildParams& p) const noexcept;
-  void requestBuild(const AnalyzerBuildParams& p, bool reuse_session);
-  void install(std::shared_ptr<AnalyzerPipeline> p);
-  void dispose(std::shared_ptr<AnalyzerPipeline> p);
   void zeroStates();
   void runBlock();
   void reduceOutputs(std::span<const float> flat);

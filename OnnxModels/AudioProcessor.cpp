@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -87,7 +88,7 @@ makePipeline(const AudioBuildParams& bp, std::shared_ptr<Onnx::OnnxRunContext> c
   auto P = std::make_shared<AudioPipeline>();
   P->params = bp;
   if(!ctx)
-    ctx = Onnx::loadRunContext(bp.path, Onnx::Options::precise());
+    ctx = Onnx::loadRunContext(bp.file.path, Onnx::Options::precise());
   P->ctx = std::move(ctx);
   P->spec = P->ctx->readModelSpec();
   P->arch = Onnx::classifyModel(Onnx::toArchIO(P->spec));
@@ -253,7 +254,7 @@ static void buildPipeline(AudioPipeline& P)
 
   P.model_rate = bp.rate_override > 0 ? (double)bp.rate_override
                : Onnx::audioModelRate(
-                   *P.ctx, bp.path, P.mel_input ? melcfg.rate : bp.host_rate);
+                   *P.ctx, bp.file.path, P.mel_input ? melcfg.rate : bp.host_rate);
 
   const int hc = bp.host_channels > 0 ? bp.host_channels : 1;
   if(P.mel_input)
@@ -292,7 +293,7 @@ static void buildPipeline(AudioPipeline& P)
   // streaming models (recurrent denoise) run inline for low latency. A
   // vocoder always does: its mel analysis alone is too long for the audio
   // thread.
-  P.async_model = bp.model_bytes > 32u * 1024 * 1024 || block > 48000
+  P.async_model = bp.file.size > 32u * 1024 * 1024 || block > 48000
                 || P.mel_input;
   const int backlog = P.async_model ? 4 : 0;
   const auto overlap = (AudioOverlap)bp.overlap;
@@ -324,8 +325,7 @@ void AudioProcessor::zeroStates()
 AudioBuildParams AudioProcessor::currentParams() const
 {
   return {
-      .path = std::string(inputs.model.file.filename),
-      .model_bytes = inputs.model.file.bytes.size(),
+      .file = ModelFile::of(inputs.model),
       .host_rate = host_rate,
       .host_channels = host_in_channels,
       .max_frames = max_frames,
@@ -343,39 +343,15 @@ bool AudioProcessor::sameSettings(const AudioBuildParams& p) const noexcept
          && p.mel_style == (int)inputs.mel_style.value && p.block == inputs.block.value;
 }
 
-// Asks the worker for a new pipeline. A settings change reuses the running
-// session; a new file loads its own.
-void AudioProcessor::requestBuild(const AudioBuildParams& p, bool reuse_session)
-{
-  building = true;
-  requested = p;
-  auto job = JobPool<AudioInferJob>::instance().acquire();
-  job->kind = AudioInferJob::Kind::Build;
-  job->build = p;
-  job->ctx = reuse_session && pipe ? pipe->ctx : nullptr;
-  worker.request(std::move(job));
-}
-
 // On the audio thread: the new pipeline replaces the running one, which goes
 // back to the worker to be freed with its session and buffers. A job of the
 // old pipeline still running brings nothing back (gen), but it keeps
 // inferenceInProgress until it returns: two jobs in flight could return out
 // of order.
-void AudioProcessor::install(std::shared_ptr<AudioPipeline> p)
+void AudioProcessor::modelInstalled()
 {
-  std::swap(pipe, p);
+  pipe = models.model();
   ++gen;
-  dispose(std::move(p));
-}
-
-void AudioProcessor::dispose(std::shared_ptr<AudioPipeline> p)
-{
-  if(!p)
-    return;
-  auto job = JobPool<AudioInferJob>::instance().acquire();
-  job->kind = AudioInferJob::Kind::Dispose;
-  job->pipeline = std::move(p);
-  worker.request(std::move(job));
 }
 
 void AudioProcessor::operator()(int frames)
@@ -394,17 +370,8 @@ try
 
   // A new file, or new settings: a pipeline is built on the worker. The
   // running one (if any) keeps playing until it arrives.
-  if(!building)
-  {
-    const bool newFile = !pipe || pipe->params.path != inputs.model.file.filename;
-    if(newFile)
-    {
-      if(!pipe || requested.path != inputs.model.file.filename)
-        requestBuild(currentParams(), false);
-    }
-    else if(!sameSettings(pipe->params))
-      requestBuild(currentParams(), true);
-  }
+  if(const auto& r = models.requested(); !(r.file.is(inputs.model) && sameSettings(r)))
+    models.request(worker, currentParams());
   if(!pipe || !pipe->refusal.empty() || pipe->spec.inputs.empty()
      || pipe->spec.outputs.empty())
   {
@@ -497,7 +464,6 @@ void AudioProcessor::dispatchInfer(int64_t n, bool force_async)
     // Pooled job: lock-free acquire; recycled vectors keep their capacity so
     // the assignments below don't allocate in steady state.
     auto job = JobPool<AudioInferJob>::instance().acquire();
-    job->kind = AudioInferJob::Kind::Infer;
     job->ctx = P.ctx;
     job->input = P.staged;
     job->ishape = P.mel_input ? P.mel_shape : P.in_shape.tensorShape(n);
@@ -640,7 +606,6 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
       {
         // Don't keep the ORT session and the tables alive from the pool.
         j->ctx.reset();
-        j->pipeline.reset();
         j->mel.reset();
         j->synth.reset();
       }
@@ -648,50 +613,33 @@ AudioProcessor::worker::work(std::unique_ptr<AudioInferJob> job)
     }
   } recycle{job};
 
-  if(job && job->kind == AudioInferJob::Kind::Dispose)
-  {
-    job->pipeline.reset(); // the session and the buffers are freed here
-    return {};
-  }
-  if(job && job->kind == AudioInferJob::Kind::Build)
-  {
-    try
-    {
-      auto p = makePipeline(job->build, std::move(job->ctx));
-      return [p = std::move(p)](AudioProcessor& self) mutable
+  // A settings change reuses the running session; a new file loads its own.
+  if(job && job->load.active())
+    return ModelLoader<AudioPipeline, AudioInferJob, AudioBuildParams>::work<
+        &AudioProcessor::models, AudioProcessor>(
+        job->load,
+        [](const AudioBuildParams& bp, const std::shared_ptr<AudioPipeline>& running) {
+      std::shared_ptr<AudioPipeline> p;
+      try
       {
-        self.building = false;
-        if(p->params.path != self.inputs.model.file.filename)
-        {
-          self.dispose(std::move(p)); // another file was picked meanwhile
-          return;
-        }
-        if(!p->refusal.empty())
-        {
-          self.failures.failed(AudioProcessor::name(), p->params.path, p->refusal);
-          self.inputs.model.current_model_invalid = true;
-          self.requested.path.clear(); // picking the file again retries
-          self.dispose(std::move(p));
-          return;
-        }
-        self.install(std::move(p));
-      };
-    }
-    catch(const std::exception& e)
-    {
-      return [what = std::string(e.what()),
-              path = job->build.path](AudioProcessor& self)
+        p = makePipeline(
+            bp, running && running->params.file == bp.file ? running->ctx : nullptr);
+      }
+      catch(const std::exception& e)
       {
-        self.building = false;
-        if(path != self.inputs.model.file.filename)
-          return;
-        self.failures.failed(
-            AudioProcessor::name(), path, "cannot load the model: " + what);
+        throw std::runtime_error(std::string("cannot load the model: ") + e.what());
+      }
+      if(!p->refusal.empty())
+        throw std::runtime_error(p->refusal);
+      return p;
+    },
+        [](AudioProcessor& self) { self.modelInstalled(); },
+        [](AudioProcessor& self, std::string_view what) {
+      self.failures.failed(AudioProcessor::name(), self.models.requested().file.path, what);
+      // Not when another file was picked since: that one is still to load.
+      if(self.models.requested().file.is(self.inputs.model))
         self.inputs.model.current_model_invalid = true;
-        self.requested.path.clear(); // picking the file again retries
-      };
-    }
-  }
+    });
 
   if(!job || !job->ctx)
     return [](AudioProcessor& self) { self.inferenceInProgress = false; };

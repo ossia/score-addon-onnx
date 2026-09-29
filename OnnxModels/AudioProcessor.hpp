@@ -8,6 +8,7 @@
 // sample-rate. Recurrent state (DeepFilterNet / RAVE-style streaming models) is
 // detected via classifyModel and threaded internally (zero-init, output->input
 // each call, re-zeroed on Reset).
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <Onnx/helpers/AudioIO.hpp>
@@ -46,13 +47,11 @@ struct AudioStatePort
 // What the node's model and settings resolve to: the ORT session, the I/O
 // routing, the resamplers and rings, the vocoder tables, the recurrent state
 // and the synchronous path's scratch. Building one creates the session and
-// allocates all of this, so it is done by a worker job (buildPipeline), never
-// on the audio thread; the audio thread swaps the new one in and sends the
-// old one back to the worker to be freed.
+// allocates all of this, so it is done on the worker (ModelLoader keyed on the
+// file and the settings, buildPipeline), never on the audio thread.
 struct AudioBuildParams
 {
-  std::string path;          // the model file, read again on the worker
-  std::size_t model_bytes = 0;
+  ModelFile file; // the model file, read again on the worker
   double host_rate = 48000.0;
   int host_channels = 0;
   std::size_t max_frames = 4096;
@@ -60,6 +59,8 @@ struct AudioBuildParams
   int overlap = 0;           // AudioOverlap
   int mel_style = 0;         // AudioMelStyle
   int block = 0;
+
+  bool operator==(const AudioBuildParams&) const noexcept = default;
 };
 
 struct AudioPipeline
@@ -107,8 +108,8 @@ struct AudioPipeline
 // Off-thread inference job for heavy audio models (separation / vocoders): a
 // preprocessed waveform tensor plus the recurrent-state snapshot. ctx is shared
 // so it outlives the node frame; readModelSpec() is re-read in work().
-// The same job type builds a pipeline (Kind::Build) and frees an old one
-// (Kind::Dispose) off the audio thread.
+// The same job type builds a pipeline and frees an old one (`load`) off the
+// audio thread.
 //
 // Jobs travel through score::TaskPool's 128-byte smallfun queue, so they are
 // heap-allocated and recycled through the lock-free JobPool (only the
@@ -116,14 +117,7 @@ struct AudioPipeline
 // steady-state request path does not allocate). See OnnxModels/JobPool.hpp.
 struct AudioInferJob
 {
-  enum class Kind : uint8_t
-  {
-    Infer,
-    Build,
-    Dispose
-  } kind = Kind::Infer;
-  AudioBuildParams build;                  // Kind::Build
-  std::shared_ptr<AudioPipeline> pipeline; // Kind::Dispose: its last owner
+  ModelJob<AudioPipeline, AudioBuildParams> load;
 
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   std::vector<float> input;    // planar [C,N]
@@ -254,12 +248,17 @@ public:
     work(std::unique_ptr<AudioInferJob> job);
   } worker;
 
+  // The running pipeline's session (for tests; null before a model).
+  const Onnx::OnnxRunContext* sessionForTest() const noexcept
+  {
+    return pipe ? pipe->ctx.get() : nullptr;
+  }
+
 private:
-  // The running pipeline, and whether a build is in flight. While one is,
-  // the current pipeline keeps running (a settings change has no gap).
+  // The running pipeline: the installed model of `models`. While a build is
+  // in flight, it keeps running (a settings change has no gap).
+  ModelLoader<AudioPipeline, AudioInferJob, AudioBuildParams> models;
   std::shared_ptr<AudioPipeline> pipe;
-  bool building = false;
-  AudioBuildParams requested; // what the last build was asked for
   bool inferenceInProgress = false;
   // Reset, and each new pipeline, bump gen: a job they outdated does not
   // bring back its states or its block.
@@ -272,9 +271,7 @@ private:
 
   AudioBuildParams currentParams() const;
   bool sameSettings(const AudioBuildParams& p) const noexcept;
-  void requestBuild(const AudioBuildParams& p, bool reuse_session);
-  void install(std::shared_ptr<AudioPipeline> p);
-  void dispose(std::shared_ptr<AudioPipeline> p);
+  void modelInstalled();
   void zeroStates();
   void runBlock();
   void dispatchInfer(int64_t n, bool force_async);

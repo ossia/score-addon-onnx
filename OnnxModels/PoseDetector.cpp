@@ -1,5 +1,9 @@
 #include "PoseDetector_internal.hpp"
 
+#include <OnnxModels/JobPool.hpp>
+
+#include <stdexcept>
+
 namespace OnnxModels
 {
 
@@ -222,6 +226,163 @@ Onnx::ModelRole PoseDetector::roleForWorkflow(PoseWorkflow w) const
   return r;
 }
 
+template <typename Loader, typename Port>
+void PoseDetector::syncModel(
+    Loader& loader, const Port& port, bool usable, bool needed,
+    void (PoseDetector::*installed)())
+{
+  if(!usable)
+  {
+    if(loader.model() || loader.loading())
+    {
+      loader.release(worker);
+      (this->*installed)();
+    }
+    return;
+  }
+  if(needed && !loader.requested().is(port))
+    loader.request(worker, ModelFile::of(port));
+}
+
+void PoseDetector::resetTracking()
+{
+  m_tracking = false;
+  m_last_keypoints.clear();
+  m_roi_smoother.reset();
+  resetSmoothers(); // 2D + 3D filters and the confidence-hold history
+  m_box_smoother.reset();
+  m_tracker.reset();
+  m_lost_frames = 0;
+  m_frames_since_detect = 0;
+  m_last_single_pose.reset();
+  m_hold_frames = 0;
+  m_had_detection = false;
+  // m_params_angle_mask / m_params_beta / m_hmr_out are NOT cleared here:
+  // they belong to the landmark model and are rebuilt by loadInstantHmr()
+  // every time one is installed (a Detection Model change resets the tracking
+  // without touching the landmark model, and must not lose them).
+}
+
+void PoseDetector::landmarkInstalled()
+{
+  const auto& m = m_landmark_models.model();
+  ctx = m ? m->ctx : nullptr;
+  resetTracking();
+  if(!m)
+  {
+    m_landmark_role = {};
+    m_hmr_out = {};
+    m_hmr_cliff_focal = false;
+    m_params_angle_mask.clear();
+    m_params_beta = 0.f;
+    return;
+  }
+  failures.succeeded();
+  m_landmark_role = m->role;
+  m_landmark_no_batch = false;
+  m_landmark_batch_cap = 0;
+  const auto& pv = ctx->provider;
+  m_landmark_pad_batch = pv == "cuda" || pv == "tensorrt" || pv == "rocm";
+  loadInstantHmr(*ctx, m_landmark_role);
+}
+
+void PoseDetector::detectorInstalled()
+{
+  const auto& m = m_det_models.model();
+  det_ctx = m ? m->ctx : nullptr;
+  m_detector_role = m ? m->role : Onnx::ModelRole{};
+  m_yolox_range = {};
+  resetTracking();
+}
+
+void PoseDetector::reidInstalled()
+{
+  const auto& m = m_reid_models.model();
+  reid_ctx = m ? m->ctx : nullptr;
+  m_reid_spec = m ? m->reid : Onnx::ReidSpec{};
+  resetTracking();
+}
+
+namespace
+{
+// A landmark or detection model: its session, from the file (the port's
+// mapping may be gone by now), and its role. The graph metadata InstantHMR
+// reads at install is read here too.
+std::shared_ptr<const PoseModel> makeRoleModel(const ModelFile& f)
+{
+  auto m = std::make_shared<PoseModel>();
+  m->ctx = Onnx::loadRunContext(f.path);
+  m->role = classifyModel(*m->ctx);
+  (void)m->ctx->metadata();
+  return m;
+}
+
+std::shared_ptr<const PoseModel> makeReidModel(const ModelFile& f)
+{
+  auto m = std::make_shared<PoseModel>();
+  m->ctx = Onnx::loadRunContext(f.path);
+  m->reid = Onnx::classifyReid(toModelIO(m->ctx->readModelSpec()));
+  return m;
+}
+
+std::shared_ptr<const Onnx::Mhr::Model> makeBodyModel(const ModelFile& f)
+{
+  std::string err;
+  auto model = Onnx::Mhr::Model::loadFile(f.path, &err);
+  if(!model)
+    throw std::runtime_error(err.empty() ? "unreadable" : err);
+  return std::make_shared<const Onnx::Mhr::Model>(std::move(*model));
+}
+
+template <typename F, typename L>
+auto reportLoadFailure(F port, L loader)
+{
+  return [port, loader](PoseDetector& self, std::string_view what) {
+    auto& p = (self.inputs.*port);
+    const auto& failed = (self.*loader).requested();
+    self.failures.failed(
+        PoseDetector::name(), failed.path,
+        std::string("cannot load the model: ").append(what));
+    // Not when another file was picked since: that one is still to load.
+    if(failed.is(p))
+      p.current_model_invalid = true;
+  };
+}
+}
+
+std::function<void(PoseDetector&)> PoseDetector::worker::work(std::unique_ptr<PoseJob> job)
+{
+  struct Recycle
+  {
+    std::unique_ptr<PoseJob>& j;
+    ~Recycle() { JobPool<PoseJob>::instance().release(std::move(j)); }
+  } recycle{job};
+  if(!job)
+    return {};
+
+  using Models = decltype(PoseDetector::m_landmark_models);
+  if(job->landmark.active())
+    return Models::work<&PoseDetector::m_landmark_models, PoseDetector>(
+        job->landmark, makeRoleModel, [](PoseDetector& self) { self.landmarkInstalled(); },
+        reportLoadFailure(&PoseDetector::ins::model, &PoseDetector::m_landmark_models));
+  if(job->detector.active())
+    return decltype(PoseDetector::m_det_models)::work<&PoseDetector::m_det_models, PoseDetector>(
+        job->detector, makeRoleModel, [](PoseDetector& self) { self.detectorInstalled(); },
+        reportLoadFailure(&PoseDetector::ins::det_model, &PoseDetector::m_det_models));
+  if(job->reid.active())
+    return decltype(PoseDetector::m_reid_models)::work<&PoseDetector::m_reid_models, PoseDetector>(
+        job->reid, makeReidModel, [](PoseDetector& self) { self.reidInstalled(); },
+        reportLoadFailure(&PoseDetector::ins::reid_model, &PoseDetector::m_reid_models));
+  return decltype(PoseDetector::m_body_models)::work<&PoseDetector::m_body_models, PoseDetector>(
+      job->body, makeBodyModel, [](PoseDetector& self) { self.bodyModelInstalled(); },
+      [](PoseDetector& self, std::string_view what) {
+    // Once per file; the node goes on without a mesh.
+    std::fprintf(
+        stderr, "[pose] body model %s: %.*s -- no mesh\n",
+        self.m_body_models.requested().path.c_str(), (int)what.size(), what.data());
+  });
+}
+
 void PoseDetector::passthrough(const Onnx::ImageView& src)
 {
   ONNX_PROF_SCOPE(Draw);
@@ -293,18 +454,27 @@ try
     }
   }
 
-  // The body mesh file, parsed only when its name changes.
+  // The body mesh file, parsed on the worker when it changes.
   loadBodyModel();
 
   const bool have_landmark = !inputs.model.current_model_invalid
                              && inputs.model.file.bytes.size() >= 32;
   const bool have_det = !inputs.det_model.current_model_invalid
                         && inputs.det_model.file.bytes.size() >= 32;
-  const bool have_reid = inputs.reid.value
-                         && !inputs.reid_model.current_model_invalid
-                         && inputs.reid_model.file.bytes.size() >= 32;
+  const bool reid_usable = !inputs.reid_model.current_model_invalid
+                           && inputs.reid_model.file.bytes.size() >= 32;
+  const bool have_reid = inputs.reid.value && reid_usable;
 
-  // Reset contexts on workflow / model change.
+  // New files load on the worker; the models running meanwhile, if any, keep
+  // running until theirs arrive. A model that cannot be built is reported
+  // once and stays disabled until another file is picked for its port; a
+  // per-frame inference failure does not disable anything (see the function
+  // catch below). Without its re-identification model the tracker keeps
+  // running on motion alone.
+  syncModel(m_landmark_models, inputs.model, have_landmark, true, &PoseDetector::landmarkInstalled);
+  syncModel(m_det_models, inputs.det_model, have_det, true, &PoseDetector::detectorInstalled);
+  syncModel(m_reid_models, inputs.reid_model, reid_usable, have_reid, &PoseDetector::reidInstalled);
+
   const PoseWorkflow wf = inputs.workflow.value;
 
   // Box Detection runs the Detection Model with no landmark stage: explicit
@@ -318,111 +488,15 @@ try
 
   ONNX_PROF_FRAME(); // counts only frames that actually process
 
-  bool reinit = false;
   if(wf != m_last_workflow)
   {
-    ctx.reset();
-    det_ctx.reset();
     m_last_workflow = wf;
-    reinit = true;
-  }
-  if(inputs.model.file.filename != m_last_model)
-  {
-    ctx.reset();
-    m_last_model = std::string(inputs.model.file.filename);
-    reinit = true;
-  }
-  if(inputs.det_model.file.filename != m_last_det_model)
-  {
-    det_ctx.reset();
-    m_last_det_model = std::string(inputs.det_model.file.filename);
-    m_yolox_range = {};
-    reinit = true;
-  }
-  if(inputs.reid_model.file.filename != m_last_reid_model)
-  {
-    reid_ctx.reset();
-    m_reid_spec = {};
-    m_last_reid_model = std::string(inputs.reid_model.file.filename);
-    reinit = true;
-  }
-  // A model/workflow change invalidates the temporal tracking/smoothing state.
-  if(reinit)
-  {
-    m_tracking = false;
-    m_last_keypoints.clear();
-    m_roi_smoother.reset();
-    resetSmoothers(); // 2D + 3D filters and the confidence-hold history
-    m_box_smoother.reset();
-    m_tracker.reset();
-    m_lost_frames = 0;
-    m_frames_since_detect = 0;
-    m_last_single_pose.reset();
-    m_hold_frames = 0;
-    m_had_detection = false;
-    // m_params_angle_mask / m_params_beta / m_hmr_out are NOT cleared here:
-    // they belong to the landmark model and are rebuilt by loadInstantHmr()
-    // every time one is loaded below (a Detection Model change reinits without
-    // reloading the landmark model, and must not lose them).
+    resetTracking();
   }
 
-  // A model that cannot be built is reported once and stays disabled until
-  // another file is picked for its port; a per-frame inference failure does
-  // not disable anything (see the function catch below). Without its
-  // re-identification model the tracker keeps running on motion alone.
-  auto build = [this](auto& port, auto&& make) {
-    try
-    {
-      make();
-      return true;
-    }
-    catch(const std::exception& e)
-    {
-      failures.failed(
-          name(), port.file.filename, std::string("cannot load the model: ") + e.what());
-    }
-    catch(...)
-    {
-      failures.failed(name(), port.file.filename, "cannot load the model");
-    }
-    port.current_model_invalid = true;
-    return false;
-  };
-  if(have_landmark && !this->ctx
-     && !build(inputs.model, [this] {
-          this->ctx = std::make_unique<Onnx::OnnxRunContext>(
-              this->inputs.model.file.bytes, this->inputs.model.file.filename);
-          m_landmark_role = classifyModel(*this->ctx);
-          m_landmark_no_batch = false;
-          m_landmark_batch_cap = 0;
-          const auto& pv = this->ctx->provider;
-          m_landmark_pad_batch = pv == "cuda" || pv == "tensorrt" || pv == "rocm";
-          loadInstantHmr(*this->ctx, m_landmark_role);
-        }))
-  {
-    ctx.reset();
+  // Until the models this frame runs have arrived.
+  if(box_only ? !det_ctx : (!ctx || (have_det && !det_ctx)))
     return;
-  }
-  if(have_det && !this->det_ctx
-     && !build(inputs.det_model, [this] {
-          this->det_ctx = std::make_unique<Onnx::OnnxRunContext>(
-              this->inputs.det_model.file.bytes, this->inputs.det_model.file.filename);
-          m_detector_role = classifyModel(*this->det_ctx);
-        }))
-  {
-    det_ctx.reset();
-    return;
-  }
-  if(have_reid && !this->reid_ctx
-     && !build(inputs.reid_model, [this] {
-          this->reid_ctx = std::make_unique<Onnx::OnnxRunContext>(
-              this->inputs.reid_model.file.bytes, this->inputs.reid_model.file.filename);
-          m_reid_spec = Onnx::classifyReid(toModelIO(this->reid_ctx->readModelSpec()));
-        }))
-  {
-    reid_ctx.reset();
-    m_reid_spec = {};
-  }
 
   Onnx::ImageView src{
       reinterpret_cast<const uint8_t*>(in_tex.bytes), in_tex.width,

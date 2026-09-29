@@ -10,37 +10,6 @@ FastVLMNode::FastVLMNode() noexcept = default;
 
 FastVLMNode::~FastVLMNode() = default;
 
-std::array<std::string_view, 4> FastVLMNode::files() const noexcept
-{
-  return {
-      inputs.visionEncoder.file.filename, inputs.embedTokens.file.filename,
-      inputs.decoder.file.filename, inputs.tokenizer.file.filename};
-}
-
-void FastVLMNode::requestLoad()
-{
-  const auto f = files();
-  loading = true;
-  auto job = std::make_unique<VlmJob>();
-  job->kind = VlmJob::Kind::Load;
-  for(std::size_t i = 0; i < f.size(); ++i)
-  {
-    requested[i] = f[i];
-    job->files[i] = f[i];
-  }
-  worker.request(std::move(job));
-}
-
-void FastVLMNode::dispose(std::shared_ptr<Onnx::FastVLMInference> old)
-{
-  if(!old)
-    return;
-  auto job = std::make_unique<VlmJob>();
-  job->kind = VlmJob::Kind::Dispose;
-  job->vlm = std::move(old);
-  worker.request(std::move(job));
-}
-
 void FastVLMNode::requestInference()
 {
   if(inferenceInProgress || !vlm)
@@ -52,7 +21,6 @@ void FastVLMNode::requestInference()
 
   // The worker owns a copy of the pixels: the texture is only valid now.
   auto job = std::make_unique<VlmJob>();
-  job->kind = VlmJob::Kind::Infer;
   job->image.width = in_tex.width;
   job->image.height = in_tex.height;
   job->image.pixels.assign(
@@ -91,12 +59,21 @@ try
     return;
 
   // New files: the models load on the worker; the running ones (if any) keep
-  // answering until they arrive.
-  const auto f = files();
-  const bool complete
-      = std::none_of(f.begin(), f.end(), [](std::string_view s) { return s.empty(); });
-  if (complete && !loading && !std::equal(f.begin(), f.end(), requested.begin()))
-    requestLoad();
+  // answering until they arrive. Files that fail are not loaded again until
+  // one of them changes.
+  const auto& i = inputs;
+  const bool complete = !i.visionEncoder.file.filename.empty()
+                        && !i.embedTokens.file.filename.empty()
+                        && !i.decoder.file.filename.empty()
+                        && !i.tokenizer.file.filename.empty();
+  const auto& r = models.requested();
+  if (complete
+      && !(r[0].is(i.visionEncoder) && r[1].is(i.embedTokens) && r[2].is(i.decoder)
+           && r[3].is(i.tokenizer)))
+    models.request(
+        worker, VlmFiles{
+                    ModelFile::of(i.visionEncoder), ModelFile::of(i.embedTokens),
+                    ModelFile::of(i.decoder), ModelFile::of(i.tokenizer)});
 
   if (!vlm)
   {
@@ -125,42 +102,20 @@ std::function<void(FastVLMNode&)> FastVLMNode::worker::work(std::unique_ptr<VlmJ
   if (!job)
     return {};
 
-  switch (job->kind)
-  {
-    case VlmJob::Kind::Dispose:
-      job->vlm.reset();
-      return {};
-
-    case VlmJob::Kind::Load:
-      try
-      {
-        const auto& f = job->files;
-        auto vlm = std::make_shared<Onnx::FastVLMInference>(f[0], f[1], f[2], f[3]);
-        return [vlm = std::move(vlm), files = std::move(job->files)](
-                   FastVLMNode& node) mutable {
-          node.loading = false;
-          if (!std::equal(files.begin(), files.end(), node.files().begin()))
-          {
-            node.dispose(std::move(vlm)); // other files were picked meanwhile
-            return;
-          }
-          std::swap(node.vlm, vlm);
-          node.dispose(std::move(vlm));
-        };
-      }
-      catch (const std::exception& e)
-      {
-        std::string what = std::string("Cannot load the model: ") + e.what();
-        std::fprintf(stderr, "Vision Language Model: %s\n", what.c_str());
-        return [what = std::move(what)](FastVLMNode& node) mutable {
-          node.loading = false;
-          node.outputs.response.value = std::move(what);
-        };
-      }
-
-    case VlmJob::Kind::Infer:
-      break;
-  }
+  if (job->load.active())
+    return ModelLoader<Onnx::FastVLMInference, VlmJob, VlmFiles>::work<
+        &FastVLMNode::models, FastVLMNode>(
+        job->load,
+        [](const VlmFiles& f) {
+      return std::make_shared<Onnx::FastVLMInference>(
+          f[0].path, f[1].path, f[2].path, f[3].path);
+    },
+        [](FastVLMNode& node) { node.vlm = node.models.model(); },
+        [](FastVLMNode& node, std::string_view what) {
+      std::string msg = std::string("Cannot load the model: ").append(what);
+      std::fprintf(stderr, "Vision Language Model: %s\n", msg.c_str());
+      node.outputs.response.value = std::move(msg);
+    });
 
   if (!job->vlm || job->image.empty() || job->prompt.empty())
   {

@@ -1,4 +1,5 @@
 #pragma once
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <Onnx/helpers/AuxInputs.hpp>
@@ -43,12 +44,10 @@ enum class GeomTaskMode
   Data,
 };
 
-// What a model file resolves to: its session and the routing of its inputs.
-// Built by a worker job, never on the processing thread, which swaps it in
-// and hands the old one back to the worker to be freed.
+// What a model file resolves to: its session and the routing of its inputs,
+// built on the worker (ModelLoader).
 struct GeomModel
 {
-  std::string path;
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   Onnx::ModelSpec spec;
   Onnx::PointLayout in_layout;
@@ -58,15 +57,7 @@ struct GeomModel
 
 struct GeomInferJob
 {
-  // Infer runs the model; Build makes one for `build_path`; Dispose frees
-  // `model` here, off the processing thread.
-  enum class Kind : uint8_t
-  {
-    Infer,
-    Build,
-    Dispose
-  } kind = Kind::Infer;
-  std::string build_path;
+  ModelJob<const GeomModel> load;
   std::shared_ptr<const GeomModel> model;
 
   uint32_t gen = 0; // the node's generation at dispatch
@@ -156,9 +147,7 @@ public:
   } worker;
 
 private:
-  std::shared_ptr<const GeomModel> model;
-  bool building = false;
-  std::string requested; // the file the last build was for
+  ModelLoader<const GeomModel, GeomInferJob> models;
   bool inferenceInProgress = false;
   // Bumped by a new model: a job of the previous model finishing later must
   // not publish its result.
@@ -170,9 +159,7 @@ private:
   std::vector<uint8_t> staging;           // a non-float32 input
   std::vector<float> out_scratch;         // output dtype->float scratch
 
-  void requestBuild();
-  void install(std::shared_ptr<const GeomModel> m);
-  void dispose(std::shared_ptr<const GeomModel> m);
+  void modelInstalled();
   void runCloud();
   void dispatchInfer(int64_t npoints, bool force_async);
 };

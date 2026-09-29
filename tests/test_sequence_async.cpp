@@ -32,7 +32,7 @@ struct Deferred
     // Loading a model and freeing the old one run right away; only the
     // inference jobs wait.
     node.worker.request = [this](std::unique_ptr<OnnxModels::SeqInferJob> job) {
-      if(job->kind != OnnxModels::SeqInferJob::Kind::Infer)
+      if(isModelJob(*job))
       {
         runJob(node, std::move(job));
         return;

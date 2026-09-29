@@ -22,28 +22,6 @@ void QwenLLMNode::cancel_generation() noexcept
     token_stream->cancelled = true;
 }
 
-void QwenLLMNode::request_load()
-{
-  loading = true;
-  requested_model = inputs.model.file.filename;
-  requested_tokenizer = inputs.tokenizer.file.filename;
-  auto job = std::make_unique<LlmJob>();
-  job->kind = LlmJob::Kind::Load;
-  job->model = requested_model;
-  job->tokenizer = requested_tokenizer;
-  worker.request(std::move(job));
-}
-
-void QwenLLMNode::dispose(std::shared_ptr<Onnx::QwenLLMInference> old)
-{
-  if (!old)
-    return;
-  auto job = std::make_unique<LlmJob>();
-  job->kind = LlmJob::Kind::Dispose;
-  job->llm = std::move(old);
-  worker.request(std::move(job));
-}
-
 void QwenLLMNode::request_inference()
 {
   if (inference_in_progress || !llm)
@@ -66,7 +44,6 @@ void QwenLLMNode::request_inference()
 
   token_stream = std::make_shared<LlmTokenStream>();
   auto job = std::make_unique<LlmJob>();
-  job->kind = LlmJob::Kind::Generate;
   job->prompt = prompt;
   job->temperature = inputs.temperature.value;
   job->topP = inputs.topP.value;
@@ -159,14 +136,17 @@ try
   }
 
   // New files: the model loads on the worker; the running one (if any) keeps
-  // answering until it arrives.
+  // answering until it arrives, with the generation it was running stopped.
+  // Files that fail are not loaded again until one of them changes.
   const auto& model = inputs.model.file.filename;
   const auto& tokenizer = inputs.tokenizer.file.filename;
-  if (!model.empty() && !tokenizer.empty() && !loading
-      && (model != requested_model || tokenizer != requested_tokenizer))
+  if (const auto& r = models.requested();
+      !model.empty() && !tokenizer.empty()
+      && !(r.model.is(inputs.model) && r.tokenizer.is(inputs.tokenizer)))
   {
     cancel_generation();
-    request_load();
+    models.request(
+        worker, LlmFiles{ModelFile::of(inputs.model), ModelFile::of(inputs.tokenizer)});
   }
 
   if (!llm)
@@ -183,7 +163,7 @@ try
   // While new files load, such a change waits for them.
   const bool start
       = inputs.trigger.value.has_value() || restart
-        || (must_infer && !loading && !inputs.manual && !inputs.prompt.value.empty());
+        || (must_infer && !models.loading() && !inputs.manual && !inputs.prompt.value.empty());
   if (start)
   {
     if (inference_in_progress)
@@ -221,42 +201,19 @@ std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(std::unique_ptr<LlmJ
   if (!job)
     return {};
 
-  switch (job->kind)
-  {
-    case LlmJob::Kind::Dispose:
-      job->llm.reset();
-      return {};
-
-    case LlmJob::Kind::Load:
-      try
-      {
-        auto llm = std::make_shared<Onnx::QwenLLMInference>(job->model, job->tokenizer);
-        return [llm = std::move(llm), model = std::move(job->model),
-                tokenizer = std::move(job->tokenizer)](QwenLLMNode& node) mutable {
-          node.loading = false;
-          if (model != node.inputs.model.file.filename
-              || tokenizer != node.inputs.tokenizer.file.filename)
-          {
-            node.dispose(std::move(llm)); // other files were picked meanwhile
-            return;
-          }
-          std::swap(node.llm, llm);
-          node.dispose(std::move(llm));
-        };
-      }
-      catch (const std::exception& e)
-      {
-        std::string what = std::string("Cannot load the model: ") + e.what();
-        std::fprintf(stderr, "Language Model: %s\n", what.c_str());
-        return [what = std::move(what)](QwenLLMNode& node) mutable {
-          node.loading = false;
-          node.outputs.response.value = std::move(what);
-        };
-      }
-
-    case LlmJob::Kind::Generate:
-      break;
-  }
+  if (job->load.active())
+    return ModelLoader<Onnx::QwenLLMInference, LlmJob, LlmFiles>::work<
+        &QwenLLMNode::models, QwenLLMNode>(
+        job->load,
+        [](const LlmFiles& f) {
+      return std::make_shared<Onnx::QwenLLMInference>(f.model.path, f.tokenizer.path);
+    },
+        [](QwenLLMNode& node) { node.llm = node.models.model(); },
+        [](QwenLLMNode& node, std::string_view what) {
+      std::string msg = std::string("Cannot load the model: ").append(what);
+      std::fprintf(stderr, "Language Model: %s\n", msg.c_str());
+      node.outputs.response.value = std::move(msg);
+    });
 
   auto& stream = job->stream;
   if (!job->llm || job->prompt.empty() || !stream)

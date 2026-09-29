@@ -1,4 +1,5 @@
 #pragma once
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <Onnx/helpers/Detection.hpp>
@@ -20,8 +21,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 
@@ -215,6 +219,21 @@ enum class MeshSpace
 {
   OpenGL, // X right, Y up, Z backward (toward the viewer): score's 3D objects
   Camera, // OpenCV / InstantHMR: X right, Y down, Z forward (into the scene)
+};
+
+// The model of one of the ONNX ports, built on the worker.
+struct PoseModel
+{
+  std::shared_ptr<Onnx::OnnxRunContext> ctx;
+  Onnx::ModelRole role; // Landmark and Detection models
+  Onnx::ReidSpec reid;  // Re-identification model
+};
+
+// The worker's jobs: a load or a free per model port.
+struct PoseJob
+{
+  ModelJob<const PoseModel> landmark, detector, reid;
+  ModelJob<const Onnx::Mhr::Model> body;
 };
 
 struct PoseDetector : OnnxObject
@@ -687,6 +706,13 @@ public:
 
   void operator()();
 
+  // The models load, and are freed, on the worker; they run inline.
+  struct worker
+  {
+    std::function<void(std::unique_ptr<PoseJob>)> request;
+    static std::function<void(PoseDetector&)> work(std::unique_ptr<PoseJob> job);
+  } worker;
+
 private:
   // --- Two-stage building blocks ---
   // Stage 1: run the detector on the full frame, return detections in
@@ -852,10 +878,26 @@ private:
   // Temporally smooth the ROI rect so the crop stays steady.
   Onnx::ROI::Rect smoothRoi(Onnx::ROI::Rect r);
 
+  // --- Model changes (PoseDetector.cpp) ---
+  // Asks for the model of a port whose file changed, or drops the model of a
+  // port with no usable file.
+  template <typename Loader, typename Port>
+  void syncModel(
+      Loader& loader, const Port& port, bool usable, bool needed,
+      void (PoseDetector::*installed)());
+  // A model was installed, or dropped: the sessions and what derives from
+  // them, and the temporal state that belonged to the previous one.
+  void landmarkInstalled();
+  void detectorInstalled();
+  void reidInstalled();
+  // A model/workflow change invalidates the temporal tracking/smoothing state.
+  void resetTracking();
+
   // --- Body mesh (PoseDetector_mesh.cpp) ---
-  // Parse the Body Model file when its name changes (allocates; never per
-  // frame). An unreadable file logs once and leaves the mesh off.
+  // Asks for the Body Model when its file changes. An unreadable file logs
+  // once and leaves the mesh off.
   void loadBodyModel();
+  void bodyModelInstalled();
   // What this frame's outputs need from the mesh: vertices (a mesh Data
   // Format, Draw Mesh) and/or MHR70 keypoints (Mesh Keypoints). All false =
   // no body model, or nothing asks for it: the mesh costs nothing.
@@ -877,9 +919,14 @@ private:
   // Rasterize the given slots' meshes onto the output image (Draw Mesh).
   void drawMeshes(unsigned char* dst, int w, int h, std::span<const int> slots);
 
-  std::unique_ptr<Onnx::OnnxRunContext> ctx;     // main / landmark model
-  std::unique_ptr<Onnx::OnnxRunContext> det_ctx; // optional stage-1 detector
-  std::unique_ptr<Onnx::OnnxRunContext> reid_ctx; // optional appearance ReID
+  ModelLoader<const PoseModel, PoseJob, ModelFile, &PoseJob::landmark> m_landmark_models;
+  ModelLoader<const PoseModel, PoseJob, ModelFile, &PoseJob::detector> m_det_models;
+  ModelLoader<const PoseModel, PoseJob, ModelFile, &PoseJob::reid> m_reid_models;
+  ModelLoader<const Onnx::Mhr::Model, PoseJob, ModelFile, &PoseJob::body> m_body_models;
+  // The sessions of the installed models (see *Installed()).
+  std::shared_ptr<Onnx::OnnxRunContext> ctx;     // main / landmark model
+  std::shared_ptr<Onnx::OnnxRunContext> det_ctx; // optional stage-1 detector
+  std::shared_ptr<Onnx::OnnxRunContext> reid_ctx; // optional appearance ReID
   boost::container::vector<float> storage;
   boost::container::vector<float> det_storage;
 
@@ -940,11 +987,8 @@ private:
   boost::container::vector<float> m_reid_batch; // packed [N,3,H,W] reid input
   boost::container::vector<float> m_reid_tmp;   // per-crop reid build scratch
 
-  std::string m_last_model;
-  std::string m_last_det_model;
   // YoloxDetector input range, probed per detection model (see runDetector).
   enum class YoloxRange : uint8_t { Unknown, Unit, Raw } m_yolox_range{};
-  std::string m_last_reid_model;
   std::string m_last_cfg_log; // de-dup for the debug config trace
 
   // Custom box class names, loaded once when the Class Names File path changes.
@@ -1007,11 +1051,9 @@ private:
     int claimed = -1;           // m_mesh_frame of the last use (LRU)
     bool has_verts = false;
   };
-  // Heap-held: every Workspace keeps a pointer to the Model it was sized for.
-  std::unique_ptr<Onnx::Mhr::Model> m_mhr;
-  std::string m_last_body_model;
-  const char* m_last_body_data{}; // the mapping it was loaded from
-  size_t m_last_body_size{};
+  // The installed Body Model (m_body_models): every Workspace keeps a pointer
+  // to the Model it was sized for.
+  std::shared_ptr<const Onnx::Mhr::Model> m_mhr;
   std::vector<MeshSlot> m_mesh_slots;
   std::vector<int> m_inst_mesh; // per m_instances entry: its slot, or -1
   int m_single_mesh{-1};        // slot of the single-path pose (held too)

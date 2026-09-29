@@ -106,19 +106,20 @@ ImageProcessor::ImageProcessor() noexcept
 
 ImageProcessor::~ImageProcessor() = default;
 
-void ImageProcessor::reloadModel()
+namespace
 {
-  ++gen;
-  ctx = std::make_shared<Onnx::OnnxRunContext>(
-      inputs.model.file.bytes, inputs.model.file.filename);
-  spec = ctx->readModelSpec();
+// Worker side of a model change: the session, from the file (the port's
+// mapping may be gone by now), and the routing of its inputs.
+std::shared_ptr<const ImageModel> makeImageModel(const std::string& path)
+{
+  auto m = std::make_shared<ImageModel>();
+  m->ctx = Onnx::loadRunContext(path);
+  m->spec = m->ctx->readModelSpec();
+  const auto& spec = m->spec;
 
-  // Resolve multi-input roles: 1st image -> In, 2nd image -> Aux, scalar inputs
-  // -> Param 1/2. Single-input models keep multi_input=false.
-  march = Onnx::classifyModel(Onnx::toArchIO(spec));
-  image_input_index = -1;
-  aux_input_index = -1;
-  param_in[0] = param_in[1] = -1;
+  // 1st image -> In, 2nd image -> Aux, scalar inputs -> Param 1/2.
+  const auto march = Onnx::classifyModel(Onnx::toArchIO(spec));
+  m->image_input_index = -1;
   int img_seen = 0, param_seen = 0;
   for(int i = 0; i < (int)march.inputs.size(); ++i)
   {
@@ -126,38 +127,40 @@ void ImageProcessor::reloadModel()
     if(a == Onnx::PortArchetype::Image)
     {
       if(img_seen == 0)
-        image_input_index = i;
+        m->image_input_index = i;
       else if(img_seen == 1)
-        aux_input_index = i;
+        m->aux_input_index = i;
       ++img_seen;
     }
     else if(isScalarLike(a, spec.inputs[i].shape) && param_seen < 2)
     {
-      param_in[param_seen++] = i;
+      m->param_in[param_seen++] = i;
     }
   }
-  has_image_input = image_input_index >= 0;
-  if(image_input_index < 0)
-    image_input_index = 0;
-  multi_input = spec.inputs.size() > 1;
+  m->has_image_input = m->image_input_index >= 0;
+  if(m->image_input_index < 0)
+    m->image_input_index = 0;
+  m->multi_input = spec.inputs.size() > 1;
 
-  role = Onnx::classifyImage(
-      toImageIO(spec, image_input_index), inputs.output_index.value);
-  {
-    const auto io = toImageIO(spec, image_input_index);
-    out_kinds.clear();
-    for(int j = 0; j < (int)spec.outputs.size(); ++j)
-      out_kinds.push_back(Onnx::classifyImage(io, j).kind);
-  }
+  const auto io = toImageIO(spec, m->image_input_index);
+  for(int j = 0; j < (int)spec.outputs.size(); ++j)
+    m->out_kinds.push_back(Onnx::classifyImage(io, j).kind);
+  return m;
+}
+}
 
-  // Invalidate the latent-generation cache: a different GAN may produce an
-  // identical seed-derived latent, and without this the `latent == last_latent`
-  // short-circuit would keep showing the previous model's output.
+// A new model: jobs of the previous one bring nothing back, its role is
+// classified again, and the latent-generation cache is invalidated (a
+// different GAN may produce an identical seed-derived latent, and the
+// `latent == last_latent` short-circuit would keep showing the previous
+// model's output).
+void ImageProcessor::modelInstalled()
+{
+  failures.succeeded();
+  ++gen;
+  lastOutputIndex = -1;
   produced_latent = false;
   last_latent.clear();
-
-  lastModelPath = inputs.model.file.filename;
-  lastOutputIndex = inputs.output_index.value;
 }
 
 void ImageProcessor::operator()()
@@ -171,26 +174,29 @@ try
   if(inputs.model.file.bytes.empty())
     return;
 
-  // (Re)load / (re)classify on model or output-index change.
-  if(!ctx || lastModelPath != inputs.model.file.filename)
-  {
-    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
-      return;
-  }
-  else if(inputs.output_index.value != lastOutputIndex)
+  // A new file loads on the worker; the running model, if any, keeps running
+  // until it arrives.
+  if(!models.requested().is(inputs.model))
+    models.request(worker, ModelFile::of(inputs.model));
+  if(!models.model())
+    return;
+  const ImageModel& m = *models.model();
+
+  // (Re)classify on model or output-index change.
+  if(inputs.output_index.value != lastOutputIndex)
   {
     role = Onnx::classifyImage(
-        toImageIO(spec, image_input_index), inputs.output_index.value);
+        toImageIO(m.spec, m.image_input_index), inputs.output_index.value);
     lastOutputIndex = inputs.output_index.value;
   }
-  if(spec.inputs.empty() || spec.outputs.empty())
+  if(m.spec.inputs.empty() || m.spec.outputs.empty())
     return;
   if(!failures.ready())
     return; // the last frames failed the same way: backing off
 
   // A model with an image input is never run from a latent, whatever its
   // other inputs look like.
-  if(!has_image_input
+  if(!m.has_image_input
      && applyTaskOverride(role.kind, inputs.task.value)
             == ImageModelKind::LatentToImage)
     runLatent();
@@ -216,7 +222,7 @@ void ImageProcessor::runImage()
     return;
 
   // Multi-input models (image-pair / parametric) bind every input themselves.
-  if(multi_input)
+  if(models.model()->multi_input)
   {
     runImageMulti();
     return;
@@ -357,6 +363,10 @@ void runMulti(
 
 void ImageProcessor::runImageMulti()
 {
+  const ImageModel& m = *models.model();
+  const auto& spec = m.spec;
+  const int image_input_index = m.image_input_index;
+  const int aux_input_index = m.aux_input_index;
   const ImageModelKind kind = applyTaskOverride(role.kind, inputs.task.value);
   const Onnx::WriteMode wm = resolveWriteMode(inputs.output_mode.value, kind);
   const int nin = (int)spec.inputs.size();
@@ -441,7 +451,7 @@ void ImageProcessor::runImageMulti()
   {
     inferenceInProgress = true;
     auto job = JobPool<InferJob>::instance().acquire();
-    job->ctx = ctx;
+    job->ctx = m.ctx;
     job->multi = true;
     std::swap(job->input, storage);
     job->ishape = primary_shape;
@@ -456,13 +466,13 @@ void ImageProcessor::runImageMulti()
     }
     for(int k = 0; k < 2; ++k)
     {
-      job->param_index[k] = param_in[k];
+      job->param_index[k] = m.param_in[k];
       job->param_value[k] = k == 0 ? inputs.param1.value : inputs.param2.value;
     }
     job->output_index = inputs.output_index.value;
     job->kind = kind;
     job->wm = wm;
-    job->out_kinds = out_kinds;
+    job->out_kinds = m.out_kinds;
     job->gen = gen;
     worker.request(std::move(job));
     return;
@@ -478,11 +488,11 @@ void ImageProcessor::runImageMulti()
       .aux_dt = aux_input_index >= 0 ? spec.inputs[aux_input_index].elem_type
                                      : TensorElemType::Float,
       .aux_index = aux_input_index,
-      .param_index = {param_in[0], param_in[1]},
+      .param_index = {m.param_in[0], m.param_in[1]},
       .param_value = {inputs.param1.value, inputs.param2.value}};
   std::vector<Ort::Value> outs;
-  runMulti(*ctx, spec, mi, outs, half_buf, u8_buf, aux_half_buf, aux_u8_buf);
-  auto ds = decodeAll(outs, idx, kind, wm, out_kinds, out_scratch);
+  runMulti(*m.ctx, spec, mi, outs, half_buf, u8_buf, aux_half_buf, aux_u8_buf);
+  auto ds = decodeAll(outs, idx, kind, wm, m.out_kinds, out_scratch);
   applyDecoded(*this, ds);
 }
 
@@ -492,6 +502,8 @@ void ImageProcessor::dispatchInfer(
     std::vector<int64_t> ishape, ImageModelKind kind, Onnx::WriteMode wm,
     bool force_async)
 {
+  const ImageModel& m = *models.model();
+  const auto& spec = m.spec;
   const TensorElemType in_dt = spec.inputs[0].elem_type;
 
   if(force_async)
@@ -502,7 +514,7 @@ void ImageProcessor::dispatchInfer(
     // Pooled job: lock-free acquire; recycled vectors keep their capacity so
     // the assignments below don't allocate in steady state.
     auto job = JobPool<InferJob>::instance().acquire();
-    job->ctx = ctx;
+    job->ctx = m.ctx;
     // Swap (not copy) the preprocessed input into the job: `storage` is fully
     // rewritten next frame, so it can take the job's recycled buffer back and we
     // avoid a multi-MB memcpy every async frame.
@@ -512,7 +524,7 @@ void ImageProcessor::dispatchInfer(
     job->output_index = inputs.output_index.value;
     job->kind = kind;
     job->wm = wm;
-    job->out_kinds = out_kinds;
+    job->out_kinds = m.out_kinds;
     job->multi = false;
     job->gen = gen;
     worker.request(std::move(job));
@@ -527,10 +539,10 @@ void ImageProcessor::dispatchInfer(
   for(int i = 0; i < nout; ++i)
     outs.emplace_back(nullptr);
   Ort::Value ins[1] = {std::move(in_val)};
-  ctx->infer(spec, ins, outs);
+  m.ctx->infer(spec, ins, outs);
 
   const int idx = std::clamp(inputs.output_index.value, 0, nout - 1);
-  auto ds = decodeAll(outs, idx, kind, wm, out_kinds, out_scratch);
+  auto ds = decodeAll(outs, idx, kind, wm, m.out_kinds, out_scratch);
   applyDecoded(*this, ds);
 }
 
@@ -549,6 +561,19 @@ ImageProcessor::worker::work(std::unique_ptr<InferJob> job)
       JobPool<InferJob>::instance().release(std::move(j));
     }
   } recycle{job};
+
+  if(job && job->load.active())
+    return ModelLoader<const ImageModel, InferJob>::work<&ImageProcessor::models, ImageProcessor>(
+        job->load, [](const ModelFile& f) { return makeImageModel(f.path); },
+        [](ImageProcessor& self) { self.modelInstalled(); },
+        [](ImageProcessor& self, std::string_view what) {
+      self.failures.failed(
+          ImageProcessor::name(), self.models.requested().path,
+          std::string("cannot load the model: ").append(what));
+      // Not when another file was picked since: that one is still to load.
+      if(self.models.requested().is(self.inputs.model))
+        self.inputs.model.current_model_invalid = true;
+    });
 
   if(!job || !job->ctx)
     return [](ImageProcessor& self) { self.inferenceInProgress = false; };
@@ -647,7 +672,7 @@ void ImageProcessor::runLatent()
   // (dynamic -1 / batch) dim resolved. The single dynamic axis carries the
   // latent length; any other dynamic dim becomes 1. Leaving a -1 in the shape
   // would make CreateTensor throw and permanently invalidate the model.
-  std::vector<int64_t> ishape = spec.inputs[0].shape;
+  std::vector<int64_t> ishape = models.model()->spec.inputs[0].shape;
   if(ishape.empty())
   {
     ishape = {1, dim};

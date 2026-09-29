@@ -6,6 +6,7 @@
 // No per-architecture hardcoding: the mapping output 0 is fed straight into the
 // synthesis input 0 (flat sizes must match, or a w+ [1,K,D] input repeats w).
 // The chain runs on a worker so a heavy generation never freezes the render thread.
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <ossia/detail/pod_vector.hpp>
@@ -47,6 +48,25 @@ enum class GenOutputMode
   DirectClamp,     // clamp(x,0,1)*255       — [0,1] outputs
 };
 
+// The files of the chain: the synthesis model and the optional mapping one.
+struct GenFiles
+{
+  ModelFile model, mapping;
+  bool operator==(const GenFiles&) const noexcept = default;
+};
+
+// Both stages of the chain and what z is built from, built on the worker.
+struct GenModel
+{
+  std::shared_ptr<Onnx::OnnxRunContext> ctx;     // synthesis / main
+  std::shared_ptr<Onnx::OnnxRunContext> map_ctx; // optional mapping
+  Onnx::ModelSpec spec;                          // synthesis spec
+  Onnx::ModelSpec map_spec;                      // mapping spec (when loaded)
+  // The first stage's first-input flat size: the latent size z is built with.
+  int latent_dim = 0;
+  std::vector<Onnx::AuxPlan> synth_aux, map_aux; // inputs after input 0
+};
+
 // Off-thread generation job: carries BOTH context pointers (mapping is optional)
 // plus the pre-built z buffer and everything work() needs to chain + decode
 // without touching the node. ctx pointers are shared so they outlive the frame.
@@ -57,6 +77,7 @@ enum class GenOutputMode
 // steady-state request path does not allocate). See OnnxModels/JobPool.hpp.
 struct GenJob
 {
+  ModelJob<const GenModel, GenFiles> load;
   uint32_t gen = 0; // the node's generation at dispatch
   std::shared_ptr<Onnx::OnnxRunContext> synth_ctx; // synthesis / main generator
   std::shared_ptr<Onnx::OnnxRunContext> map_ctx;   // optional mapping network
@@ -123,9 +144,9 @@ public:
 
   void operator()();
 
-  // Worker-thread generation (avendish pattern): generative models are heavy, so
-  // the chain runs off the render thread. Latest-wins: while a job is in flight
-  // new frames are dropped.
+  // The models load on the worker, and the chain runs there: generative
+  // models are heavy. Latest-wins: while a job is in flight new frames are
+  // dropped.
   struct worker
   {
     std::function<void(std::unique_ptr<GenJob>)> request;
@@ -145,19 +166,11 @@ public:
       const std::vector<int64_t>& map_out, const std::vector<int64_t>& synth_in);
 
 private:
-  std::shared_ptr<Onnx::OnnxRunContext> ctx;     // synthesis / main
-  std::shared_ptr<Onnx::OnnxRunContext> map_ctx; // optional mapping
-  Onnx::ModelSpec spec;                          // synthesis spec
-  Onnx::ModelSpec map_spec;                      // mapping spec (when loaded)
-  std::string lastModelPath;
-  std::string lastMappingPath;
-  bool loadFailed = false; // the current files did not load: wait for others
-  int latent_dim = 0;
+  ModelLoader<const GenModel, GenJob, GenFiles> models;
   bool inferenceInProgress = false;
   // Bumped by a model reload: a job of the previous model finishing later
   // must not publish its result (nor, for Auto, its mapping).
   uint32_t gen = 0;
-  std::vector<Onnx::AuxPlan> synth_aux, map_aux; // inputs after input 0
   std::optional<Onnx::WriteMode> autoMode; // Auto's choice for this model
 
   // z build state (re-infer only when the effective latent changed).
@@ -165,7 +178,7 @@ private:
   std::vector<float> last_z;
   bool produced = false;
 
-  void reloadModel();
+  void modelInstalled();
   void runGenerate();
 };
 
