@@ -697,6 +697,7 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     tests/test_instanthmr_tables.cpp
     tests/test_mhr_model.cpp
     tests/test_tensor_type_conversions.cpp
+    tests/test_audio_resampler.cpp
     # real object sources under test:
     RapidlibModels/Classifier.cpp
     RapidlibModels/Regressor.cpp

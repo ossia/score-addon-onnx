@@ -5,12 +5,10 @@
 // inference (e.g. CREPE 1024 @ 16k, Silero-VAD 512 @ 16k, EnCodec @ 24k,
 // DeepFilterNet/RAVE @ 48k, Demucs @ 44.1k). This file provides:
 //
-//   - ResamplerLin    : streaming linear resampler (host SR -> model SR and back)
+//   - Resampler        : band-limited resampler (host SR -> model SR and back)
 //   - AudioRing        : a fixed-capacity ring buffer (block accumulation / hop)
 //   - WaveformIO       : ring + resampler glue that fires the model at its
 //                        block/hop and builds the [1,C,N] / [1,N] waveform tensor
-//   - Stft / Istft     : optional host STFT/iSTFT (since ONNX has no complex
-//                        dtype, magnitude [1,F,T] or real/imag [1,2,F,T])
 //
 // Everything here is dependency-free (only <vector>/<cmath>/<cstdint>/<cstddef>
 // and the dependency-free TensorType.hpp) so the pure-logic parts compile and
@@ -29,39 +27,104 @@ namespace Onnx
 {
 
 // ---------------------------------------------------------------------------
-// Streaming linear resampler. One instance per channel direction. Keeps the
-// last input sample across calls so block boundaries don't click. ratio =
-// out_rate / in_rate. Output count is not known a-priori (it depends on the
-// fractional phase carried over), so process() appends to a caller-owned vector
-// that is reserve()d once in prepare().
+// Band-limited resampler: a Kaiser-windowed sinc, its cutoff below the lower
+// of the two Nyquist frequencies (a linear interpolation would alias
+// everything above the model's Nyquist into its band when going down, and
+// image the model's spectrum when going up). One instance per channel and
+// direction; ratio = out_rate / in_rate.
+//
+// Streaming: process() keeps the last input samples across blocks. Output k
+// is the input at time k / out_rate, produced once the `half` input samples
+// after that time have arrived (the latency). The output count of a
+// call depends on the fractional phase carried over, so process() appends to
+// a caller-owned vector reserved once. resampleWhole() converts a complete
+// signal instead: no latency, exactly round(n * ratio) samples.
 // ---------------------------------------------------------------------------
-struct ResamplerLin
+namespace resampler_detail
+{
+inline constexpr int zeros = 16;      // zero crossings on each side at cutoff 1
+inline constexpr int resolution = 512; // kernel table points per zero crossing
+inline constexpr double beta = 8.;    // Kaiser: ~80 dB stopband
+
+inline double besselI0(double x) noexcept
+{
+  double sum = 1., term = 1.;
+  for(int k = 1; k < 64 && term > 1e-12 * sum; ++k)
+  {
+    term *= (x / (2. * k)) * (x / (2. * k));
+    sum += term;
+  }
+  return sum;
+}
+
+// sinc(u) * kaiser(u / zeros) for u in [0, zeros], `resolution` points per
+// unit, plus a guard point.
+inline const std::vector<float>& kernel()
+{
+  static const std::vector<float> table = [] {
+    std::vector<float> t((std::size_t)zeros * resolution + 2, 0.f);
+    const double norm = 1. / besselI0(beta);
+    for(std::size_t i = 0; i + 1 < t.size(); ++i)
+    {
+      const double u = (double)i / resolution;
+      const double r = u / zeros;
+      const double w = r < 1. ? besselI0(beta * std::sqrt(1. - r * r)) * norm : 0.;
+      const double x = 3.14159265358979323846 * u;
+      t[i] = (float)(w * (u == 0. ? 1. : std::sin(x) / x));
+    }
+    return t;
+  }();
+  return table;
+}
+
+inline float kernelAt(const float* k, double u) noexcept
+{
+  u = std::abs(u) * resolution;
+  const auto i = (std::size_t)u;
+  if(i >= (std::size_t)zeros * resolution)
+    return 0.f;
+  const float f = (float)(u - (double)i);
+  return k[i] + (k[i + 1] - k[i]) * f;
+}
+
+// The cutoff, relative to the input's Nyquist: a little under the lower of
+// the two, for the transition band.
+inline double cutoff(double ratio) noexcept
+{
+  return 0.92 * std::min(1., ratio);
+}
+}
+
+struct Resampler
 {
   double ratio = 1.0; // out_rate / in_rate
-  double pos = 0.0;   // fractional read position into the (prev|cur) stream
-  float prev = 0.f;   // last sample of the previous block
-  bool primed = false;
+  double fc = 1.0;    // cutoff, relative to the input's Nyquist
+  int half = 0;       // input samples on each side of an output
+  double pos = 0.0;   // read position in `history`
+  std::vector<float> history;
 
-  void prepare(double in_rate, double out_rate) noexcept
+  void prepare(double in_rate, double out_rate, std::size_t max_block = 0)
   {
-    ratio = (in_rate > 0.0) ? (out_rate / in_rate) : 1.0;
+    ratio = (in_rate > 0.0 && out_rate > 0.0) ? (out_rate / in_rate) : 1.0;
+    fc = resampler_detail::cutoff(ratio);
+    half = (int)std::ceil(resampler_detail::zeros / fc);
+    (void)resampler_detail::kernel(); // built here, not on the audio thread
+    history.clear();
+    history.reserve(max_block + 2 * (std::size_t)half + 4);
     reset();
   }
 
   void reset() noexcept
   {
-    pos = 0.0;
-    prev = 0.f;
-    primed = false;
+    // The first outputs read `half` samples of silence before the signal.
+    history.assign((std::size_t)half, 0.f);
+    pos = (double)half;
   }
 
-  bool passthrough() const noexcept
-  {
-    return std::abs(ratio - 1.0) < 1e-9;
-  }
+  bool passthrough() const noexcept { return std::abs(ratio - 1.0) < 1e-9; }
 
-  // Resample `in` (n samples) into `out` (appended). Returns number appended.
-  // `out` must have spare capacity (reserved in prepare()); we never shrink it.
+  // Resample `in` (n samples) into `out` (appended). Returns the number
+  // appended. `out` needs spare capacity for about n * ratio + 2 samples.
   std::size_t process(const float* in, std::size_t n, std::vector<float>& out)
   {
     if(n == 0)
@@ -69,54 +132,74 @@ struct ResamplerLin
     if(passthrough())
     {
       out.insert(out.end(), in, in + n);
-      prev = in[n - 1];
-      primed = true;
       return n;
     }
 
-    // The virtual input stream is [prev, in[0], in[1], ... in[n-1]], indexed
-    // from -1. We advance `pos` (in input-sample units) by 1/ratio per output
-    // sample and read while the right neighbour is still inside this block.
+    history.insert(history.end(), in, in + n);
+    const float* k = resampler_detail::kernel().data();
+    const float* h = history.data();
     const double step = 1.0 / ratio;
     const std::size_t before = out.size();
-    if(!primed)
+    // An output at `pos` reads history[i0 - half + 1 .. i0 + half].
+    while((std::size_t)pos + (std::size_t)half < history.size())
     {
-      // First-ever block: start exactly on in[0], no carried `prev`.
-      pos = 0.0;
-      while(pos < (double)(n - 1) + 1e-12)
+      const auto i0 = (std::ptrdiff_t)pos;
+      const double frac = pos - (double)i0;
+      double acc = 0., wsum = 0.;
+      for(int j = -half + 1; j <= half; ++j)
       {
-        const auto i0 = (std::ptrdiff_t)std::floor(pos);
-        const double frac = pos - (double)i0;
-        const float a = in[i0];
-        const float b = (i0 + 1 < (std::ptrdiff_t)n) ? in[i0 + 1] : in[n - 1];
-        out.push_back((float)(a + (b - a) * frac));
-        pos += step;
+        const float w = resampler_detail::kernelAt(k, ((double)j - frac) * fc);
+        acc += (double)w * h[i0 + j];
+        wsum += w;
       }
-      // Next block uses index -1 == this block's in[n-1] (== prev), so the
-      // carried phase shifts by n (block-2 index = absolute pos - n).
-      pos -= (double)n;
+      out.push_back(wsum != 0. ? (float)(acc / wsum) : 0.f);
+      pos += step;
     }
-    else
+
+    // Drop what no later output reads.
+    const auto keep_from = (std::ptrdiff_t)pos - half + 1;
+    if(keep_from > 0)
     {
-      // pos is measured from index -1 (i.e. `prev`). Read until we'd need a
-      // sample at or past n (which belongs to the next block).
-      while(pos < (double)(n - 1) + 1e-12)
-      {
-        const auto idx = pos; // -1 == prev, 0 == in[0], ...
-        const auto i0 = (std::ptrdiff_t)std::floor(idx);
-        const double frac = idx - (double)i0;
-        const float a = (i0 < 0) ? prev : in[i0];
-        const float b = (i0 + 1 < 0)        ? prev
-                        : (i0 + 1 < (std::ptrdiff_t)n) ? in[i0 + 1]
-                                                       : in[n - 1];
-        out.push_back((float)(a + (b - a) * frac));
-        pos += step;
-      }
-      pos -= (double)n; // shift origin: next block's prev becomes index -1
+      history.erase(history.begin(), history.begin() + keep_from);
+      pos -= (double)keep_from;
     }
-    prev = in[n - 1];
-    primed = true;
     return out.size() - before;
+  }
+
+  // A complete signal at another rate: round(n * ratio) samples, aligned on
+  // the input (the signal is taken as silent outside of it).
+  static void
+  resampleWhole(const float* in, std::size_t n, double ratio, std::vector<float>& out)
+  {
+    out.clear();
+    if(n == 0 || !(ratio > 0.))
+      return;
+    if(std::abs(ratio - 1.0) < 1e-9)
+    {
+      out.assign(in, in + n);
+      return;
+    }
+    const double fc = resampler_detail::cutoff(ratio);
+    const int half = (int)std::ceil(resampler_detail::zeros / fc);
+    const float* k = resampler_detail::kernel().data();
+    const auto m = (std::size_t)std::llround((double)n * ratio);
+    out.resize(m);
+    for(std::size_t o = 0; o < m; ++o)
+    {
+      const double t = (double)o / ratio;
+      const auto i0 = (std::ptrdiff_t)t;
+      const double frac = t - (double)i0;
+      double acc = 0., wsum = 0.;
+      for(int j = -half + 1; j <= half; ++j)
+      {
+        const float w = resampler_detail::kernelAt(k, ((double)j - frac) * fc);
+        wsum += w;
+        const std::ptrdiff_t i = i0 + j;
+        if(i >= 0 && i < (std::ptrdiff_t)n)
+          acc += (double)w * in[i];
+      }
+      out[o] = wsum != 0. ? (float)(acc / wsum) : 0.f;
+    }
   }
 };
 
@@ -319,7 +402,7 @@ struct WaveformInput
   int64_t block = 0; // resolved model block (fixed when shape.block>0)
   int64_t hop = 0;   // <= block; defaults to block (no overlap)
 
-  std::vector<ResamplerLin> resamplers; // one per host channel
+  std::vector<Resampler> resamplers; // one per host channel
   std::vector<AudioRing> rings;         // one per model channel (post-mix)
   std::vector<std::vector<float>> rs_scratch; // resample output staging
 
@@ -341,7 +424,7 @@ struct WaveformInput
 
     resamplers.assign(hc, {});
     for(auto& r : resamplers)
-      r.prepare(in_rate, out_rate);
+      r.prepare(in_rate, out_rate, max_host_frames);
 
     // A host block of `max_host_frames` becomes up to ceil(frames*ratio)+1
     // model-rate samples; ring must hold a full model block plus that margin.
@@ -430,7 +513,7 @@ struct WaveformOutput
   double model_rate = 48000.0;
   double host_rate = 48000.0;
   int channels = 1;
-  std::vector<ResamplerLin> resamplers; // one per channel (model->host)
+  std::vector<Resampler> resamplers; // one per channel (model->host)
   std::vector<AudioRing> rings;         // one per channel (host rate)
   std::vector<std::vector<float>> rs_scratch;
 
@@ -450,7 +533,7 @@ struct WaveformOutput
     host_rate = out_rate;
     resamplers.assign(channels, {});
     for(auto& r : resamplers)
-      r.prepare(in_rate, out_rate);
+      r.prepare(in_rate, out_rate, (std::size_t)std::max<int64_t>(model_block, 0));
 
     const double ratio = (in_rate > 0) ? out_rate / in_rate : 1.0;
     const std::size_t per_block
@@ -569,155 +652,6 @@ struct WaveformOutput
   std::size_t available() const noexcept
   {
     return rings.empty() ? 0 : rings[0].size();
-  }
-};
-
-// ---------------------------------------------------------------------------
-// Optional host STFT / iSTFT. ONNX has no complex dtype, so spectrogram models
-// take either magnitude [1,F,T] or real/imag interleaved [1,2,F,T]. We provide
-// a naive (O(F*N)) DFT good enough for the small n_fft used by most models;
-// preallocated window + work buffers keep the steady state allocation-free.
-// ---------------------------------------------------------------------------
-struct Stft
-{
-  int n_fft = 512;
-  int hop = 128;
-  std::vector<float> window; // length n_fft
-  std::vector<float> cosT, sinT; // [F * n_fft] precomputed twiddles
-
-  void prepare(int nfft, int hop_size)
-  {
-    n_fft = nfft > 0 ? nfft : 512;
-    hop = hop_size > 0 ? hop_size : n_fft / 4;
-    const int F = n_fft / 2 + 1;
-    window.assign(n_fft, 0.f);
-    for(int i = 0; i < n_fft; ++i) // Hann
-      window[i]
-          = 0.5f * (1.f - std::cos(2.f * 3.14159265358979323846f * i
-                                   / (float)(n_fft - 1)));
-    cosT.assign((std::size_t)F * n_fft, 0.f);
-    sinT.assign((std::size_t)F * n_fft, 0.f);
-    for(int f = 0; f < F; ++f)
-      for(int n = 0; n < n_fft; ++n)
-      {
-        const double ang
-            = -2.0 * 3.14159265358979323846 * f * n / (double)n_fft;
-        cosT[(std::size_t)f * n_fft + n] = (float)std::cos(ang);
-        sinT[(std::size_t)f * n_fft + n] = (float)std::sin(ang);
-      }
-  }
-
-  int bins() const noexcept { return n_fft / 2 + 1; }
-  int frames(std::size_t n) const noexcept
-  {
-    return (n < (std::size_t)n_fft) ? 0
-                                    : 1 + (int)((n - n_fft) / hop);
-  }
-
-  // Forward STFT of `in` (n mono samples). Outputs magnitude [F,T] (row-major,
-  // bin-major) if `mag` non-null, and/or real/imag [2,F,T] if re/im non-null.
-  // Caller sizes the outputs via bins()/frames(). RT-safe (no allocation).
-  void forward(
-      const float* in, std::size_t n, float* mag, float* re, float* im) const
-  {
-    const int F = bins();
-    const int T = frames(n);
-    for(int t = 0; t < T; ++t)
-    {
-      const std::size_t off = (std::size_t)t * hop;
-      for(int f = 0; f < F; ++f)
-      {
-        double rr = 0.0, ii = 0.0;
-        const float* ct = &cosT[(std::size_t)f * n_fft];
-        const float* st = &sinT[(std::size_t)f * n_fft];
-        for(int k = 0; k < n_fft; ++k)
-        {
-          const float s = in[off + k] * window[k];
-          rr += s * ct[k];
-          ii += s * st[k];
-        }
-        const std::size_t idx = (std::size_t)f * T + t;
-        if(re)
-          re[idx] = (float)rr;
-        if(im)
-          im[idx] = (float)ii;
-        if(mag)
-          mag[idx] = (float)std::sqrt(rr * rr + ii * ii);
-      }
-    }
-  }
-};
-
-// Inverse STFT (overlap-add) from real/imag [F,T]. Reconstructs into `out`
-// (length >= (T-1)*hop + n_fft, pre-zeroed by caller). Uses the same Hann
-// window for synthesis (COLA approx). RT-safe.
-struct Istft
-{
-  int n_fft = 512;
-  int hop = 128;
-  std::vector<float> window;
-  std::vector<float> cosT, sinT; // [F * n_fft]
-  std::vector<float> norm;       // window^2 overlap normalisation per sample
-
-  void prepare(int nfft, int hop_size, std::size_t max_out)
-  {
-    n_fft = nfft > 0 ? nfft : 512;
-    hop = hop_size > 0 ? hop_size : n_fft / 4;
-    const int F = n_fft / 2 + 1;
-    window.assign(n_fft, 0.f);
-    for(int i = 0; i < n_fft; ++i)
-      window[i]
-          = 0.5f * (1.f - std::cos(2.f * 3.14159265358979323846f * i
-                                   / (float)(n_fft - 1)));
-    cosT.assign((std::size_t)F * n_fft, 0.f);
-    sinT.assign((std::size_t)F * n_fft, 0.f);
-    for(int f = 0; f < F; ++f)
-      for(int nn = 0; nn < n_fft; ++nn)
-      {
-        const double ang
-            = 2.0 * 3.14159265358979323846 * f * nn / (double)n_fft;
-        cosT[(std::size_t)f * n_fft + nn] = (float)std::cos(ang);
-        sinT[(std::size_t)f * n_fft + nn] = (float)std::sin(ang);
-      }
-    norm.assign(max_out, 0.f);
-  }
-
-  std::size_t outLength(int T) const noexcept
-  {
-    return (T <= 0) ? 0 : (std::size_t)(T - 1) * hop + n_fft;
-  }
-
-  // out and norm scratch must be >= outLength(T) and pre-zeroed.
-  void inverse(const float* re, const float* im, int F, int T, float* out)
-  {
-    const std::size_t len = outLength(T);
-    for(std::size_t i = 0; i < len && i < norm.size(); ++i)
-      norm[i] = 0.f;
-    for(int t = 0; t < T; ++t)
-    {
-      const std::size_t off = (std::size_t)t * hop;
-      for(int k = 0; k < n_fft; ++k)
-      {
-        double acc = 0.0;
-        for(int f = 0; f < F; ++f)
-        {
-          const std::size_t idx = (std::size_t)f * T + t;
-          const float c = cosT[(std::size_t)f * n_fft + k];
-          const float s = sinT[(std::size_t)f * n_fft + k];
-          // real part of inverse DFT with Hermitian symmetry folded into F bins
-          const double scale = (f == 0 || f == F - 1) ? 1.0 : 2.0;
-          acc += scale * (re[idx] * c - im[idx] * s);
-        }
-        acc /= (double)n_fft;
-        const float w = window[k];
-        out[off + k] += (float)acc * w;
-        if(off + k < norm.size())
-          norm[off + k] += w * w;
-      }
-    }
-    for(std::size_t i = 0; i < len && i < norm.size(); ++i)
-      if(norm[i] > 1e-8f)
-        out[i] /= norm[i];
   }
 };
 
