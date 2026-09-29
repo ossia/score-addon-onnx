@@ -2,6 +2,7 @@
 // when its model or image is missing.
 #include <tests/AllocCounter.hpp>
 #include <tests/TestPaths.hpp>
+#include <tests/TestWorker.hpp>
 #include <OnnxModels/PoseDetector_internal.hpp>
 
 #include <QFile>
@@ -18,6 +19,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -48,12 +51,26 @@ struct Harness
     node.inputs.det_model.file.filename = det_name;
     node.inputs.model.file.bytes = lm_bytes;
     node.inputs.model.file.filename = lm_name;
+    inlineWorker(node);
   }
 
-  // The Body Model port (a view too).
+  // The Body Model port (a view too). The worker reads the file: a name that
+  // is not a file on disk is written to a temporary one.
   std::string body_name, body_bytes;
   void setBodyModel(std::string name, std::string bytes)
   {
+    if(!name.empty() && !std::filesystem::exists(name))
+    {
+      static const auto dir = [] {
+        auto d = std::filesystem::temp_directory_path()
+                 / ("score-onnx-pose-" + std::to_string(std::random_device{}()));
+        std::filesystem::create_directories(d);
+        return d;
+      }();
+      const auto path = (dir / name).string();
+      std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
+      name = path;
+    }
     body_name = std::move(name);
     body_bytes = std::move(bytes);
     node.inputs.body_model.file.bytes = body_bytes;

@@ -191,12 +191,11 @@ static void resolveTokenIO(TokenPipeline& P);
 // Worker side of a model change: the session (from the file, since the
 // port's mapping may be gone by now), the routing, the voices.
 static std::shared_ptr<TokenPipeline>
-makeTokenPipeline(const std::string& path, double host_rate)
+makeTokenPipeline(const std::string& path)
 {
   auto pp = std::make_shared<TokenPipeline>();
   auto& P = *pp;
   P.path = path;
-  P.host_rate = host_rate;
   P.ctx = Onnx::loadRunContext(path, Onnx::Options::precise());
   P.spec = P.ctx->readModelSpec();
   const auto io = Onnx::toArchIO(P.spec);
@@ -410,39 +409,29 @@ float TextToken::paramValue(int idx) const
   }
 }
 
-void TextToken::requestBuild()
-{
-  building = true;
-  requested = std::string(inputs.model.file.filename);
-  auto job = JobPool<TokenInferJob>::instance().acquire();
-  job->kind = TokenInferJob::Kind::Build;
-  job->build_path = requested;
-  job->build_host_rate = host_rate;
-  worker.request(std::move(job));
-}
-
-// On the audio thread: the new model replaces the running one, which goes
-// back to the worker to be freed, with the utterance it was playing. A job
-// still running on the previous model is dropped (gen) but keeps
+// On the audio thread: the new model replaces the running one, and the
+// utterance it was playing goes back to the worker to be freed. A job still
+// running on the previous model is dropped (gen) but keeps
 // inferenceInProgress until it returns, so that jobs never overlap.
-void TextToken::install(std::shared_ptr<TokenPipeline> p)
+void TextToken::modelInstalled()
 {
-  std::swap(pipe, p);
+  pipe = models.model();
+  if(pipe)
+    failures.succeeded();
   last_tokens.clear();
   pending = false;
   ++gen;
   TtsUtterance old;
   std::swap(old, utterance);
-  dispose(std::move(p), std::move(old));
+  dispose(std::move(old));
 }
 
-void TextToken::dispose(std::shared_ptr<TokenPipeline> p, TtsUtterance u)
+void TextToken::dispose(TtsUtterance u)
 {
-  if(!p && u.samples.empty())
+  if(u.samples.empty())
     return;
   auto job = JobPool<TokenInferJob>::instance().acquire();
   job->kind = TokenInferJob::Kind::Dispose;
-  job->pipeline = std::move(p);
   job->utterance = std::move(u);
   worker.request(std::move(job));
 }
@@ -462,9 +451,8 @@ try
   }
 
   // A new file: its pipeline is built on the worker.
-  if(!building && (!pipe || pipe->path != inputs.model.file.filename)
-     && requested != inputs.model.file.filename)
-    requestBuild();
+  if(!models.requested().is(inputs.model))
+    models.request(worker, ModelFile::of(inputs.model));
   if(!pipe || pipe->refused || pipe->spec.inputs.empty() || pipe->spec.outputs.empty())
   {
     silence();
@@ -618,7 +606,6 @@ TextToken::worker::work(std::unique_ptr<TokenInferJob> job)
       if(j)
       {
         j->ctx.reset(); // don't keep the ORT session alive from the pool
-        j->pipeline.reset();
         j->utterance = {};
         j->kind = TokenInferJob::Kind::Infer;
       }
@@ -626,43 +613,22 @@ TextToken::worker::work(std::unique_ptr<TokenInferJob> job)
     }
   } recycle{job};
 
+  if(job && job->load.active())
+    return ModelLoader<TokenPipeline, TokenInferJob>::work<&TextToken::models, TextToken>(
+        job->load, [](const ModelFile& f) { return makeTokenPipeline(f.path); },
+        [](TextToken& self) { self.modelInstalled(); },
+        [](TextToken& self, std::string_view what) {
+      self.failures.failed(
+          TextToken::name(), self.models.requested().path,
+          std::string("cannot load the model: ").append(what));
+      // Not when another file was picked since: that one is still to load.
+      if(self.models.requested().is(self.inputs.model))
+        self.inputs.model.current_model_invalid = true;
+    });
   if(job && job->kind == TokenInferJob::Kind::Dispose)
   {
-    // The old session, pipeline and utterance are freed here.
-    job->pipeline.reset();
-    job->utterance = {};
+    job->utterance = {}; // the old utterance is freed here
     return {};
-  }
-  if(job && job->kind == TokenInferJob::Kind::Build)
-  {
-    try
-    {
-      auto p = makeTokenPipeline(job->build_path, job->build_host_rate);
-      return [p = std::move(p)](TextToken& self) mutable
-      {
-        self.building = false;
-        if(p->path != self.inputs.model.file.filename)
-        {
-          self.requested.clear(); // another file was picked meanwhile
-          self.dispose(std::move(p), {});
-          return;
-        }
-        self.failures.succeeded();
-        self.install(std::move(p));
-      };
-    }
-    catch(const std::exception& e)
-    {
-      return [what = std::string(e.what()), path = job->build_path](TextToken& self)
-      {
-        self.building = false;
-        if(path != self.inputs.model.file.filename)
-          return;
-        self.failures.failed(TextToken::name(), path, "cannot load the model: " + what);
-        self.inputs.model.current_model_invalid = true;
-        self.requested.clear(); // picking the file again retries
-      };
-    }
   }
 
   if(!job || !job->ctx)
@@ -796,7 +762,7 @@ TextToken::worker::work(std::unique_ptr<TokenInferJob> job)
       {
         std::swap(self.utterance, u);
         // The utterance it replaced is freed on the worker.
-        self.dispose(nullptr, std::move(u));
+        self.dispose(std::move(u));
       }
     };
   }

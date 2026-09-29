@@ -2,6 +2,7 @@
 #include <Onnx/helpers/ImageBuffer.hpp>
 
 #include <Onnx/helpers/FastVLM.hpp>
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 #include <halp/controls.hpp>
 #include <halp/file_port.hpp>
@@ -18,15 +19,14 @@
 namespace OnnxModels
 {
 
+// Vision encoder, embeddings, decoder, tokenizer.
+using VlmFiles = std::array<ModelFile, 4>;
+
+// The models load on the worker (`load`); an inference is a response for
+// `image` and `prompt`.
 struct VlmJob
 {
-  enum class Kind : uint8_t
-  {
-    Load,    // the models at `files`
-    Infer,   // a response for `image` and `prompt`
-    Dispose, // frees `vlm` off the processing thread
-  } kind = Kind::Infer;
-  std::array<std::string, 4> files; // vision encoder, embeddings, decoder, tokenizer
+  ModelJob<Onnx::FastVLMInference, VlmFiles> load;
   Onnx::ImageData image;
   std::string prompt;
   float temperature = 1.f;
@@ -116,16 +116,10 @@ public:
   } worker;
 
 private:
-  std::shared_ptr<Onnx::FastVLMInference> vlm;
-  // The files of the last load, the running one or one in progress: a load
-  // that fails is not retried until a file changes.
-  std::array<std::string, 4> requested;
-  bool loading = false;
+  ModelLoader<Onnx::FastVLMInference, VlmJob, VlmFiles> models;
+  std::shared_ptr<Onnx::FastVLMInference> vlm; // the installed model of `models`
   bool inferenceInProgress = false;
 
-  std::array<std::string_view, 4> files() const noexcept;
-  void requestLoad();
-  void dispose(std::shared_ptr<Onnx::FastVLMInference> old);
   void requestInference();
 };
 

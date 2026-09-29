@@ -10,6 +10,7 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
+#include <stdexcept>
 #include <cstdio>
 #include <cmath>
 
@@ -73,7 +74,7 @@ makePipeline(const AnalyzerBuildParams& bp, std::shared_ptr<Onnx::OnnxRunContext
   auto P = std::make_shared<AnalyzerPipeline>();
   P->params = bp;
   if(!ctx)
-    ctx = Onnx::loadRunContext(bp.path, Onnx::Options::precise());
+    ctx = Onnx::loadRunContext(bp.file.path, Onnx::Options::precise());
   P->ctx = std::move(ctx);
   P->spec = P->ctx->readModelSpec();
   P->arch = Onnx::classifyModel(Onnx::toArchIO(P->spec));
@@ -149,7 +150,7 @@ static void buildPipeline(AnalyzerPipeline& P)
       = Onnx::WaveformShape::fromInputShape(P.spec.inputs[P.wave_in_index].shape);
   P.model_rate = bp.rate_override > 0
                    ? (double)bp.rate_override
-                   : Onnx::audioModelRate(*P.ctx, bp.path, 16000.);
+                   : Onnx::audioModelRate(*P.ctx, bp.file.path, 16000.);
   P.normalize_frames = isCrepe(P.spec);
 
   const int hc = bp.host_channels > 0 ? bp.host_channels : 1;
@@ -172,7 +173,7 @@ void AudioAnalyzer::zeroStates()
 AnalyzerBuildParams AudioAnalyzer::currentParams() const
 {
   return {
-      .path = std::string(inputs.model.file.filename),
+      .file = ModelFile::of(inputs.model),
       .host_rate = host_rate,
       .host_channels = host_in_channels,
       .max_frames = max_frames,
@@ -185,33 +186,6 @@ bool AudioAnalyzer::sameSettings(const AnalyzerBuildParams& p) const noexcept
          && p.max_frames == max_frames && p.rate_override == inputs.model_rate.value;
 }
 
-void AudioAnalyzer::requestBuild(const AnalyzerBuildParams& p, bool reuse_session)
-{
-  building = true;
-  requested = p;
-  auto job = JobPool<AnalyzerJob>::instance().acquire();
-  job->kind = AnalyzerJob::Kind::Build;
-  job->build = p;
-  job->ctx = reuse_session && pipe ? pipe->ctx : nullptr;
-  worker.request(std::move(job));
-}
-
-void AudioAnalyzer::install(std::shared_ptr<AnalyzerPipeline> p)
-{
-  std::swap(pipe, p);
-  dispose(std::move(p));
-}
-
-void AudioAnalyzer::dispose(std::shared_ptr<AnalyzerPipeline> p)
-{
-  if(!p)
-    return;
-  auto job = JobPool<AnalyzerJob>::instance().acquire();
-  job->kind = AnalyzerJob::Kind::Dispose;
-  job->pipeline = std::move(p);
-  worker.request(std::move(job));
-}
-
 void AudioAnalyzer::operator()(int frames)
 try
 {
@@ -221,16 +195,8 @@ try
 
   // A new file, or new settings: a pipeline is built on the worker; the
   // running one (if any) keeps analysing until it arrives.
-  if(!building)
-  {
-    if(!pipe || pipe->params.path != inputs.model.file.filename)
-    {
-      if(!pipe || requested.path != inputs.model.file.filename)
-        requestBuild(currentParams(), false);
-    }
-    else if(!sameSettings(pipe->params))
-      requestBuild(currentParams(), true);
-  }
+  if(const auto& r = models.requested(); !(r.file.is(inputs.model) && sameSettings(r)))
+    models.request(worker, currentParams());
   if(!pipe || !pipe->refusal.empty() || pipe->spec.inputs.empty()
      || pipe->spec.outputs.empty())
     return;
@@ -280,62 +246,44 @@ catch(...)
 std::function<void(AudioAnalyzer&)>
 AudioAnalyzer::worker::work(std::unique_ptr<AnalyzerJob> job)
 {
-  // Back to the lock-free pool, emptied, whatever path we exit through.
+  // Back to the lock-free pool, whatever path we exit through: the audio
+  // thread takes its next job from there without allocating.
   struct Recycle
   {
     std::unique_ptr<AnalyzerJob>& j;
-    ~Recycle()
-    {
-      if(j)
-      {
-        j->ctx.reset();
-        j->pipeline.reset();
-      }
-      JobPool<AnalyzerJob>::instance().release(std::move(j));
-    }
+    ~Recycle() { JobPool<AnalyzerJob>::instance().release(std::move(j)); }
   } recycle{job};
   if(!job)
     return {};
-  if(job->kind == AnalyzerJob::Kind::Dispose)
-  {
-    job->pipeline.reset(); // the session and the buffers are freed here
-    return {};
-  }
-  try
-  {
-    auto p = makePipeline(job->build, std::move(job->ctx));
-    return [p = std::move(p)](AudioAnalyzer& self) mutable
+  // A settings change reuses the running session; a new file loads its own.
+  return ModelLoader<AnalyzerPipeline, AnalyzerJob, AnalyzerBuildParams>::work<
+      &AudioAnalyzer::models, AudioAnalyzer>(
+      job->load,
+      [](const AnalyzerBuildParams& bp, const std::shared_ptr<AnalyzerPipeline>& running) {
+    std::shared_ptr<AnalyzerPipeline> p;
+    try
     {
-      self.building = false;
-      if(p->params.path != self.inputs.model.file.filename)
-      {
-        self.dispose(std::move(p)); // another file was picked meanwhile
-        return;
-      }
-      if(!p->refusal.empty())
-      {
-        self.failures.failed(AudioAnalyzer::name(), p->params.path, p->refusal);
-        self.inputs.model.current_model_invalid = true;
-        self.requested.path.clear(); // picking the file again retries
-        self.dispose(std::move(p));
-        return;
-      }
+      p = makePipeline(bp, running && running->params.file == bp.file ? running->ctx : nullptr);
+    }
+    catch(const std::exception& e)
+    {
+      throw std::runtime_error(std::string("cannot load the model: ") + e.what());
+    }
+    if(!p->refusal.empty())
+      throw std::runtime_error(p->refusal);
+    return p;
+  },
+      [](AudioAnalyzer& self) {
+    self.pipe = self.models.model();
+    if(self.pipe)
       self.failures.succeeded();
-      self.install(std::move(p));
-    };
-  }
-  catch(const std::exception& e)
-  {
-    return [what = std::string(e.what()), path = job->build.path](AudioAnalyzer& self)
-    {
-      self.building = false;
-      if(path != self.inputs.model.file.filename)
-        return;
-      self.failures.failed(AudioAnalyzer::name(), path, "cannot load the model: " + what);
+  },
+      [](AudioAnalyzer& self, std::string_view what) {
+    self.failures.failed(AudioAnalyzer::name(), self.models.requested().file.path, what);
+    // Not when another file was picked since: that one is still to load.
+    if(self.models.requested().file.is(self.inputs.model))
       self.inputs.model.current_model_invalid = true;
-      self.requested.path.clear(); // picking the file again retries
-    };
-  }
+  });
 }
 
 void AudioAnalyzer::runBlock()

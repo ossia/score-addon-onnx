@@ -1,5 +1,6 @@
 #pragma once
 #include <Onnx/helpers/QwenLLM.hpp>
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/ThinkFilter.hpp>
 #include <OnnxModels/Utils.hpp>
 #include <halp/controls.hpp>
@@ -31,15 +32,18 @@ struct LlmTokenStream
   std::atomic_bool cancelled{false};
 };
 
+// The model and its tokenizer.
+struct LlmFiles
+{
+  ModelFile model, tokenizer;
+  bool operator==(const LlmFiles&) const noexcept = default;
+};
+
+// The model loads on the worker (`load`); a generation is a reply to
+// `prompt`, streamed to `stream`.
 struct LlmJob
 {
-  enum class Kind : uint8_t
-  {
-    Load,     // the model at `model` with the tokenizer at `tokenizer`
-    Generate, // a reply to `prompt`, streamed to `stream`
-    Dispose,  // frees `llm` off the processing thread
-  } kind = Kind::Generate;
-  std::string model, tokenizer;
+  ModelJob<Onnx::QwenLLMInference, LlmFiles> load;
   std::string prompt;
   float temperature = 0.7f;
   float topP = 0.9f;
@@ -169,17 +173,12 @@ public:
   } worker;
 
 private:
-  void request_load();
-  void dispose(std::shared_ptr<Onnx::QwenLLMInference> old);
   void request_inference();
   void cancel_generation() noexcept;
   void drain_stream();
 
-  std::shared_ptr<Onnx::QwenLLMInference> llm;
-  // The files of the last load, the running one or one in progress: a load
-  // that fails is not retried until a file changes.
-  std::string requested_model, requested_tokenizer;
-  bool loading = false;
+  ModelLoader<Onnx::QwenLLMInference, LlmJob, LlmFiles> models;
+  std::shared_ptr<Onnx::QwenLLMInference> llm; // the installed model of `models`
 
   void segmentPartials(std::string_view delta);
   // Adds generated text to the response and the partials, through the

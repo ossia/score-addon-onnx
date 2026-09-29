@@ -219,11 +219,10 @@ namespace
 {
 // Worker side of a model change: the session, from the file (the port's
 // mapping may be gone by now), and the routing of its inputs.
-std::shared_ptr<const GeomModel> makeGeomModel(const std::string& path)
+std::shared_ptr<const GeomModel> makeGeomModel(const ModelFile& f)
 {
   auto m = std::make_shared<GeomModel>();
-  m->path = path;
-  m->ctx = Onnx::loadRunContext(path);
+  m->ctx = Onnx::loadRunContext(f.path);
   m->spec = m->ctx->readModelSpec();
   const int ci = findCloudInput(m->spec);
   m->in_layout = (ci >= 0) ? Onnx::detectPointLayout(m->spec.inputs[ci].shape)
@@ -235,31 +234,11 @@ std::shared_ptr<const GeomModel> makeGeomModel(const std::string& path)
 }
 }
 
-void GeometryProcessor::requestBuild()
+// A new model: a job of the previous one finishing later brings nothing back.
+void GeometryProcessor::modelInstalled()
 {
-  building = true;
-  requested = inputs.model.file.filename;
-  auto job = JobPool<GeomInferJob>::instance().acquire();
-  job->kind = GeomInferJob::Kind::Build;
-  job->build_path = requested;
-  worker.request(std::move(job));
-}
-
-void GeometryProcessor::install(std::shared_ptr<const GeomModel> m)
-{
-  std::swap(model, m);
+  failures.succeeded();
   ++gen;
-  dispose(std::move(m));
-}
-
-void GeometryProcessor::dispose(std::shared_ptr<const GeomModel> m)
-{
-  if(!m)
-    return;
-  auto job = JobPool<GeomInferJob>::instance().acquire();
-  job->kind = GeomInferJob::Kind::Dispose;
-  job->model = std::move(m);
-  worker.request(std::move(job));
 }
 
 void GeometryProcessor::operator()()
@@ -273,9 +252,9 @@ try
     return;
 
   // A new file: its model is built on the worker.
-  if(!building && (!model || model->path != inputs.model.file.filename)
-     && requested != inputs.model.file.filename)
-    requestBuild();
+  if(!models.requested().is(inputs.model))
+    models.request(worker, ModelFile::of(inputs.model));
+  const auto& model = models.model();
   if(!model || model->spec.inputs.empty() || model->spec.outputs.empty())
     return;
   if(!failures.ready())
@@ -316,7 +295,7 @@ void GeometryProcessor::runCloud()
     return;
 
   // Fixed-N model: clamp/pad to the model's declared point count.
-  const PointLayout pl = model->in_layout;
+  const PointLayout pl = models.model()->in_layout;
   if(!pl.dynamicCount())
     npoints = std::min<int64_t>(npoints, pl.count);
 
@@ -344,6 +323,7 @@ void GeometryProcessor::runCloud()
 // for heavy models (latest-wins: drop frames while one is in flight).
 void GeometryProcessor::dispatchInfer(int64_t npoints, bool force_async)
 {
+  const auto& model = models.model();
   const auto& m = *model;
   std::vector<int64_t> ishape = Onnx::resolveShape(m.in_layout, npoints);
 
@@ -355,7 +335,6 @@ void GeometryProcessor::dispatchInfer(int64_t npoints, bool force_async)
     // Pooled job: lock-free acquire; recycled vectors keep their capacity so
     // the assignments below don't allocate in steady state.
     auto job = JobPool<GeomInferJob>::instance().acquire();
-    job->kind = GeomInferJob::Kind::Infer;
     job->model = model;
     // `packed` is rewritten next frame: it takes the job's buffer back.
     std::swap(job->input, packed);
@@ -399,43 +378,18 @@ GeometryProcessor::worker::work(std::unique_ptr<GeomInferJob> job)
 
   if(!job)
     return {};
-  switch(job->kind)
-  {
-    case GeomInferJob::Kind::Dispose:
-      job->model.reset(); // the session is freed here
-      return {};
-    case GeomInferJob::Kind::Build:
-      try
-      {
-        auto m = makeGeomModel(job->build_path);
-        return [m = std::move(m)](GeometryProcessor& self) mutable {
-          self.building = false;
-          if(m->path != self.inputs.model.file.filename)
-          {
-            self.requested.clear(); // another file was picked meanwhile
-            self.dispose(std::move(m));
-            return;
-          }
-          self.failures.succeeded();
-          self.install(std::move(m));
-        };
-      }
-      catch(const std::exception& e)
-      {
-        return [what = std::string(e.what()),
-                path = job->build_path](GeometryProcessor& self) {
-          self.building = false;
-          if(path != self.inputs.model.file.filename)
-            return;
-          self.failures.failed(
-              GeometryProcessor::name(), path, "cannot load the model: " + what);
-          self.inputs.model.current_model_invalid = true;
-          self.requested.clear(); // picking the file again retries
-        };
-      }
-    case GeomInferJob::Kind::Infer:
-      break;
-  }
+  if(job->load.active())
+    return ModelLoader<const GeomModel, GeomInferJob>::work<&GeometryProcessor::models, GeometryProcessor>(
+        job->load, [](const ModelFile& f) { return makeGeomModel(f); },
+        [](GeometryProcessor& self) { self.modelInstalled(); },
+        [](GeometryProcessor& self, std::string_view what) {
+      self.failures.failed(
+          GeometryProcessor::name(), self.models.requested().path,
+          std::string("cannot load the model: ").append(what));
+      // Not when another file was picked since: that one is still to load.
+      if(self.models.requested().is(self.inputs.model))
+        self.inputs.model.current_model_invalid = true;
+    });
 
   if(!job->model)
     return [](GeometryProcessor& self) { self.inferenceInProgress = false; };

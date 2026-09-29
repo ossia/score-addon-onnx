@@ -31,7 +31,7 @@ TEST_CASE("Sequence Processor: the model loads and is probed on the worker", "[o
   node.inputs.in.value = {1.f, 2.f};
   node();
   REQUIRE(jobs.size() == 1);
-  CHECK(jobs.front()->kind == Job::Kind::Build);
+  CHECK(isLoadJob(*jobs.front()));
   CHECK(node.outputs.out.value.empty()); // nothing runs before the pipeline
   node();
   CHECK(jobs.size() == 1); // not requested twice

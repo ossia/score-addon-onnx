@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <span>
+#include <stdexcept>
 
 namespace OnnxModels
 {
@@ -423,37 +424,17 @@ void SequenceProcessor::reportError(std::string_view what)
   failures.failed(name(), inputs.model.file.filename, what);
 }
 
-void SequenceProcessor::requestBuild()
+// On the processing thread: the new model replaces the running one. A job of
+// the old model still running brings nothing back (gen) but keeps
+// inferenceInProgress until it returns, so that jobs never overlap.
+void SequenceProcessor::modelInstalled()
 {
-  building = true;
-  requested = std::string(inputs.model.file.filename);
-  auto job = JobPool<SeqInferJob>::instance().acquire();
-  job->kind = SeqInferJob::Kind::Build;
-  job->build_path = requested;
-  job->build_bytes = inputs.model.file.bytes.size();
-  worker.request(std::move(job));
-}
-
-// On the processing thread: the new model replaces the running one, which
-// goes back to the worker to be freed. A job of the old model still running
-// brings nothing back (gen) but keeps inferenceInProgress until it returns,
-// so that jobs never overlap.
-void SequenceProcessor::install(std::shared_ptr<SeqPipeline> p)
-{
-  std::swap(pipe, p);
+  pipe = models.model();
+  if(!pipe)
+    return;
+  failures.succeeded();
   resetState();
   resolveWindow();
-  dispose(std::move(p));
-}
-
-void SequenceProcessor::dispose(std::shared_ptr<SeqPipeline> p)
-{
-  if(!p)
-    return;
-  auto job = JobPool<SeqInferJob>::instance().acquire();
-  job->kind = SeqInferJob::Kind::Dispose;
-  job->pipeline = std::move(p);
-  worker.request(std::move(job));
 }
 
 // The model needs a fixed T when the primary input rank>=3 with a concrete time
@@ -494,9 +475,8 @@ try
     return;
 
   // A new file: its pipeline is built (and probed) on the worker.
-  if(!building && (!pipe || pipe->path != inputs.model.file.filename)
-     && requested != inputs.model.file.filename)
-    requestBuild();
+  if(!models.requested().is(inputs.model))
+    models.request(worker, ModelFile::of(inputs.model));
   if(!pipe || pipe->spec.inputs.empty() || pipe->spec.outputs.empty())
     return;
   auto& P = *pipe;
@@ -565,7 +545,6 @@ void SequenceProcessor::dispatchInfer(bool force_async)
     // Pooled job: lock-free acquire; recycled vectors keep their capacity so
     // the assignments below don't allocate in steady state.
     auto job = JobPool<SeqInferJob>::instance().acquire();
-    job->kind = SeqInferJob::Kind::Infer;
     job->ctx = P.ctx;
     std::swap(job->input, P.input); // the job's recycled buffer comes back
     job->ishape.assign(P.ishape.begin(), P.ishape.end());
@@ -616,57 +595,35 @@ SequenceProcessor::worker::work(std::unique_ptr<SeqInferJob> job)
       if(j)
       {
         j->ctx.reset(); // don't keep the ORT session alive from the pool
-        j->pipeline.reset();
-        j->kind = SeqInferJob::Kind::Infer;
       }
       JobPool<SeqInferJob>::instance().release(std::move(j));
     }
   } recycle{job};
 
-  if(job && job->kind == SeqInferJob::Kind::Dispose)
-  {
-    job->pipeline.reset(); // the session and the buffers are freed here
-    return {};
-  }
-  if(job && job->kind == SeqInferJob::Kind::Build)
-  {
-    try
-    {
-      auto p = makeSeqPipeline(job->build_path, job->build_bytes);
-      return [p = std::move(p)](SequenceProcessor& self) mutable
+  if(job && job->load.active())
+    return ModelLoader<SeqPipeline, SeqInferJob>::work<&SequenceProcessor::models, SequenceProcessor>(
+        job->load,
+        [](const ModelFile& f) {
+      std::shared_ptr<SeqPipeline> p;
+      try
       {
-        self.building = false;
-        if(p->path != self.inputs.model.file.filename)
-        {
-          self.requested.clear(); // another file was picked meanwhile
-          self.dispose(std::move(p));
-          return;
-        }
-        if(!p->refusal.empty())
-        {
-          self.reportError(p->refusal);
-          self.inputs.model.current_model_invalid = true;
-          self.requested.clear(); // picking the file again retries
-          self.dispose(std::move(p));
-          return;
-        }
-        self.failures.succeeded();
-        self.install(std::move(p));
-      };
-    }
-    catch(const std::exception& e)
-    {
-      return [what = std::string(e.what()), path = job->build_path](SequenceProcessor& self)
+        p = makeSeqPipeline(f.path, f.size);
+      }
+      catch(const std::exception& e)
       {
-        self.building = false;
-        if(path != self.inputs.model.file.filename)
-          return;
-        self.reportError("cannot load the model: " + what);
+        throw std::runtime_error(std::string("cannot load the model: ") + e.what());
+      }
+      if(!p->refusal.empty())
+        throw std::runtime_error(p->refusal);
+      return p;
+    },
+        [](SequenceProcessor& self) { self.modelInstalled(); },
+        [](SequenceProcessor& self, std::string_view what) {
+      self.failures.failed(SequenceProcessor::name(), self.models.requested().path, what);
+      // Not when another file was picked since: that one is still to load.
+      if(self.models.requested().is(self.inputs.model))
         self.inputs.model.current_model_invalid = true;
-        self.requested.clear(); // picking the file again retries
-      };
-    }
-  }
+    });
 
   if(!job || !job->ctx)
     return [](SequenceProcessor& self) { self.inferenceInProgress = false; };

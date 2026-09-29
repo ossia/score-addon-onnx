@@ -1,5 +1,6 @@
 #pragma once
 #include <OnnxModels/ImageEnums.hpp>
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <ossia/detail/pod_vector.hpp>
@@ -30,6 +31,23 @@ namespace OnnxModels
 {
 struct ImageProcessor;
 
+// A model file and the routing of its inputs, built on the worker.
+struct ImageModel
+{
+  std::shared_ptr<Onnx::OnnxRunContext> ctx;
+  Onnx::ModelSpec spec;
+  // Multi-input models (image pair, image + mask, image + scalars): the 1st
+  // image input takes In, the 2nd Aux, the scalar ones Param 1 / 2.
+  bool multi_input = false;
+  int image_input_index = 0;
+  bool has_image_input = false; // no image input: a latent -> image model
+  int aux_input_index = -1;
+  int param_in[2] = {-1, -1};
+  // Auto role of every model output (index = output index). The Output Index
+  // output goes where Task says; the others fill the outlets it left free.
+  std::vector<Onnx::ImageModelKind> out_kinds;
+};
+
 // Off-thread inference job: a preprocessed input plus everything work() needs to
 // run + decode without touching the node. ctx is shared so it outlives the node
 // frame; readModelSpec() is re-read inside work() for thread-stable name ptrs.
@@ -40,6 +58,7 @@ struct ImageProcessor;
 // steady-state request path does not allocate). See OnnxModels/JobPool.hpp.
 struct InferJob
 {
+  ModelJob<const ImageModel> load;
   uint32_t gen = 0; // the node's generation at dispatch
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   boost::container::vector<float> input;
@@ -121,8 +140,8 @@ public:
 
   void operator()();
 
-  // Worker-thread inference (avendish pattern): heavy models run off the render
-  // thread so a slow inference can't freeze the graph. Cheap models stay inline.
+  // The model loads on the worker. Heavy models run there too, so a slow
+  // inference can't freeze the graph; cheap ones run inline.
   struct worker
   {
     std::function<void(std::unique_ptr<InferJob>)> request;
@@ -131,13 +150,8 @@ public:
   } worker;
 
 private:
-  std::shared_ptr<Onnx::OnnxRunContext> ctx;
-  Onnx::ModelSpec spec;
+  ModelLoader<const ImageModel, InferJob> models;
   Onnx::ImageModelRole role;
-  // Auto role of every model output (index = output index). The Output Index
-  // output goes where Task says; the others fill the outlets it left free.
-  std::vector<Onnx::ImageModelKind> out_kinds;
-  std::string lastModelPath;
   int lastOutputIndex = -1;
   bool inferenceInProgress = false;
   // Bumped by a model reload: a job of the previous model finishing later
@@ -152,14 +166,6 @@ private:
   // Output dtype->float scratch (only used when a result is not fp32).
   std::vector<float> out_scratch;
 
-  // Multi-input (image-pair / parametric) support. Roles are resolved once per
-  // model from classifyModel; single-input models leave multi_input=false.
-  Onnx::ModelArchetype march;
-  bool multi_input = false;
-  int image_input_index = 0;
-  bool has_image_input = false; // no image input: a latent -> image model
-  int aux_input_index = -1;
-  int param_in[2] = {-1, -1};
   boost::container::vector<float> aux_storage;
   std::vector<uint16_t> aux_half_buf;
   std::vector<uint8_t> aux_u8_buf;
@@ -169,7 +175,7 @@ private:
   std::vector<float> last_latent;
   bool produced_latent = false;
 
-  void reloadModel();
+  void modelInstalled();
   void runImage();
   void runImageMulti();
   void runLatent();

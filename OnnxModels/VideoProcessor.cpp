@@ -164,15 +164,19 @@ VideoProcessor::VideoProcessor() noexcept
 
 VideoProcessor::~VideoProcessor() = default;
 
-// Identify the primary image input, the scalar param inputs, and the recurrent
-// state slots (RecurrentState input -> matching output) using classifyModel.
-void VideoProcessor::detectStates()
+namespace
 {
-  arch = Onnx::classifyModel(Onnx::toArchIO(spec));
-  states.clear();
-  imageInputIndex = 0;
-  param0InputIndex = param1InputIndex = -1;
-
+// Worker side of a model change: the session, from the file (the port's
+// mapping may be gone by now), the primary image input, the scalar param
+// inputs, and the recurrent state slots (RecurrentState input -> matching
+// output) using classifyModel.
+std::shared_ptr<const VideoModel> makeVideoModel(const std::string& path)
+{
+  auto m = std::make_shared<VideoModel>();
+  m->ctx = Onnx::loadRunContext(path);
+  m->spec = m->ctx->readModelSpec();
+  const auto& spec = m->spec;
+  const auto arch = Onnx::classifyModel(Onnx::toArchIO(spec));
   const int nin = (int)spec.inputs.size();
 
   // Recurrent-state slots: the RecurrentState inputs, each fed back from the
@@ -191,14 +195,14 @@ void VideoProcessor::detectStates()
     s.dtype = spec.inputs[i].elem_type;
     s.shape = concreteShape(spec.inputs[i].shape);
     s.count = Onnx::flatSize(s.shape);
-    states.push_back(std::move(s));
+    m->states.push_back(std::move(s));
   }
 
   // Primary image input: first non-state input classified Image (RVM: 'src').
   for(int i = 0; i < nin; ++i)
     if(!is_state[i] && arch.inputs[i].arch == PortArchetype::Image)
     {
-      imageInputIndex = i;
+      m->imageInputIndex = i;
       break;
     }
 
@@ -207,13 +211,18 @@ void VideoProcessor::detectStates()
   {
     if(!is_state[i] && arch.inputs[i].arch == PortArchetype::Scalar)
     {
-      if(param0InputIndex < 0)
-        param0InputIndex = i;
-      else if(param1InputIndex < 0)
-        param1InputIndex = i;
+      if(m->param0InputIndex < 0)
+        m->param0InputIndex = i;
+      else if(m->param1InputIndex < 0)
+        m->param1InputIndex = i;
     }
   }
-  zeroStates();
+
+  const auto io = toPrimaryImageIO(spec, m->imageInputIndex);
+  for(int j = 0; j < (int)spec.outputs.size(); ++j)
+    m->out_kinds.push_back(Onnx::classifyImage(io, j).kind);
+  return m;
+}
 }
 
 // Reset every recurrent state to its INITIAL declared size (dynamic dims -> 1)
@@ -226,6 +235,7 @@ void VideoProcessor::detectStates()
 // node stops. Shrinking back to [1,C,1,1] lets the model re-grow it cleanly.
 void VideoProcessor::zeroStates()
 {
+  const auto& spec = models.model()->spec;
   for(auto& s : states)
   {
     if(s.input_index >= 0 && s.input_index < (int)spec.inputs.size())
@@ -238,19 +248,22 @@ void VideoProcessor::zeroStates()
   }
 }
 
-void VideoProcessor::reloadModel()
+// A new model: its states start from zero, a job of the previous one brings
+// nothing back, its role is classified again and its cost measured again.
+void VideoProcessor::modelInstalled()
 {
-  ctx = std::make_shared<Onnx::OnnxRunContext>(
-      inputs.model.file.bytes, inputs.model.file.filename);
-  spec = ctx->readModelSpec();
-  detectStates();
-  const auto io = toPrimaryImageIO(spec, imageInputIndex);
-  role = Onnx::classifyImage(io, inputs.output_index.value);
-  out_kinds.clear();
-  for(int j = 0; j < (int)spec.outputs.size(); ++j)
-    out_kinds.push_back(Onnx::classifyImage(io, j).kind);
-  lastModelPath = inputs.model.file.filename;
-  lastOutputIndex = inputs.output_index.value;
+  failures.succeeded();
+  if(const auto& m = models.model())
+  {
+    states = m->states;
+    zeroStates();
+  }
+  else
+  {
+    states.clear();
+  }
+  spareStates.reset();
+  lastOutputIndex = -1;
   ++gen;
   resetPending = false;
   preferAsync = false;
@@ -267,18 +280,21 @@ try
   if(inputs.model.file.bytes.empty())
     return;
 
-  if(!ctx || lastModelPath != inputs.model.file.filename)
+  // A new file loads on the worker; the running model, if any, keeps running
+  // until it arrives.
+  if(!models.requested().is(inputs.model))
+    models.request(worker, ModelFile::of(inputs.model));
+  if(!models.model())
+    return;
+  const VideoModel& m = *models.model();
+
+  if(inputs.output_index.value != lastOutputIndex)
   {
-    if(!loadModel([this] { reloadModel(); }, inputs.model, name()))
-      return;
-  }
-  else if(inputs.output_index.value != lastOutputIndex)
-  {
-    role = Onnx::classifyImage(toPrimaryImageIO(spec, imageInputIndex),
-                               inputs.output_index.value);
+    role = Onnx::classifyImage(
+        toPrimaryImageIO(m.spec, m.imageInputIndex), inputs.output_index.value);
     lastOutputIndex = inputs.output_index.value;
   }
-  if(spec.inputs.empty() || spec.outputs.empty())
+  if(m.spec.inputs.empty() || m.spec.outputs.empty())
     return;
 
   // Reset impulse: re-zero all recurrent state. While a job is in flight the
@@ -390,7 +406,9 @@ void VideoProcessor::dispatchInfer(
     std::vector<int64_t> ishape, ImageModelKind kind, Onnx::WriteMode wm,
     bool force_async)
 {
-  const TensorElemType in_dt = spec.inputs[imageInputIndex].elem_type;
+  const VideoModel& m = *models.model();
+  const auto& spec = m.spec;
+  const TensorElemType in_dt = spec.inputs[m.imageInputIndex].elem_type;
   const int out_idx = std::clamp(
       inputs.output_index.value, 0, (int)spec.outputs.size() - 1);
 
@@ -402,29 +420,29 @@ void VideoProcessor::dispatchInfer(
     // Pooled job: lock-free acquire; recycled vectors keep their capacity so
     // the assignments below don't allocate in steady state.
     auto job = JobPool<VideoInferJob>::instance().acquire();
-    job->ctx = ctx;
+    job->ctx = m.ctx;
     // Swap (not copy) the preprocessed input: `storage` is fully rewritten next
     // frame, so it can take the job's recycled buffer back and we avoid a
     // multi-MB memcpy each async frame. (States below MUST stay a copy — the
     // node keeps them as the next frame's recurrent input.)
     std::swap(job->input, storage);
     job->ishape = std::move(ishape);
-    job->image_input_index = imageInputIndex;
+    job->image_input_index = m.imageInputIndex;
     job->in_dt = in_dt;
     job->output_index = out_idx;
     job->kind = kind;
     job->wm = wm;
     job->param0 = inputs.param0.value;
     job->param1 = inputs.param1.value;
-    job->param0_input_index = param0InputIndex;
-    job->param1_input_index = param1InputIndex;
+    job->param0_input_index = m.param0InputIndex;
+    job->param1_input_index = m.param1InputIndex;
     // Snapshot the held states into the job. Copy-assigning into buffers that
     // already have the capacity (the spare set from the last result, else the
     // recycled job's) does not allocate in steady state.
     if(spareStates && job->states.empty())
       std::swap(job->states, *spareStates);
     copyStates(states, job->states);
-    job->out_kinds = out_kinds;
+    job->out_kinds = m.out_kinds;
     job->gen = gen;
     worker.request(std::move(job));
     return;
@@ -435,9 +453,9 @@ void VideoProcessor::dispatchInfer(
   // the worker, so the render thread blocks for one frame at most.
   const auto t0 = std::chrono::steady_clock::now();
   auto ds = runInferAndThread(
-      *ctx, spec, storage, ishape, imageInputIndex, in_dt, param0InputIndex,
-      inputs.param0.value, param1InputIndex, inputs.param1.value, states,
-      out_idx, kind, wm, out_kinds, half_buf, u8_buf, out_scratch);
+      *m.ctx, spec, storage, ishape, m.imageInputIndex, in_dt, m.param0InputIndex,
+      inputs.param0.value, m.param1InputIndex, inputs.param1.value, states,
+      out_idx, kind, wm, m.out_kinds, half_buf, u8_buf, out_scratch);
   if(std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(8))
     preferAsync = true;
   applyDecoded(*this, ds);
@@ -458,6 +476,19 @@ VideoProcessor::worker::work(std::unique_ptr<VideoInferJob> job)
       JobPool<VideoInferJob>::instance().release(std::move(j));
     }
   } recycle{job};
+
+  if(job && job->load.active())
+    return ModelLoader<const VideoModel, VideoInferJob>::work<&VideoProcessor::models, VideoProcessor>(
+        job->load, [](const ModelFile& f) { return makeVideoModel(f.path); },
+        [](VideoProcessor& self) { self.modelInstalled(); },
+        [](VideoProcessor& self, std::string_view what) {
+      self.failures.failed(
+          VideoProcessor::name(), self.models.requested().path,
+          std::string("cannot load the model: ").append(what));
+      // Not when another file was picked since: that one is still to load.
+      if(self.models.requested().is(self.inputs.model))
+        self.inputs.model.current_model_invalid = true;
+    });
 
   if(!job || !job->ctx)
     return [](VideoProcessor& self) { self.inferenceInProgress = false; };

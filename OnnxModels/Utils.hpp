@@ -196,32 +196,6 @@ public:
   OnnxObject() noexcept { available = initOnnxRuntime(); }
   bool available{false};
   FailureLog failures;
-
-  // Runs `reload` for a new model file: a failure is printed once and marks
-  // the port invalid (sticky until another file is picked). Returns whether
-  // the model is usable.
-  template <typename F, typename Port>
-  bool loadModel(F&& reload, Port& port, std::string_view node)
-  {
-    try
-    {
-      reload();
-    }
-    catch(const std::exception& e)
-    {
-      failures.failed(node, port.file.filename, std::string("cannot load the model: ") + e.what());
-      port.current_model_invalid = true;
-      return false;
-    }
-    catch(...)
-    {
-      failures.failed(node, port.file.filename, "cannot load the model");
-      port.current_model_invalid = true;
-      return false;
-    }
-    failures.succeeded();
-    return !port.current_model_invalid;
-  }
 };
 
 template <halp::static_string lit>

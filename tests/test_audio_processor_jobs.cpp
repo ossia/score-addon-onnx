@@ -38,12 +38,12 @@ struct Deferred
     node.outputs.audio.samples = outs;
     node.outputs.audio.channels = 1;
     node.worker.request = [this](std::unique_ptr<Job> job) {
-      if(job->kind == Job::Kind::Infer)
+      if(!isModelJob(*job))
       {
         held.push_back(std::move(job));
         return;
       }
-      if(job->kind == Job::Kind::Build)
+      if(isLoadJob(*job))
         ++builds;
       runJob(node, std::move(job));
     };
@@ -124,7 +124,7 @@ TEST_CASE("Geometry Processor: a file that failed loads again when picked again"
   OnnxModels::GeometryProcessor node;
   int builds = 0;
   node.worker.request = [&](std::unique_ptr<OnnxModels::GeomInferJob> job) {
-    if(job->kind == OnnxModels::GeomInferJob::Kind::Build)
+    if(isLoadJob(*job))
       ++builds;
     runJob(node, std::move(job));
   };
@@ -139,6 +139,9 @@ TEST_CASE("Geometry Processor: a file that failed loads again when picked again"
   node();
   CHECK(builds == 1);
 
+  // Picked again: a new mapping of the file.
+  const auto again = TestPaths::slurp(name);
+  node.inputs.model.file.bytes = again;
   node.inputs.model.update(node);
   node();
   CHECK(builds == 2);

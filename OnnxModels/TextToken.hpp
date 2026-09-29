@@ -18,6 +18,7 @@
 //   * A real text TOKENIZER. The Tokens port carries RAW integer ids already
 //     produced by the host/user. The optional Text string port is a documented
 //     pass-through no-op reserved for a future tokenizer.
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <Onnx/helpers/AudioIO.hpp>
@@ -68,14 +69,12 @@ struct TtsUtterance
 };
 
 // What the node's model resolves to: the session, the token input and the
-// aux plans, the output routing and rate, the voices of a style TTS. Built by
-// a worker job (the session and a sibling voices.bin are read from disk
-// there), never on the audio thread; the audio thread swaps it in and hands
-// the old one back to the worker to be freed.
+// aux plans, the output routing and rate, the voices of a style TTS. Built on
+// the worker (ModelLoader; the session and a sibling voices.bin are read from
+// disk there), never on the audio thread.
 struct TokenPipeline
 {
   std::string path;
-  double host_rate = 48000.0;
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   Onnx::ModelSpec spec;
   Onnx::ModelArchetype arch;
@@ -103,17 +102,14 @@ struct TokenPipeline
 // steady-state request path does not allocate). See OnnxModels/JobPool.hpp.
 struct TokenInferJob
 {
-  // Infer runs the model; Build makes a pipeline for `build_path`; Dispose
-  // frees `pipeline` and `utterance` here, off the audio thread.
+  ModelJob<TokenPipeline> load;
+  // Infer runs the model; Dispose frees `utterance` here, off the audio
+  // thread.
   enum class Kind : uint8_t
   {
     Infer,
-    Build,
     Dispose
   } kind = Kind::Infer;
-  std::string build_path;
-  double build_host_rate = 48000.0;
-  std::shared_ptr<TokenPipeline> pipeline;
   TtsUtterance utterance;
 
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
@@ -196,9 +192,8 @@ public:
   } worker;
 
 private:
-  std::shared_ptr<TokenPipeline> pipe;
-  bool building = false;
-  std::string requested; // the file the last build was for
+  ModelLoader<TokenPipeline, TokenInferJob> models;
+  std::shared_ptr<TokenPipeline> pipe; // the installed model of `models`
   bool inferenceInProgress = false;
 
   double host_rate = 48000.0;
@@ -213,9 +208,8 @@ private:
   std::vector<float> style_buf;
   bool styleFor(int64_t token_count);
 
-  void requestBuild();
-  void install(std::shared_ptr<TokenPipeline> p);
-  void dispose(std::shared_ptr<TokenPipeline> p, TtsUtterance u);
+  void modelInstalled();
+  void dispose(TtsUtterance u);
   float paramValue(int idx) const;
   void dispatchInfer(int64_t token_len);
   void playUtterance(int frames);

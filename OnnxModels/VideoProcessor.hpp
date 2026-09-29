@@ -13,6 +13,7 @@
 // The Reset impulse re-zeros all state. The primary image input + image/mask/
 // depth outputs use the normal ImageProcessor paths (ImageOps + TensorToTexture).
 #include <OnnxModels/ImageEnums.hpp>
+#include <OnnxModels/ModelLoader.hpp>
 #include <OnnxModels/Utils.hpp>
 
 #include <ossia/detail/pod_vector.hpp>
@@ -56,6 +57,22 @@ struct StateSlot
   std::vector<uint8_t> buffer; // count * elemSize(dtype) bytes, zero-init
 };
 
+// A model file, its inputs and its recurrent state slots, built on the worker.
+struct VideoModel
+{
+  std::shared_ptr<Onnx::OnnxRunContext> ctx;
+  Onnx::ModelSpec spec;
+  // The primary image input (the non-state, non-scalar image input) and the
+  // scalar params (downsample_ratio etc.), in declaration order.
+  int imageInputIndex = 0;
+  int param0InputIndex = -1;
+  int param1InputIndex = -1;
+  // One slot per RecurrentState input, at its declared size, unallocated.
+  std::vector<StateSlot> states;
+  // classifyImage's kind for every output, to route the non-primary ones.
+  std::vector<Onnx::ImageModelKind> out_kinds;
+};
+
 // Off-thread inference job: a preprocessed image input + the held recurrent
 // state buffers, plus everything work() needs to run and decode without touching
 // the node. ctx is shared so it outlives the node frame.
@@ -66,6 +83,7 @@ struct StateSlot
 // steady-state request path does not allocate). See OnnxModels/JobPool.hpp.
 struct VideoInferJob
 {
+  ModelJob<const VideoModel> load;
   std::shared_ptr<Onnx::OnnxRunContext> ctx;
   boost::container::vector<float> input; // preprocessed primary image
   std::vector<int64_t> ishape;
@@ -136,9 +154,9 @@ public:
 
   void operator()();
 
-  // Worker-thread inference (avendish pattern): heavy recurrent models run off
-  // the render thread. Strict per-frame ordering + latest-wins (drop frames
-  // while a job is in flight) keeps the recurrent state coherent.
+  // The model loads on the worker, and heavy recurrent models run there.
+  // Strict per-frame ordering + latest-wins (drop frames while a job is in
+  // flight) keeps the recurrent state coherent.
   struct worker
   {
     std::function<void(std::unique_ptr<VideoInferJob>)> request;
@@ -147,27 +165,16 @@ public:
   } worker;
 
 private:
-  std::shared_ptr<Onnx::OnnxRunContext> ctx;
-  Onnx::ModelSpec spec;
+  ModelLoader<const VideoModel, VideoInferJob> models;
   Onnx::ImageModelRole role;
-  Onnx::ModelArchetype arch;
-  std::string lastModelPath;
   int lastOutputIndex = -1;
   bool inferenceInProgress = false;
-
-  // Primary image input port index (the non-state, non-scalar image input).
-  int imageInputIndex = 0;
-  // Scalar param input indices (downsample_ratio etc.), in declaration order.
-  int param0InputIndex = -1;
-  int param1InputIndex = -1;
 
   // Recurrent state slots (one per RecurrentState input), held across frames.
   std::vector<StateSlot> states;
   // The buffers of the states before the last result, handed to the next
   // job so its snapshot reuses their capacity (see worker::work).
   std::shared_ptr<std::vector<StateSlot>> spareStates;
-  // classifyImage's kind for every output, to route the non-primary ones.
-  std::vector<Onnx::ImageModelKind> out_kinds;
   // Reset and model changes bump gen: a job dispatched before does not bring
   // its states back. A Reset during a job waits for it (resetPending).
   uint32_t gen = 0;
@@ -188,8 +195,7 @@ private:
   std::vector<uint8_t> u8_buf;
   std::vector<float> out_scratch;
 
-  void reloadModel();
-  void detectStates();
+  void modelInstalled();
   void zeroStates();
   void runImage();
   void dispatchInfer(

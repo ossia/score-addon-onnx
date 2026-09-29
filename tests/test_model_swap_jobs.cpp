@@ -19,7 +19,8 @@ namespace
 {
 const std::string dir = SCORE_ONNX_TEST_DATA_DIR "/image/";
 
-// A node whose jobs wait until complete(), as on a busy worker.
+// A node whose inference jobs wait until complete(), as on a busy worker.
+// Its models load (and the old ones are freed) right away.
 template <typename Node, typename Job>
 struct Deferred
 {
@@ -29,7 +30,12 @@ struct Deferred
 
   Deferred()
   {
-    node.worker.request = [this](std::unique_ptr<Job> job) { held = std::move(job); };
+    node.worker.request = [this](std::unique_ptr<Job> job) {
+      if constexpr(requires { job->load; })
+        if(isModelJob(*job))
+          return runJob(node, std::move(job));
+      held = std::move(job);
+    };
   }
   void load(const std::string& path)
   {
@@ -84,14 +90,6 @@ TEST_CASE("Geometry Processor: a job of the old model is dropped after a swap", 
 {
   REQUIRE(OnnxModels::initOnnxRuntime());
   Deferred<OnnxModels::GeometryProcessor, OnnxModels::GeomInferJob> g;
-  // The models load (and the old one is freed) right away; only the
-  // inference jobs wait.
-  g.node.worker.request = [&g](std::unique_ptr<OnnxModels::GeomInferJob> job) {
-    if(job->kind != OnnxModels::GeomInferJob::Kind::Infer)
-      runJob(g.node, std::move(job));
-    else
-      g.held = std::move(job);
-  };
   constexpr int n = 10000; // above 8192 points: the worker path
   auto tick = [&] {
     g.node.inputs.cloud.value.assign(n * 3, 2.f);

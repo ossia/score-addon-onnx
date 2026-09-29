@@ -28,40 +28,29 @@ namespace OnnxModels
 
 void PoseDetector::loadBodyModel()
 {
-  // Keyed on the name AND the mapped bytes (address + size): a file
-  // re-exported under the same name, or re-read after a failed load, is a new
-  // mapping and reloads; an unchanged one is never parsed twice.
-  const std::string_view fn = inputs.body_model.file.filename;
-  const std::string_view bytes = inputs.body_model.file.bytes;
-  if(fn == m_last_body_model && bytes.data() == m_last_body_data
-     && bytes.size() == m_last_body_size)
+  if(inputs.body_model.file.filename.empty())
+  {
+    if(m_body_models.model() || m_body_models.loading())
+    {
+      m_body_models.release(worker);
+      bodyModelInstalled();
+    }
     return;
-  m_last_body_model.assign(fn);
-  m_last_body_data = bytes.data();
-  m_last_body_size = bytes.size();
+  }
+  if(!m_body_models.requested().is(inputs.body_model))
+    m_body_models.request(worker, ModelFile::of(inputs.body_model));
+}
+
+void PoseDetector::bodyModelInstalled()
+{
   // Every workspace is sized for (and points at) the old model: drop them
   // with it. They are rebuilt lazily for the new one.
   m_mesh_slots.clear();
   m_inst_mesh.clear();
   m_single_mesh = -1;
-  m_mhr.reset();
-  if(fn.empty())
-    return;
-
-  std::string err;
-  auto model = Onnx::Mhr::Model::load(
-      std::span<const char>(bytes.data(), bytes.size()), &err);
-  if(!model)
-  {
-    // Once per file name (this only runs when it changes); the node goes on
-    // without a mesh.
-    std::fprintf(
-        stderr, "[pose] body model %s: %s -- no mesh\n", m_last_body_model.c_str(),
-        err.empty() ? "unreadable" : err.c_str());
-    return;
-  }
-  m_mhr = std::make_unique<Onnx::Mhr::Model>(std::move(*model));
-  m_mesh_slots.reserve(16); // Max Instances' ceiling: slots never move later
+  m_mhr = m_body_models.model();
+  if(m_mhr)
+    m_mesh_slots.reserve(16); // Max Instances' ceiling: slots never move later
   setHmrParamKinds(); // the smoothing kinds of this rig's parameters
 }
 

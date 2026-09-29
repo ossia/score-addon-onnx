@@ -754,6 +754,8 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     tests/test_image_outputs.cpp
     tests/test_node_failures.cpp
     tests/test_model_swap_jobs.cpp
+    tests/test_model_loader.cpp
+    tests/test_node_model_loads.cpp
     tests/test_audio_processor_jobs.cpp
     OnnxModels/Resnet.cpp
     OnnxModels/ENet.cpp
@@ -798,9 +800,11 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
       tests/test_llm_thinking.cpp
       tests/test_vlm.cpp
       tests/test_tokenizer.cpp
+      tests/test_text_model_loads.cpp
       OnnxModels/Tokenizer.cpp
       Onnx/helpers/TextTokenizer.cpp
       OnnxModels/QwenLLM.cpp
+      OnnxModels/FastVLM.cpp
       Onnx/helpers/QwenLLM.cpp
       Onnx/helpers/FastVLM.cpp)
     target_link_libraries(score_addon_onnx_node_tests PRIVATE
