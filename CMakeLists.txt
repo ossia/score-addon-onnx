@@ -911,3 +911,33 @@ if(COMMAND score_add_test AND TARGET score_plugin_engine
   target_compile_definitions(score_addon_onnx_rapidlib_param_count PRIVATE
     SCORE_ONNX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 endif()
+
+# Each texture outlet of the Image Processor reaches its own cable, rendered
+# through ossia-score (llvmpipe, own Xvfb) with a small bundled 2-output model.
+# The ossia-score target does not exist yet when the addons are configured:
+# the runner exits 77 when the binary is not there.
+if(COMMAND add_test AND UNIX AND NOT APPLE AND NOT EMSCRIPTEN
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/multi-outlet/multi-outlet.sh")
+  add_test(NAME score_addon_onnx_multi_outlet
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/multi-outlet/multi-outlet.sh"
+                   "${CMAKE_BINARY_DIR}/ossia-score"
+           WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+  set_tests_properties(score_addon_onnx_multi_outlet PROPERTIES
+    SKIP_RETURN_CODE 77
+    TIMEOUT 900
+    RUN_SERIAL TRUE
+    LABELS "gui;gpu"
+    ENVIRONMENT "OUT=${CMAKE_CURRENT_BINARY_DIR}/multi-outlet"
+    ATTACHED_FILES_ON_FAIL
+      "${CMAKE_CURRENT_BINARY_DIR}/multi-outlet/init/grid.png;${CMAKE_CURRENT_BINARY_DIR}/multi-outlet/live/grid.png")
+  # ossia-score loads libclang from the SDK, with no RPATH to it in a dev build
+  # (same as tests/integration's score_test_app_libpath).
+  set(_onnx_app_libdir "${SCORE_TEST_RUNTIME_LIBDIR}")
+  if(NOT _onnx_app_libdir AND LLVM_DIR)
+    get_filename_component(_onnx_app_libdir "${LLVM_DIR}/../.." ABSOLUTE)
+  endif()
+  if(_onnx_app_libdir)
+    set_property(TEST score_addon_onnx_multi_outlet APPEND PROPERTY
+      ENVIRONMENT_MODIFICATION "LD_LIBRARY_PATH=path_list_prepend:${_onnx_app_libdir}")
+  endif()
+endif()
