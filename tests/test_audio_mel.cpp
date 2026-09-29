@@ -70,7 +70,7 @@ std::vector<float> resynthesise(
     const std::string& model, double rate, const std::vector<float>& signal,
     OnnxModels::AudioMelStyle style = OnnxModels::AudioMelStyle::Auto)
 {
-  const auto bytes = slurp(model);
+  const auto bytes = TestPaths::slurp(model);
   constexpr int frames = 512;
   OnnxModels::AudioProcessor node;
   node.prepare({.rate = rate, .input_channels = 1, .output_channels = 1, .frames = frames});
