@@ -895,3 +895,19 @@ if(NOT AVND_ADDON_SCORE AND COMMAND avnd_addon_package)
     BACKENDS max touchdesigner godot
     SUPPORT ${ONNXRUNTIME_SUPPORT_FILES})
 endif()
+
+# The RapidLib models' dynamic knob groups in a document: undo, save/load,
+# copy/paste, presets and execution. Uses score's test fixtures, so only in a
+# score build that has the test tree.
+if(COMMAND score_add_test AND TARGET score_plugin_engine
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/RapidlibParamCountTest.cpp")
+  score_add_test(score_addon_onnx_rapidlib_param_count
+    SOURCES tests/RapidlibParamCountTest.cpp
+    GUI
+    PLUGINS score_plugin_engine score_plugin_scenario score_lib_process)
+  add_dependencies(score_addon_onnx_rapidlib_param_count score_addon_onnx_models)
+  target_include_directories(score_addon_onnx_rapidlib_param_count PRIVATE
+    "${SCORE_ROOT_SOURCE_DIR}/tests/fixtures")
+  target_compile_definitions(score_addon_onnx_rapidlib_param_count PRIVATE
+    SCORE_ONNX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+endif()
