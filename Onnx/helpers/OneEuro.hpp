@@ -214,11 +214,13 @@ struct RectSmoother
   // in/out: {cx, cy, w, h, angle}; returns the smoothed values in the same array
   void smooth(float* v, float dt = 1.0f)
   {
+    // A non-finite rect (from an untrusted model) is left as is and does not
+    // reach the filters.
+    for(int i = 0; i < 5; ++i)
+      if(!detail::finiteValue(v[i]))
+        return;
     // unwrap angle relative to previous so it never jumps by ~2pi
-    float a = v[4];
-    while(a - prev_angle > 3.14159265f) a -= 2.0f * 3.14159265f;
-    while(a - prev_angle < -3.14159265f) a += 2.0f * 3.14159265f;
-    v[4] = a;
+    v[4] = prev_angle + detail::wrapPi(v[4] - prev_angle);
     for(int i = 0; i < 5; ++i)
       v[i] = f[i].filter(v[i], dt);
     prev_angle = v[4];
