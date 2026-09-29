@@ -366,37 +366,62 @@ try
     // reloading the landmark model, and must not lose them).
   }
 
-  // Model construction is the only failure that should permanently invalidate
-  // the node; a per-frame inference/decode exception must NOT (it would kill the
-  // node forever after a single transient throw — see the function catch below).
-  try
-  {
-    if(have_landmark && !this->ctx)
+  // A model that cannot be built is reported once and stays disabled until
+  // another file is picked for its port; a per-frame inference failure does
+  // not disable anything (see the function catch below). Without its
+  // re-identification model the tracker keeps running on motion alone.
+  auto build = [this](auto& port, auto&& make) {
+    try
     {
       make();
       return true;
     }
-    if(have_det && !this->det_ctx)
+    catch(const std::exception& e)
     {
       failures.failed(
           name(), port.file.filename, std::string("cannot load the model: ") + e.what());
     }
-    if(have_reid && !this->reid_ctx)
+    catch(...)
     {
       failures.failed(name(), port.file.filename, "cannot load the model");
     }
-  }
-  catch(...)
+    port.current_model_invalid = true;
+    return false;
+  };
+  if(have_landmark && !this->ctx
+     && !build(inputs.model, [this] {
+          this->ctx = std::make_unique<Onnx::OnnxRunContext>(
+              this->inputs.model.file.bytes, this->inputs.model.file.filename);
+          m_landmark_role = classifyModel(*this->ctx);
+          m_landmark_no_batch = false;
+          m_landmark_batch_cap = 0;
+          const auto& pv = this->ctx->provider;
+          m_landmark_pad_batch = pv == "cuda" || pv == "tensorrt" || pv == "rocm";
+          loadInstantHmr(*this->ctx, m_landmark_role);
+        }))
   {
-    // Invalidate whichever model we were actually trying to construct.
-    if(box_only)
-      inputs.det_model.current_model_invalid = true;
-    else
-      inputs.model.current_model_invalid = true;
     ctx.reset();
-    det_ctx.reset();
-    reid_ctx.reset();
     return;
+  }
+  if(have_det && !this->det_ctx
+     && !build(inputs.det_model, [this] {
+          this->det_ctx = std::make_unique<Onnx::OnnxRunContext>(
+              this->inputs.det_model.file.bytes, this->inputs.det_model.file.filename);
+          m_detector_role = classifyModel(*this->det_ctx);
+        }))
+  {
+    det_ctx.reset();
+    return;
+  }
+  if(have_reid && !this->reid_ctx
+     && !build(inputs.reid_model, [this] {
+          this->reid_ctx = std::make_unique<Onnx::OnnxRunContext>(
+              this->inputs.reid_model.file.bytes, this->inputs.reid_model.file.filename);
+          m_reid_spec = Onnx::classifyReid(toModelIO(this->reid_ctx->readModelSpec()));
+        }))
+  {
+    reid_ctx.reset();
+    m_reid_spec = {};
   }
 
   Onnx::ImageView src{
@@ -553,11 +578,15 @@ try
     }
   }
 }
+catch(const std::exception& e)
+{
+  // A frame that fails (a bad crop, an odd output shape, an ORT error) is
+  // reported and skipped; the node keeps running.
+  failures.failed(name(), inputs.model.file.filename, e.what());
+}
 catch(...)
 {
-  // Transient per-frame failure (a bad crop, an odd output shape on one frame,
-  // an ORT hiccup). Skip this frame and retry next one — do NOT permanently
-  // invalidate the model (construction failures are handled separately above).
+  failures.failed(name(), inputs.model.file.filename, "unknown error");
 }
 
 
