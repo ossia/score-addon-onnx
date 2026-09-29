@@ -10,38 +10,43 @@ namespace OnnxModels
 
 QwenLLMNode::QwenLLMNode() noexcept = default;
 
-QwenLLMNode::~QwenLLMNode() = default;
-
-bool QwenLLMNode::needs_reinit() const noexcept
+// A generation still running for this node stops after its current token.
+QwenLLMNode::~QwenLLMNode()
 {
-  return !llm || last_model_path != inputs.model.file.filename
-         || last_tokenizer_path != inputs.tokenizer.file.filename;
+  cancel_generation();
 }
 
-void QwenLLMNode::initialize_model()
-try
+void QwenLLMNode::cancel_generation() noexcept
 {
-  if (inputs.model.file.filename.empty()
-      || inputs.tokenizer.file.filename.empty())
-  {
+  if (token_stream)
+    token_stream->cancelled = true;
+}
+
+void QwenLLMNode::request_load()
+{
+  loading = true;
+  requested_model = inputs.model.file.filename;
+  requested_tokenizer = inputs.tokenizer.file.filename;
+  auto job = std::make_unique<LlmJob>();
+  job->kind = LlmJob::Kind::Load;
+  job->model = requested_model;
+  job->tokenizer = requested_tokenizer;
+  worker.request(std::move(job));
+}
+
+void QwenLLMNode::dispose(std::shared_ptr<Onnx::QwenLLMInference> old)
+{
+  if (!old)
     return;
-  }
-
-  llm = std::make_shared<Onnx::QwenLLMInference>(
-      inputs.model.file.filename, inputs.tokenizer.file.filename);
-
-  last_model_path = inputs.model.file.filename;
-  last_tokenizer_path = inputs.tokenizer.file.filename;
-}
-catch (const std::exception& e)
-{
-  std::fprintf(stderr, "LLM initialization error: %s\n", e.what());
-  llm.reset();
+  auto job = std::make_unique<LlmJob>();
+  job->kind = LlmJob::Kind::Dispose;
+  job->llm = std::move(old);
+  worker.request(std::move(job));
 }
 
 void QwenLLMNode::request_inference()
 {
-  if (inference_in_progress)
+  if (inference_in_progress || !llm)
     return;
 
   const std::string& prompt = inputs.prompt.value;
@@ -153,50 +158,48 @@ try
     return;
   }
 
-  if (needs_reinit())
+  // New files: the model loads on the worker; the running one (if any) keeps
+  // answering until it arrives.
+  const auto& model = inputs.model.file.filename;
+  const auto& tokenizer = inputs.tokenizer.file.filename;
+  if (!model.empty() && !tokenizer.empty() && !loading
+      && (model != requested_model || tokenizer != requested_tokenizer))
   {
-    initialize_model();
+    cancel_generation();
+    request_load();
   }
 
   if (!llm)
   {
-    outputs.response.value
-        = "Model not initialized. Please provide model and tokenizer files.";
+    if (model.empty() || tokenizer.empty())
+      outputs.response.value
+          = "Model not initialized. Please provide model and tokenizer files.";
     return;
   }
 
   // Trigger always (re)starts a generation with the current prompt; prompt
   // and parameter changes only start one on their own outside manual mode.
-  if (inputs.trigger.value && !inference_in_progress)
+  // A generation of an outdated prompt stops, the new one starts once it has.
+  // While new files load, such a change waits for them.
+  const bool start
+      = inputs.trigger.value.has_value() || restart
+        || (must_infer && !loading && !inputs.manual && !inputs.prompt.value.empty());
+  if (start)
   {
-    must_infer = false;
-    request_inference();
-  }
-  else if (
-      must_infer && !inputs.manual && !inputs.prompt.value.empty()
-      && !inference_in_progress)
-  {
-    last_processed_prompt = inputs.prompt.value;
-    must_infer = false;
-    request_inference();
-  }
-
-  // Drain the tokens the worker generated since the last tick and cut them
-  // into partial segments; the full response is only sent at the end.
-  if (token_stream)
-  {
-    std::vector<std::string> chunk;
+    if (inference_in_progress)
     {
-      std::lock_guard lock{token_stream->mutex};
-      chunk.swap(token_stream->pending);
+      cancel_generation();
+      restart = true;
     }
-    if (!chunk.empty())
+    else
     {
       must_infer = false;
       restart = false;
       request_inference();
     }
   }
+
+  drain_stream();
 
   if (!ready_partials.empty())
   {
@@ -206,25 +209,59 @@ try
 }
 catch (const std::exception& e)
 {
-  std::fprintf(stderr, "LLM processing error: %s\n", e.what());
   outputs.response.value = std::string("Error: ") + e.what();
-  outputs.isGenerating.value = false;
-  inference_in_progress = false;
 }
 catch (...)
 {
-  std::fprintf(stderr, "LLM unknown error\n");
   outputs.response.value = "Unknown error occurred";
-  outputs.isGenerating.value = false;
-  inference_in_progress = false;
 }
 
 std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(std::unique_ptr<LlmJob> job)
 {
-  if (!llm || prompt.empty() || !stream)
+  if (!job)
+    return {};
+
+  switch (job->kind)
   {
-    return [](QwenLLMNode& node)
-    {
+    case LlmJob::Kind::Dispose:
+      job->llm.reset();
+      return {};
+
+    case LlmJob::Kind::Load:
+      try
+      {
+        auto llm = std::make_shared<Onnx::QwenLLMInference>(job->model, job->tokenizer);
+        return [llm = std::move(llm), model = std::move(job->model),
+                tokenizer = std::move(job->tokenizer)](QwenLLMNode& node) mutable {
+          node.loading = false;
+          if (model != node.inputs.model.file.filename
+              || tokenizer != node.inputs.tokenizer.file.filename)
+          {
+            node.dispose(std::move(llm)); // other files were picked meanwhile
+            return;
+          }
+          std::swap(node.llm, llm);
+          node.dispose(std::move(llm));
+        };
+      }
+      catch (const std::exception& e)
+      {
+        std::string what = std::string("Cannot load the model: ") + e.what();
+        std::fprintf(stderr, "Language Model: %s\n", what.c_str());
+        return [what = std::move(what)](QwenLLMNode& node) mutable {
+          node.loading = false;
+          node.outputs.response.value = std::move(what);
+        };
+      }
+
+    case LlmJob::Kind::Generate:
+      break;
+  }
+
+  auto& stream = job->stream;
+  if (!job->llm || job->prompt.empty() || !stream)
+  {
+    return [](QwenLLMNode& node) {
       node.inference_in_progress = false;
       node.outputs.isGenerating.value = false;
       node.outputs.response.value = "Invalid input for inference";
@@ -233,23 +270,32 @@ std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(std::unique_ptr<LlmJ
 
   try
   {
-    // Generate on the worker thread, pushing each text increment into the
-    // shared stream; the processing thread drains it every tick.
-    llm->generateStreaming(
-        prompt,
-        [&stream](const std::string& delta)
-        {
+    // Each text increment goes to the shared stream, which the processing
+    // thread drains every tick.
+    job->llm->generateStreaming(
+        job->prompt,
+        [&stream](const std::string& delta) {
+          if (stream->cancelled.load(std::memory_order_relaxed))
+            return false;
           std::lock_guard lock{stream->mutex};
           stream->pending.push_back(delta);
           return true;
         },
         job->maxTokens, job->temperature, job->topP, job->topK, job->thinking);
 
-    return [](QwenLLMNode& node)
-    {
-      // Applied on the processing thread after generation ended: drain
-      // whatever the last tick left in the stream, flush the unterminated
-      // tail as a final partial, and emit the finished response.
+    const bool cancelled = stream->cancelled.load(std::memory_order_relaxed);
+    return [cancelled](QwenLLMNode& node) {
+      node.inference_in_progress = false;
+      node.outputs.isGenerating.value = false;
+      if (cancelled)
+      {
+        // Stopped for a newer prompt or a new model: nothing to show.
+        node.token_stream.reset();
+        return;
+      }
+      // Drain whatever the last tick left in the stream (the generation has
+      // ended: nothing holds the lock), flush the unterminated tail as a
+      // final partial, and emit the finished response.
       if (node.token_stream)
       {
         std::vector<std::string> chunk;
@@ -274,28 +320,24 @@ std::function<void(QwenLLMNode&)> QwenLLMNode::worker::work(std::unique_ptr<LlmJ
       }
       node.token_stream.reset();
       node.outputs.response.value = node.accumulated_response;
-      node.inference_in_progress = false;
-      node.outputs.isGenerating.value = false;
     };
   }
   catch (const std::exception& e)
   {
     std::string errorMsg = std::string("Inference error: ") + e.what();
-
-    return [errorMsg = std::move(errorMsg)](QwenLLMNode& node) mutable
-    {
+    return [errorMsg = std::move(errorMsg)](QwenLLMNode& node) mutable {
       node.inference_in_progress = false;
       node.outputs.isGenerating.value = false;
+      node.token_stream.reset();
       node.outputs.response.value = std::move(errorMsg);
     };
   }
   catch (...)
   {
-    std::fprintf(stderr, "Unknown inference error\n");
-    return [](QwenLLMNode& node)
-    {
+    return [](QwenLLMNode& node) {
       node.inference_in_progress = false;
       node.outputs.isGenerating.value = false;
+      node.token_stream.reset();
       node.outputs.response.value = "Unknown inference error";
     };
   }

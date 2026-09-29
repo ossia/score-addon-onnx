@@ -1,5 +1,6 @@
 #include "FastVLM.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace OnnxModels
@@ -9,74 +10,62 @@ FastVLMNode::FastVLMNode() noexcept = default;
 
 FastVLMNode::~FastVLMNode() = default;
 
-bool FastVLMNode::needsReinitialization() const
+std::array<std::string_view, 4> FastVLMNode::files() const noexcept
 {
-  return !vlm || lastVisionEncoderPath != inputs.visionEncoder.file.filename
-         || lastEmbedTokensPath != inputs.embedTokens.file.filename
-         || lastDecoderPath != inputs.decoder.file.filename
-         || lastTokenizerPath != inputs.tokenizer.file.filename;
+  return {
+      inputs.visionEncoder.file.filename, inputs.embedTokens.file.filename,
+      inputs.decoder.file.filename, inputs.tokenizer.file.filename};
 }
 
-void FastVLMNode::initializeModel()
+void FastVLMNode::requestLoad()
 {
-  try
+  const auto f = files();
+  loading = true;
+  auto job = std::make_unique<VlmJob>();
+  job->kind = VlmJob::Kind::Load;
+  for(std::size_t i = 0; i < f.size(); ++i)
   {
-    if (inputs.visionEncoder.file.filename.empty()
-        || inputs.embedTokens.file.filename.empty()
-        || inputs.decoder.file.filename.empty()
-        || inputs.tokenizer.file.filename.empty())
-    {
-      return;
-    }
-
-    vlm = std::make_shared<Onnx::FastVLMInference>(
-        inputs.visionEncoder.file.filename,
-        inputs.embedTokens.file.filename,
-        inputs.decoder.file.filename,
-        inputs.tokenizer.file.filename);
-
-    lastVisionEncoderPath = inputs.visionEncoder.file.filename;
-    lastEmbedTokensPath = inputs.embedTokens.file.filename;
-    lastDecoderPath = inputs.decoder.file.filename;
-    lastTokenizerPath = inputs.tokenizer.file.filename;
+    requested[i] = f[i];
+    job->files[i] = f[i];
   }
-  catch (const std::exception& e)
-  {
-    std::fprintf(stderr, "FastVLM initialization error: %s\n", e.what());
-    vlm.reset();
-  }
+  worker.request(std::move(job));
+}
+
+void FastVLMNode::dispose(std::shared_ptr<Onnx::FastVLMInference> old)
+{
+  if(!old)
+    return;
+  auto job = std::make_unique<VlmJob>();
+  job->kind = VlmJob::Kind::Dispose;
+  job->vlm = std::move(old);
+  worker.request(std::move(job));
 }
 
 void FastVLMNode::requestInference()
 {
-  // Don't start new inference if one is already in progress
-  if (inferenceInProgress)
+  if(inferenceInProgress || !vlm)
     return;
 
   auto& in_tex = inputs.image.texture;
-  if (!in_tex.bytes || in_tex.width <= 0 || in_tex.height <= 0)
+  if(!in_tex.bytes || in_tex.width <= 0 || in_tex.height <= 0)
     return;
 
-  // Wrap the input RGBA8888 texture in a Qt-free ImageData (deep copy so the
-  // worker thread owns its pixels).
-  Onnx::ImageData image;
-  image.width = in_tex.width;
-  image.height = in_tex.height;
-  image.pixels.assign(
+  // The worker owns a copy of the pixels: the texture is only valid now.
+  auto job = std::make_unique<VlmJob>();
+  job->kind = VlmJob::Kind::Infer;
+  job->image.width = in_tex.width;
+  job->image.height = in_tex.height;
+  job->image.pixels.assign(
       reinterpret_cast<const unsigned char*>(in_tex.bytes),
       reinterpret_cast<const unsigned char*>(in_tex.bytes)
           + static_cast<std::size_t>(in_tex.width) * in_tex.height * 4);
+  job->prompt = inputs.prompt.value;
+  job->temperature = inputs.temperature.value;
+  job->maxTokens = inputs.maxTokens.value;
+  job->vlm = vlm;
 
-  if (image.empty())
-    return;
-
-  // Mark inference as in progress
   inferenceInProgress = true;
-
-  // Start worker thread computation
-  worker.request(
-      image, inputs.prompt.value, inputs.temperature.value,
-      inputs.maxTokens.value, vlm);
+  worker.request(std::move(job));
 }
 
 void FastVLMNode::operator()()
@@ -101,55 +90,81 @@ try
       || missing(inputs.decoder, "Decoder") || missing(inputs.tokenizer, "Tokenizer"))
     return;
 
-  if (needsReinitialization())
-  {
-    initializeModel();
-  }
+  // New files: the models load on the worker; the running ones (if any) keep
+  // answering until they arrive.
+  const auto f = files();
+  const bool complete
+      = std::none_of(f.begin(), f.end(), [](std::string_view s) { return s.empty(); });
+  if (complete && !loading && !std::equal(f.begin(), f.end(), requested.begin()))
+    requestLoad();
 
   if (!vlm)
   {
-    outputs.response.value
-        = "Model not initialized. Please provide all required model files.";
+    if (!complete)
+      outputs.response.value
+          = "Model not initialized. Please provide all required model files.";
     return;
   }
 
-  // The actual processing happens in the worker thread; this operator()
-  // handles initialization, model management and (re)triggering. Outside
-  // manual mode the node re-runs continuously as soon as it is idle; in
-  // manual mode only a bang on Trigger starts an inference.
-  if (inputs.manual)
-  {
-    if (inputs.trigger.value && !inferenceInProgress)
-      requestInference();
-  }
-  else if (!inferenceInProgress)
-  {
+  // Outside manual mode the node re-runs continuously as soon as it is idle;
+  // in manual mode only a bang on Trigger starts an inference.
+  if (!inputs.manual || inputs.trigger.value)
     requestInference();
-  }
 }
 catch (const std::exception& e)
 {
-  std::fprintf(stderr, "FastVLM processing error: %s\n", e.what());
   outputs.response.value = std::string("Error: ") + e.what();
 }
 catch (...)
 {
-  std::fprintf(stderr, "FastVLM unknown error\n");
   outputs.response.value = "Unknown error occurred";
 }
 
-// Worker thread implementation
-std::function<void(FastVLMNode&)> FastVLMNode::worker::work(
-    Onnx::ImageData image,
-    std::string prompt,
-    float temperature,
-    int maxTokens,
-    std::shared_ptr<Onnx::FastVLMInference> vlm)
+std::function<void(FastVLMNode&)> FastVLMNode::worker::work(std::unique_ptr<VlmJob> job)
 {
-  if (!vlm || image.empty() || prompt.empty())
+  if (!job)
+    return {};
+
+  switch (job->kind)
   {
-    return [](FastVLMNode& node)
-    {
+    case VlmJob::Kind::Dispose:
+      job->vlm.reset();
+      return {};
+
+    case VlmJob::Kind::Load:
+      try
+      {
+        const auto& f = job->files;
+        auto vlm = std::make_shared<Onnx::FastVLMInference>(f[0], f[1], f[2], f[3]);
+        return [vlm = std::move(vlm), files = std::move(job->files)](
+                   FastVLMNode& node) mutable {
+          node.loading = false;
+          if (!std::equal(files.begin(), files.end(), node.files().begin()))
+          {
+            node.dispose(std::move(vlm)); // other files were picked meanwhile
+            return;
+          }
+          std::swap(node.vlm, vlm);
+          node.dispose(std::move(vlm));
+        };
+      }
+      catch (const std::exception& e)
+      {
+        std::string what = std::string("Cannot load the model: ") + e.what();
+        std::fprintf(stderr, "Vision Language Model: %s\n", what.c_str());
+        return [what = std::move(what)](FastVLMNode& node) mutable {
+          node.loading = false;
+          node.outputs.response.value = std::move(what);
+        };
+      }
+
+    case VlmJob::Kind::Infer:
+      break;
+  }
+
+  if (!job->vlm || job->image.empty() || job->prompt.empty())
+  {
+    return [](FastVLMNode& node) {
       node.inferenceInProgress = false;
       node.outputs.response.value = "Invalid input for inference";
     };
@@ -157,13 +172,9 @@ std::function<void(FastVLMNode&)> FastVLMNode::worker::work(
 
   try
   {
-    // Perform the inference in the worker thread
-    std::string response
-        = vlm->generateResponse(image, prompt, temperature, maxTokens);
-
-    // Return a function that will be executed in the main thread
-    return [response = std::move(response)](FastVLMNode& node) mutable
-    {
+    std::string response = job->vlm->generateResponse(
+        job->image, job->prompt, job->temperature, job->maxTokens);
+    return [response = std::move(response)](FastVLMNode& node) mutable {
       node.inferenceInProgress = false;
       node.outputs.response.value = std::move(response);
     };
@@ -171,16 +182,14 @@ std::function<void(FastVLMNode&)> FastVLMNode::worker::work(
   catch (const std::exception& e)
   {
     std::string errorMsg = std::string("Inference error: ") + e.what();
-    return [errorMsg = std::move(errorMsg)](FastVLMNode& node) mutable
-    {
+    return [errorMsg = std::move(errorMsg)](FastVLMNode& node) mutable {
       node.inferenceInProgress = false;
       node.outputs.response.value = std::move(errorMsg);
     };
   }
   catch (...)
   {
-    return [](FastVLMNode& node)
-    {
+    return [](FastVLMNode& node) {
       node.inferenceInProgress = false;
       node.outputs.response.value = "Unknown inference error";
     };

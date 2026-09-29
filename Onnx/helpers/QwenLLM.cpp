@@ -484,16 +484,27 @@ void QwenLLMInference::generateLoop(
     const size_t lastPos = info.GetElementCount() - vocab;
     logits.resize(vocab);
 
-    if (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+    switch (info.GetElementType())
     {
-      const auto* d = logitsTensor.GetTensorData<Ort::Float16_t>();
-      for (size_t i = 0; i < vocab; ++i)
-        logits[i] = d[lastPos + i].ToFloat();
-    }
-    else
-    {
-      const auto* d = logitsTensor.GetTensorData<float>();
-      std::copy_n(d + lastPos, vocab, logits.begin());
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+        std::copy_n(logitsTensor.GetTensorData<float>() + lastPos, vocab, logits.begin());
+        break;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      {
+        const auto* d = logitsTensor.GetTensorData<uint16_t>() + lastPos;
+        for (size_t i = 0; i < vocab; ++i)
+          logits[i] = Onnx::halfToFloat(d[i]);
+        break;
+      }
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      {
+        const auto* d = logitsTensor.GetTensorData<uint16_t>() + lastPos;
+        for (size_t i = 0; i < vocab; ++i)
+          logits[i] = Onnx::bfloat16ToFloat(d[i]);
+        break;
+      }
+      default:
+        throw std::runtime_error("unsupported logits element type");
     }
   };
 
@@ -510,6 +521,10 @@ void QwenLLMInference::generateLoop(
 
   int64_t nextToken = -1;
   std::vector<int64_t> stepIds;
+  // The previous step's outputs: its present states are this step's past,
+  // passed back as they are rather than copied (the KV cache grows with every
+  // token).
+  std::vector<Ort::Value> previous;
 
   for (int step = 0; step < maxTokens; ++step)
   {

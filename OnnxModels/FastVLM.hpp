@@ -8,12 +8,31 @@
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 
 namespace OnnxModels
 {
+
+struct VlmJob
+{
+  enum class Kind : uint8_t
+  {
+    Load,    // the models at `files`
+    Infer,   // a response for `image` and `prompt`
+    Dispose, // frees `vlm` off the processing thread
+  } kind = Kind::Infer;
+  std::array<std::string, 4> files; // vision encoder, embeddings, decoder, tokenizer
+  Onnx::ImageData image;
+  std::string prompt;
+  float temperature = 1.f;
+  int maxTokens = 500;
+  std::shared_ptr<Onnx::FastVLMInference> vlm;
+};
 
 struct FastVLMNode : OnnxObject
 {
@@ -89,38 +108,24 @@ public:
 
   void operator()();
 
-  // Worker thread infrastructure
+  // Loading the four models and running them both happen on the worker.
   struct worker
   {
-    std::function<void(
-        Onnx::ImageData,
-        std::string,
-        float,
-        int,
-        std::shared_ptr<Onnx::FastVLMInference>)>
-        request;
-
-    // Called back in a worker thread
-    // The returned function will be later applied in this object's processing thread
-    static std::function<void(FastVLMNode&)> work(
-        Onnx::ImageData image,
-        std::string prompt,
-        float temperature,
-        int maxTokens,
-        std::shared_ptr<Onnx::FastVLMInference> vlm);
+    std::function<void(std::unique_ptr<VlmJob>)> request;
+    static std::function<void(FastVLMNode&)> work(std::unique_ptr<VlmJob> job);
   } worker;
 
 private:
   std::shared_ptr<Onnx::FastVLMInference> vlm;
-  std::string lastVisionEncoderPath;
-  std::string lastEmbedTokensPath;
-  std::string lastDecoderPath;
-  std::string lastTokenizerPath;
-
+  // The files of the last load, the running one or one in progress: a load
+  // that fails is not retried until a file changes.
+  std::array<std::string, 4> requested;
+  bool loading = false;
   bool inferenceInProgress = false;
 
-  void initializeModel();
-  bool needsReinitialization() const;
+  std::array<std::string_view, 4> files() const noexcept;
+  void requestLoad();
+  void dispose(std::shared_ptr<Onnx::FastVLMInference> old);
   void requestInference();
 };
 

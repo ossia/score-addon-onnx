@@ -162,13 +162,6 @@ private:
   ONNXTensorElementDataType embedsType{ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT};
   ONNXTensorElementDataType kvType{ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT};
 
-  // Per-layer KV cache, stored as raw bytes in the decoder's own dtype: the
-  // cache only ever round-trips from the decoder's outputs to its inputs, so
-  // it never needs converting.
-  std::vector<std::vector<std::byte>> keyCache;
-  std::vector<std::vector<std::byte>> valueCache;
-  std::vector<std::vector<int64_t>> cacheShapes;
-
   std::vector<std::string> decoderInputNames;
   std::vector<std::string> decoderOutputNames;
   std::vector<const char*> decoderInputNamePtrs;
