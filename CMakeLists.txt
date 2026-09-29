@@ -674,10 +674,18 @@ if(SCORE_ONNX_ENABLE_EXTENSIONS)
   )
 endif()
 
-# Unit tests (mirroring score-addon-cv). They only cover the RapidLib
-# objects for now, so they need neither onnxruntime nor a GPU: the test
-# executable compiles the object sources directly against rapidlib + the
-# avendish headers provided through score_plugin_avnd.
+# Unit tests (mirroring score-addon-cv). score_addon_onnx_tests needs neither
+# onnxruntime nor a GPU: it compiles the RapidLib objects and the header-only
+# helpers directly against rapidlib + the avendish headers provided through
+# score_plugin_avnd. score_addon_onnx_node_tests runs the real node sources on
+# onnxruntime.
+#
+# Test cases tagged [model] need real models, found through the environment
+# variables of tests/TestPaths.hpp, and SKIP without them; they run on the
+# default execution provider, the GPU when the onnxruntime build has one.
+# They are registered apart, labelled "model" and "gpu", so that
+# `ctest -LE model` or `ctest -LE gpu` excludes them. The other cases use the
+# fixtures bundled in tests/data only, and run on the CPU.
 option(SCORE_ADDON_ONNX_TESTS "Build score-addon-onnx unit tests" OFF)
 if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_avnd)
   if(NOT TARGET Catch2::Catch2WithMain)
@@ -713,10 +721,13 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     score_plugin_avnd
     score_onnx_imageops
   )
-  add_test(NAME score_addon_onnx_tests COMMAND score_addon_onnx_tests)
+  add_test(NAME score_addon_onnx_tests COMMAND score_addon_onnx_tests "~[model]")
+  add_test(NAME score_addon_onnx_tests_models COMMAND score_addon_onnx_tests "[model]")
+  set_tests_properties(score_addon_onnx_tests PROPERTIES LABELS "onnx")
+  # Catch2 exits with 4 when every selected test case SKIPped.
+  set_tests_properties(score_addon_onnx_tests_models PROPERTIES
+    LABELS "onnx;model" SKIP_RETURN_CODE 4)
 
-  # Node-level tests on the real object sources and real models (models from
-  # $ONNX_TEST_MODELS, default the models-presets pack; tests SKIP without them).
   add_executable(score_addon_onnx_node_tests
     tests/test_node_model_swap.cpp
     tests/test_external_data.cpp
@@ -765,8 +776,8 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
     "${CMAKE_CURRENT_SOURCE_DIR}"
   )
   target_compile_features(score_addon_onnx_node_tests PRIVATE cxx_std_23)
-  # Each test file has its own file-local helpers (slurp, Harness, ...): they
-  # cannot share a unity translation unit (a CMAKE_UNITY_BUILD release tree).
+  # Each test file has its own file-local helpers (Harness, ...): they cannot
+  # share a unity translation unit (a CMAKE_UNITY_BUILD release tree).
   set_target_properties(score_addon_onnx_tests score_addon_onnx_node_tests
                         PROPERTIES UNITY_BUILD OFF)
   target_compile_definitions(score_addon_onnx_node_tests PRIVATE
@@ -796,8 +807,18 @@ if(SCORE_ADDON_ONNX_TESTS AND NOT SCORE_FAST_DEV_BUILD AND TARGET score_plugin_a
       ocos_operators
       onnxruntime_extensions)
   endif()
-  add_test(NAME score_addon_onnx_node_tests COMMAND score_addon_onnx_node_tests)
-  set_tests_properties(score_addon_onnx_node_tests PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED")
+  add_test(NAME score_addon_onnx_node_tests
+           COMMAND score_addon_onnx_node_tests "~[model]~[gpu]")
+  set_tests_properties(score_addon_onnx_node_tests PROPERTIES
+    LABELS "onnx" ENVIRONMENT "SCORE_ONNX_FORCE_PROVIDER=cpu")
+  add_test(NAME score_addon_onnx_node_tests_models
+           COMMAND score_addon_onnx_node_tests "[model]")
+  set_tests_properties(score_addon_onnx_node_tests_models PROPERTIES
+    LABELS "onnx;model;gpu" SKIP_RETURN_CODE 4)
+  # Only meaningful where the default provider is a GPU one.
+  add_test(NAME score_addon_onnx_node_tests_gpu
+           COMMAND score_addon_onnx_node_tests "[gpu]~[model]")
+  set_tests_properties(score_addon_onnx_node_tests_gpu PROPERTIES LABELS "onnx;gpu")
 
   # Manual smoke harness for the FastVLM pipeline: needs real model files on
   # disk (pass a FastVLM-*-ONNX snapshot directory), so it is built with the
