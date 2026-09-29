@@ -14,7 +14,10 @@
 // recycled job's internal vectors keep their capacity, so the steady state
 // allocates nothing. The cold path (empty pool -> make_unique) matches the
 // first-frame allocation profile we already have. release() happens on the
-// worker thread, after work() has moved the results out.
+// worker thread once work() has moved the results out, or, for a job that
+// carries its results back (Audio / Sequence Processor), on the processing
+// thread after they were swapped in: a lock-free enqueue, and the buffers stay
+// in the job instead of being freed there.
 //
 // The pool type (ossia::object_pool) comes from Onnx/helpers/compat: libossia's
 // own header in a score build, a vendored API-compatible copy standalone
