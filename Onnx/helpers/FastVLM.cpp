@@ -58,23 +58,6 @@ static Onnx::FloatTensor preprocessImageForFastVLM(
       std);
 }
 
-static std::size_t tensorElementSize(ONNXTensorElementDataType t)
-{
-  switch (t)
-  {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
-      return 2;
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-      return 4;
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-      return 8;
-    default:
-      throw std::runtime_error(
-          fmt::format("FastVLM: unsupported tensor element type {}", (int)t));
-  }
-}
-
 // Read a float or float16 tensor into a flat fp32 vector.
 static std::vector<float> tensorToFloats(const Ort::Value& v)
 {
@@ -949,18 +932,26 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
       size_t lastPos = (logitsShape[1] - 1) * vocabSize;
 
       const float* logitsData;
-      if (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+      switch (info.GetElementType())
       {
-        const auto* d = logitsTensor.GetTensorData<Ort::Float16_t>();
-        logitsRow.resize(vocabSize);
-        for (size_t i = 0; i < vocabSize; ++i)
-          logitsRow[i] = d[lastPos + i].ToFloat();
-        logitsData = logitsRow.data();
-        lastPos = 0;
-      }
-      else
-      {
-        logitsData = logitsTensor.GetTensorData<float>();
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+          logitsData = logitsTensor.GetTensorData<float>();
+          break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+        {
+          const bool half
+              = info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+          const auto* d = logitsTensor.GetTensorData<uint16_t>() + lastPos;
+          logitsRow.resize(vocabSize);
+          for (size_t i = 0; i < vocabSize; ++i)
+            logitsRow[i] = half ? Onnx::halfToFloat(d[i]) : Onnx::bfloat16ToFloat(d[i]);
+          logitsData = logitsRow.data();
+          lastPos = 0;
+          break;
+        }
+        default:
+          throw std::runtime_error("unsupported logits element type");
       }
 
       if (temperature <= 0.0f)
@@ -1022,9 +1013,6 @@ std::vector<int64_t> FastVLMInference::generateWithONNXDecoder(
     if (isStop(bestToken))
       return generatedTokens;
     generatedTokens.push_back(bestToken);
-
-    // Store KV cache from first generation step
-    storeKVCache(outputs);
 
     // Continue generation for remaining tokens
     for (int step = 1; step < maxTokens; ++step)

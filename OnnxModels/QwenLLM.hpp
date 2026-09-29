@@ -7,6 +7,7 @@
 #include <halp/meta.hpp>
 #include <halp/texture.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -19,6 +20,35 @@
 
 namespace OnnxModels
 {
+
+// Text increments streamed from the worker's generation loop, drained on the
+// processing thread every tick. `cancelled` stops the generation after its
+// current token.
+struct LlmTokenStream
+{
+  std::mutex mutex;
+  std::vector<std::string> pending;
+  std::atomic_bool cancelled{false};
+};
+
+struct LlmJob
+{
+  enum class Kind : uint8_t
+  {
+    Load,     // the model at `model` with the tokenizer at `tokenizer`
+    Generate, // a reply to `prompt`, streamed to `stream`
+    Dispose,  // frees `llm` off the processing thread
+  } kind = Kind::Generate;
+  std::string model, tokenizer;
+  std::string prompt;
+  float temperature = 0.7f;
+  float topP = 0.9f;
+  int topK = 40;
+  int maxTokens = 512;
+  bool thinking = true;
+  std::shared_ptr<Onnx::QwenLLMInference> llm;
+  std::shared_ptr<LlmTokenStream> stream;
+};
 
 struct QwenLLMNode : OnnxObject
 {
@@ -33,14 +63,6 @@ public:
       "Gemma, Phi, DeepSeek, ... in transformers.js / onnxruntime-genai "
       "ONNX exports) for text generation.");
   halp_meta(uuid, "f8d7e6c5-4b3a-2c1e-9f8d-7e6c5b4a3f2e");
-
-  // Tokens streamed from the worker thread's generation loop, drained on the
-  // processing thread every tick.
-  struct TokenStream
-  {
-    std::mutex mutex;
-    std::vector<std::string> pending;
-  };
 
   enum PartialMode
   {
@@ -139,6 +161,7 @@ public:
 
   void operator()();
 
+  // Loading the model and generating both happen on the worker.
   struct worker
   {
     std::function<void(std::unique_ptr<LlmJob>)> request;
@@ -146,14 +169,17 @@ public:
   } worker;
 
 private:
-  void initialize_model();
-  bool needs_reinit() const noexcept;
+  void request_load();
+  void dispose(std::shared_ptr<Onnx::QwenLLMInference> old);
   void request_inference();
+  void cancel_generation() noexcept;
+  void drain_stream();
 
   std::shared_ptr<Onnx::QwenLLMInference> llm;
-  std::string last_model_path;
-  std::string last_tokenizer_path;
-  std::string last_processed_prompt;
+  // The files of the last load, the running one or one in progress: a load
+  // that fails is not retried until a file changes.
+  std::string requested_model, requested_tokenizer;
+  bool loading = false;
 
   void segmentPartials(std::string_view delta);
   // Adds generated text to the response and the partials, through the
@@ -163,13 +189,16 @@ private:
   ThinkFilter think_filter;
   bool filter_thinking = false;
 
-  std::shared_ptr<TokenStream> token_stream;
+  std::shared_ptr<LlmTokenStream> token_stream;
   std::string accumulated_response;
   std::string partial_buffer;
   std::deque<std::string> ready_partials;
   std::chrono::steady_clock::time_point generation_start_time;
   int total_tokens_generated = 0;
   bool must_infer = false;
+  // A start was asked for while a generation ran: it begins once that one
+  // has stopped.
+  bool restart = false;
   bool inference_in_progress = false;
 };
 
