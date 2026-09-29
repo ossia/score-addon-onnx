@@ -20,12 +20,13 @@
 #                        input 1x3x280x504, outputs depth + sky
 #                        (default: fixture/two_outputs.onnx, see make_fixture.py)
 #   OUT                  output directory            (default: a fresh temp dir)
+#   SCORE_TESTS_COMMON   score's tests/integration/common (default: found from
+#                        this add-on's place in score's src/addons)
 #
 # Rendering: our own Xvfb, xcb, Mesa llvmpipe forced. ONNX Runtime is pinned
 # to the CPU provider.
 #
 # PASS = both runs exit 0, no JS SCENARIO-ERROR, analyze.py green on both.
-# Self-serializes on the shared harness flock (the OSC port is global).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -35,11 +36,13 @@ IMAGE="${MULTI_OUTLET_IMAGE:-$HERE/fixture/scene.png}"
 MODEL="${MULTI_OUTLET_MODEL:-$HERE/fixture/two_outputs.onnx}"
 echo "model: $MODEL"
 echo "image: $IMAGE"
-OSC=${SCORE_LOCAL_OSC_PORT:-6666}
 TIMEOUT="${TIMEOUT:-420}"
 GRABS="${GRABS:-40}"
 
 command -v oscsend >/dev/null || { echo "SKIP: oscsend not found"; exit 77; }
+PORTS_SH="${SCORE_TESTS_COMMON:-$HERE/../../../../../tests/integration/common}/control-ports.sh"
+[ -f "$PORTS_SH" ] || { echo "SKIP: $PORTS_SH not found"; exit 77; }
+. "$PORTS_SH"
 [ -n "$BIN" ] && [ -x "$BIN" ] || { echo "SKIP: ossia-score not built (${BIN:-unset})"; exit 77; }
 [ -f "$IMAGE" ] || { echo "SKIP: test image $IMAGE missing"; exit 77; }
 [ -f "$MODEL" ] || { echo "SKIP: model $MODEL missing"; exit 77; }
@@ -78,7 +81,7 @@ printf '[score_plugin_gfx]\nGraphicsApi=OpenGL\n' > "$CFG/ossia/score.conf"
 
 jsstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
-send() { oscsend 127.0.0.1 $OSC "$@" 2>/dev/null; }
+send() { oscsend 127.0.0.1 "$OSC" "$@" 2>/dev/null; }
 
 grab() { # png -> 0 iff file written
   local png="$1"
@@ -120,20 +123,16 @@ run_mode() {
 
   rm -f "$CFG/ossia/failsafe.bit"
   (
-    # Shorter than the ctest TIMEOUT: a lock held that long is another
-    # harness, and this run is skipped rather than killed.
-    flock -w 300 9 || { echo 98 > "$dir/run.rc"; exit 0; }
-    # A previous run still shutting down can hold the OSC port: the new app then
-    # fails to listen ("asio listen error"), never gets /script, and the run
-    # times out. Wait for the port and for any earlier instance of this test.
+    # A previous run still shutting down may still write into $OUT.
     for _ in $(seq 1 60); do
-      pgrep -f -- "--script $OUT/" >/dev/null 2>&1 && { sleep 1; continue; }
-      ss -Hlun "sport = :$OSC" 2>/dev/null | grep -q . && { sleep 1; continue; }
-      break
+      pgrep -f -- "--script $OUT/" >/dev/null 2>&1 || break
+      sleep 1
     done
+    pick_control_ports || { echo 97 > "$dir/run.rc"; exit 0; }
     env -u DISPLAY XDG_CONFIG_HOME="$CFG" \
         SCORE_AUDIO_BACKEND=dummy SCORE_DISABLE_AUDIOPLUGINS=1 SCORE_ONNX_FORCE_PROVIDER=cpu \
         SCORE_FORCE_OFFSCREEN_WINDOW=Window \
+        SCORE_LOCAL_OSC_PORT="$OSC" SCORE_LOCAL_WS_PORT="$WS" \
         DISPLAY="$DISP" QT_QPA_PLATFORM=xcb \
         __GLX_VENDOR_LIBRARY_NAME=mesa LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
         QT_LOGGING_RULES='qt.rhi.general=true' \
@@ -168,18 +167,13 @@ run_mode() {
     send /stop; sleep 0.5
     send /exit s force
     wait "$APP"; echo $? > "$dir/run.rc"
-  ) 9>/tmp/score-harness.lock
+  )
 }
 
 check_mode() { # mode -> appends to $FAILS
   local mode="$1" dir="$OUT/$1" rc renderer
   echo "=== $mode wiring"
   rc=$(cat "$dir/run.rc" 2>/dev/null || echo 97)
-  if [ "$rc" = 98 ]; then
-    SKIPPED+=" $mode"
-    echo "[$mode] /tmp/score-harness.lock still held after 300 s: skipped"
-    return
-  fi
   [ "$rc" = 0 ] || FAILS+=" $mode:exit=$rc"
   if grep -q "NULL RHI BACKEND" "$dir/run.log" 2>/dev/null; then
     FAILS+=" $mode:NULL-RHI"
@@ -203,15 +197,12 @@ check_mode() { # mode -> appends to $FAILS
 }
 
 FAILS=""
-SKIPPED=""
 for mode in init live; do
   run_mode "$mode"
   check_mode "$mode"
 done
 
-if [ -z "$FAILS" ] && [ -n "$SKIPPED" ]; then
-  echo "SKIP: harness lock busy for:$SKIPPED"; exit 77
-elif [ -z "$FAILS" ]; then
+if [ -z "$FAILS" ]; then
   echo "multi-outlet PASS (grabs: $OUT/init/grid.png $OUT/live/grid.png)"
 else
   echo "multi-outlet FAIL:$FAILS  (out=$OUT)"; exit 1
