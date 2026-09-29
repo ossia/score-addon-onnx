@@ -128,7 +128,7 @@ TEST_CASE("Audio Analyzer: the model loads on the worker", "[onnx][audio][analyz
 {
   REQUIRE(OnnxModels::initOnnxRuntime());
   OnnxModels::AudioAnalyzer node;
-  const std::string name = SCORE_ONNX_TEST_DATA_DIR "/aux/audio_flag.onnx";
+  const std::string name = SCORE_ONNX_TEST_DATA_DIR "/auxinputs/audio_flag.onnx";
   const std::string bytes = TestPaths::slurp(name);
   node.prepare({.rate = 16000., .input_channels = 1, .frames = 512});
   node.inputs.model.file.bytes = bytes;

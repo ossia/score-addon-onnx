@@ -41,7 +41,7 @@ TEST_CASE("Sequence Processor: Normalize L2 and ZScore", "[onnx][sequence]")
 {
   REQUIRE(OnnxModels::initOnnxRuntime());
   // y = x * Param 1: Out shows the fed input.
-  Seq s{SCORE_ONNX_TEST_DATA_DIR "/aux/scale.onnx"};
+  Seq s{SCORE_ONNX_TEST_DATA_DIR "/auxinputs/scale.onnx"};
   s.node.inputs.param1.value = 1.f;
   using N = OnnxModels::SeqNormalize;
 

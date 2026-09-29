@@ -19,7 +19,7 @@
 
 TEST_CASE("Audio Processor: blocks wait while the worker is busy", "[onnx][audio]")
 {
-  const std::string model = SCORE_ONNX_TEST_DATA_DIR "/aux/audio_big_block.onnx";
+  const std::string model = SCORE_ONNX_TEST_DATA_DIR "/auxinputs/audio_big_block.onnx";
   const auto bytes = TestPaths::slurp(model);
   constexpr int frames = 4096; // 12 ticks per 49152-sample block
 
@@ -102,7 +102,7 @@ struct AudioHarness
 // channels, not pushed as one mono stream of 8N samples.
 TEST_CASE("Audio Processor: Param 1 picks a stem of a [B,S,C,N] output", "[onnx][audio]")
 {
-  AudioHarness h{SCORE_ONNX_TEST_DATA_DIR "/aux/audio_stems.onnx"};
+  AudioHarness h{SCORE_ONNX_TEST_DATA_DIR "/auxinputs/audio_stems.onnx"};
   h.node.inputs.param1.value = 0.6f; // stem 2 of 4: mix * 3
   h.run(8);
   REQUIRE(!h.node.inputs.model.current_model_invalid);
@@ -113,7 +113,7 @@ TEST_CASE("Audio Processor: Param 1 picks a stem of a [B,S,C,N] output", "[onnx]
 // Params 2..4 drive the model's scalar inputs.
 TEST_CASE("Audio Processor: Param 2 drives a scalar input", "[onnx][audio]")
 {
-  AudioHarness h{SCORE_ONNX_TEST_DATA_DIR "/aux/audio_gain.onnx"};
+  AudioHarness h{SCORE_ONNX_TEST_DATA_DIR "/auxinputs/audio_gain.onnx"};
   h.node.inputs.param2.value = 0.5f;
   h.run(8);
   REQUIRE(!h.node.inputs.model.current_model_invalid);

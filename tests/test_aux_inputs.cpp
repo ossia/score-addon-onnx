@@ -235,7 +235,7 @@ TEST_CASE("Sequence Processor: Silero gets sr = 16000", "[onnx][aux][sequence][m
 
 TEST_CASE("Sequence Processor: Param 1 drives a scalar input", "[onnx][aux][sequence]")
 {
-  const std::string model = SCORE_ONNX_TEST_DATA_DIR "/aux/scale.onnx";
+  const std::string model = SCORE_ONNX_TEST_DATA_DIR "/auxinputs/scale.onnx";
   const auto bytes = TestPaths::slurp(model);
   OnnxModels::SequenceProcessor node;
   inlineWorker(node);
@@ -255,7 +255,7 @@ TEST_CASE("Geometry Processor: every input bound, Param 1 drives a scalar", "[on
   {
     DYNAMIC_SECTION(name)
     {
-      const std::string model = std::string(SCORE_ONNX_TEST_DATA_DIR "/aux/") + name + ".onnx";
+      const std::string model = std::string(SCORE_ONNX_TEST_DATA_DIR "/auxinputs/") + name + ".onnx";
       const auto bytes = TestPaths::slurp(model);
       OnnxModels::GeometryProcessor node;
       inlineWorker(node);
@@ -353,7 +353,7 @@ struct AnalyzerHarness
 
 TEST_CASE("Audio Analyzer: a bool input gets a bool", "[onnx][aux][analyzer]")
 {
-  AnalyzerHarness a{SCORE_ONNX_TEST_DATA_DIR "/aux/audio_flag.onnx"};
+  AnalyzerHarness a{SCORE_ONNX_TEST_DATA_DIR "/auxinputs/audio_flag.onnx"};
   for(int i = 0; i < 8; i++)
     a.node(512);
   REQUIRE(!a.node.inputs.model.current_model_invalid);
