@@ -134,9 +134,6 @@ struct TokenInferJob
   std::vector<float> style;         // the voice row, for AuxRole::Style
 };
 
-// A synthesised utterance at host rate, planar [channel][frame], played once.
-// It is built whole on the worker and swapped in, so it has no size limit and
-// playing it does not allocate.
 struct TextToken : OnnxObject
 {
 public:
