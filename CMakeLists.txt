@@ -916,6 +916,19 @@ if(COMMAND score_add_test AND TARGET score_plugin_engine
     SCORE_ONNX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 endif()
 
+# The presets of the pose-detector and models-presets packages against the
+# current processes. Skips without SCORE_TEST_LIBRARY_ROOT.
+if(COMMAND score_add_test AND TARGET score_plugin_scenario
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/PresetLibraryTest.cpp")
+  score_add_test(score_addon_onnx_preset_library
+    SOURCES tests/PresetLibraryTest.cpp
+    GUI
+    PLUGINS score_plugin_scenario score_lib_process)
+  add_dependencies(score_addon_onnx_preset_library score_addon_onnx_models)
+  target_include_directories(score_addon_onnx_preset_library PRIVATE
+    "${SCORE_ROOT_SOURCE_DIR}/tests/fixtures")
+endif()
+
 # Each texture outlet of the Image Processor reaches its own cable, rendered
 # through ossia-score (llvmpipe, own Xvfb) with a small bundled 2-output model.
 # The ossia-score target does not exist yet when the addons are configured:
