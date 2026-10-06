@@ -180,7 +180,7 @@ struct AudioProcessor : OnnxObject
 public:
   halp_meta(name, "Audio Processor");
   halp_meta(c_name, "audio_processor");
-  halp_meta(category, "AI/Audio Processing");
+  halp_meta(category, "AI/Audio");
   halp_meta(author, "ossia team");
   halp_meta(
       description,

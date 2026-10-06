@@ -166,7 +166,7 @@ struct SequenceProcessor : OnnxObject
 public:
   halp_meta(name, "Sequence Processor");
   halp_meta(c_name, "sequence_processor");
-  halp_meta(category, "AI/Data processing");
+  halp_meta(category, "AI/Data Processing");
   halp_meta(author, "ossia team");
   halp_meta(
       description,

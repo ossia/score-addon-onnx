@@ -39,7 +39,7 @@ struct FastVLMNode : OnnxObject
 public:
   halp_meta(name, "Vision Language Model");
   halp_meta(c_name, "fastvlm");
-  halp_meta(category, "AI/Vision Language Model");
+  halp_meta(category, "AI/Computer Vision");
   halp_meta(author, "Fast VLM authors, Onnxruntime");
   halp_meta(
       description,

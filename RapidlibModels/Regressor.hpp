@@ -18,7 +18,7 @@ struct Regressor
 public:
   halp_meta(name, "Regressor");
   halp_meta(c_name, "regressor");
-  halp_meta(category, "AI/Data processing");
+  halp_meta(category, "AI/Data Processing");
   halp_meta(author, "RapidLib authors");
   halp_meta(
       description,
