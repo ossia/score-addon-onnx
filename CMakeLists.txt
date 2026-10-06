@@ -141,7 +141,6 @@ if(COMMAND score_register_license)
   endif()
   score_register_license(RapidLib URL "https://github.com/jcelerier/RapidLib" FILES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/RapidLib/LICENSE")
   score_register_license(libsvm URL "https://www.csie.ntu.edu.tw/~cjlin/libsvm" FILES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/RapidLib/dependencies/libsvm/license.md")
-  score_register_license(BayesFilter NOTICES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/RapidLib/dependencies/bayesfilter/src/BayesianFilter.cpp")
   if(SCORE_ONNX_ENABLE_EXTENSIONS)
     include(FetchContent)
     score_register_license("ONNX Runtime Extensions" URL "https://github.com/microsoft/onnxruntime-extensions"
