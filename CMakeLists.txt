@@ -129,6 +129,33 @@ if(COMMAND score_common_setup)
 endif()
 
 avnd_addon_init(NAME score_addon_onnx_models)
+
+# The onnxruntime package carries the notices of everything it embeds in
+# ThirdPartyNotices.txt; they go with the library we ship.
+if(COMMAND score_register_license)
+  if(onnxruntime_SOURCE_DIR)
+    score_register_license("ONNX Runtime" URL "https://onnxruntime.ai"
+      FILES "${onnxruntime_SOURCE_DIR}/LICENSE" "${onnxruntime_SOURCE_DIR}/ThirdPartyNotices.txt")
+  else()
+    score_register_license("ONNX Runtime" URL "https://onnxruntime.ai" HEADER "MIT License")
+  endif()
+  score_register_license(RapidLib URL "https://github.com/jcelerier/RapidLib" FILES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/RapidLib/LICENSE")
+  score_register_license(libsvm URL "https://www.csie.ntu.edu.tw/~cjlin/libsvm" FILES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/RapidLib/dependencies/libsvm/license.md")
+  score_register_license(BayesFilter NOTICES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/RapidLib/dependencies/bayesfilter/src/BayesianFilter.cpp")
+  if(SCORE_ONNX_ENABLE_EXTENSIONS)
+    include(FetchContent)
+    score_register_license("ONNX Runtime Extensions" URL "https://github.com/microsoft/onnxruntime-extensions"
+      FILES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/onnxruntime-extensions/LICENSE")
+    FetchContent_GetProperties(gsl SOURCE_DIR _onnx_gsl_dir)
+    if(_onnx_gsl_dir)
+      score_register_license(GSL URL "https://github.com/microsoft/GSL" FILES "${_onnx_gsl_dir}/LICENSE")
+    endif()
+    FetchContent_GetProperties(nlohmann_json SOURCE_DIR _onnx_json_dir)
+    if(_onnx_json_dir)
+      score_register_license("JSON for Modern C++" URL "https://github.com/nlohmann/json" FILES "${_onnx_json_dir}/LICENSE.MIT")
+    endif()
+  endif()
+endif()
 # The generated <object>_avnd.cpp files cannot share a translation unit
 # (score::custom_factories is specialized after its first instantiation).
 set_target_properties(score_addon_onnx_models PROPERTIES UNITY_BUILD OFF)
