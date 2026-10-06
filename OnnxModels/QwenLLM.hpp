@@ -59,7 +59,7 @@ struct QwenLLMNode : OnnxObject
 public:
   halp_meta(name, "Language Model");
   halp_meta(c_name, "qwen_llm");
-  halp_meta(category, "AI/Language Model");
+  halp_meta(category, "AI/Text");
   halp_meta(author, "Qwen Team, Onnxruntime");
   halp_meta(
       description,

@@ -17,7 +17,7 @@ struct Classifier
 public:
   halp_meta(name, "Classifier");
   halp_meta(c_name, "classifier");
-  halp_meta(category, "AI/Data processing");
+  halp_meta(category, "AI/Data Processing");
   halp_meta(author, "RapidLib authors");
   halp_meta(
       description,

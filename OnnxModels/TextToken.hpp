@@ -135,7 +135,7 @@ struct TextToken : OnnxObject
 public:
   halp_meta(name, "Text Token Processor");
   halp_meta(c_name, "text_token");
-  halp_meta(category, "AI/Text Processing");
+  halp_meta(category, "AI/Text");
   halp_meta(author, "ossia team");
   halp_meta(
       description,

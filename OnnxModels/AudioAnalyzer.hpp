@@ -103,7 +103,7 @@ struct AudioAnalyzer : OnnxObject
 public:
   halp_meta(name, "Audio Analyzer");
   halp_meta(c_name, "audio_analyzer");
-  halp_meta(category, "AI/Audio Analysis");
+  halp_meta(category, "AI/Audio");
   halp_meta(author, "ossia team");
   halp_meta(
       description,
