@@ -293,6 +293,29 @@ endif()
 option(SCORE_ONNX_INSTALL_TENSORRT_PROVIDER
        "Install onnxruntime's TensorRT execution provider" OFF)
 
+# The CUDA execution provider has the same problem for a different reason: the
+# library is usable, but Microsoft's archive ships none of the CUDA libraries it
+# links, so it loads only where a matching CUDA install is already on PATH.
+# See cmake/onnxruntime-cuda-runtime.cmake for the exact set and how it is
+# derived. Off by default: it is ~1.3 GB on Windows, dominated by cublasLt
+# (443 MB) and cuDNN (598 MB), which roughly quadruples a packaged app.
+option(SCORE_ONNX_BUNDLE_CUDA_RUNTIME
+       "Ship the CUDA runtime and cuDNN libraries the CUDA execution provider needs (~1.3 GB)" OFF)
+set(ONNXRUNTIME_CUDA_RUNTIME_DIRS "" CACHE STRING
+    "Directories holding the CUDA redistributable and cuDNN libraries to ship")
+
+if(SCORE_ONNX_BUNDLE_CUDA_RUNTIME AND NOT APPLE AND NOT EMSCRIPTEN)
+  include("${CMAKE_CURRENT_LIST_DIR}/onnxruntime-cuda-runtime.cmake")
+  if(ONNXRUNTIME_CUDA_RUNTIME_MISSING)
+    message(FATAL_ERROR
+      "SCORE_ONNX_BUNDLE_CUDA_RUNTIME is ON but these libraries were not found: "
+      "${ONNXRUNTIME_CUDA_RUNTIME_MISSING}. Point ONNXRUNTIME_CUDA_RUNTIME_DIRS at "
+      "the CUDA redistributable and cuDNN directories. cuDNN must be the build for "
+      "the same CUDA major as the onnxruntime archive (cuda13 for ${ONNXRUNTIME_VERSION}); "
+      "shipping a cuda11/cuda12 cuDNN against it is the usual mistake.")
+  endif()
+endif()
+
 if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES AND NOT SCORE_NO_INSTALL_ONNXRUNTIME)
     if(APPLE)
         file(GLOB ONNXRUNTIME_FILES "${onnxruntime_SOURCE_DIR}/lib/*.dylib")
@@ -305,6 +328,10 @@ if(SCORE_DEPLOYMENT_BUILD AND NOT OSSIA_USE_SYSTEM_LIBRARIES AND NOT SCORE_NO_IN
     if(NOT SCORE_ONNX_INSTALL_TENSORRT_PROVIDER)
       list(FILTER ONNXRUNTIME_FILES EXCLUDE REGEX "onnxruntime_providers_tensorrt")
     endif()
+
+    # Deployed next to the provider: the loader looks in the application
+    # directory before PATH, so these take precedence over any system CUDA.
+    list(APPEND ONNXRUNTIME_FILES ${ONNXRUNTIME_CUDA_RUNTIME_FILES})
 
   if(APPLE)
     set(SCORE_BUNDLEUTILITIES_DIRS_LIST "${SCORE_BUNDLEUTILITIES_DIRS_LIST};${onnxruntime_SOURCE_DIR}/lib/" CACHE INTERNAL "")
