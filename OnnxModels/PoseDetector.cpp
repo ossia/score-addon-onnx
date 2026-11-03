@@ -538,61 +538,82 @@ try
           && (role.kind == Onnx::ModelKind::BlazePoseLandmark
               || role.kind == Onnx::ModelKind::HandLandmark
               || role.kind == Onnx::ModelKind::FaceMeshLandmark);
-    Onnx::ROI::Rect rect;
-    bool from_tracking = false;
-    m_landmark_score = 1.f; // a tracking ROI has no detector score
-    if(can_track && m_tracking && !m_last_keypoints.empty())
+    // A subject the tracked ROI lost is re-detected on the same frame instead
+    // of blanking it: a fast hand or body outruns its previous-frame crop now
+    // and then.
+    const bool redetect_on_loss = can_track;
+    for(int attempt = 0; attempt < 2; ++attempt)
     {
-      // Derive the ROI from last frame's landmarks — no detector this frame.
-      Onnx::ROI::Rect cand = roiRectFromKeypoints(
-          draw, m_last_keypoints, in_tex.width, in_tex.height, mw, mh);
-      // Only trust it if it's well-formed and didn't teleport/shrink vs the
-      // previous ROI — otherwise re-detect (prevents drift/center-collapse).
-      if(rectValid(cand, in_tex.width, in_tex.height)
-         && (!m_have_prev_roi || rectPlausible(cand, m_prev_roi)))
+      Onnx::ROI::Rect rect;
+      bool from_tracking = false;
+      m_landmark_score = 1.f; // a tracking ROI has no detector score
+      if(attempt == 0 && can_track && m_tracking && !m_last_keypoints.empty())
       {
-        rect = cand;
-        from_tracking = true;
+        // Derive the ROI from last frame's landmarks — no detector this frame.
+        Onnx::ROI::Rect cand = roiRectFromKeypoints(
+            draw, m_last_keypoints, in_tex.width, in_tex.height, mw, mh);
+        // Only trust it if it's well-formed and didn't teleport/shrink vs the
+        // previous ROI — otherwise re-detect (prevents drift/center-collapse).
+        if(rectValid(cand, in_tex.width, in_tex.height)
+           && (!m_have_prev_roi || rectPlausible(cand, m_prev_roi)))
+        {
+          rect = cand;
+          from_tracking = true;
+        }
       }
-    }
-    if(!from_tracking)
-    {
-      auto dets = runDetector(
-          m_detector_role, src, role.domain, detectorClass(), nullptr,
-          detThreshold());
-      if(dets.empty())
+      if(!from_tracking)
       {
-        holdOrPassthrough(src);
-        return;
+        auto dets = runDetector(
+            m_detector_role, src, role.domain, detectorClass(), nullptr,
+            detThreshold());
+        if(dets.empty())
+        {
+          // Nothing to track: no tracked ROI was usable, or it lost the
+          // subject too.
+          holdOrPassthrough(src);
+          m_tracking = false;
+          m_last_keypoints.clear();
+          return;
+        }
+        rect = detectionRect(role, dets.front(), in_tex.width, in_tex.height);
+        if(refinesHandRoi(role, dets.front()))
+          rect = refineHandRect(role, src, rect, mw, mh);
+        // Models without per-joint confidence (InstantHMR) report the score of
+        // the detection they were cropped from.
+        m_landmark_score = std::clamp(dets.front().score, 0.f, 1.f);
+        // Only reset the ROI smoother on a genuine RE-ACQUISITION (the previous
+        // frame was a dropout, m_lost_frames>0) so we don't blend across the gap.
+        // For a continuous top-down stream (which re-detects every frame, so
+        // from_tracking is always false) the smoother must stay WARM — otherwise
+        // smoothRoi restarts cold every frame, never actually smooths, and the
+        // per-frame crop jitter shows up as jumpy keypoints (rtmpose-coco).
+        if(m_lost_frames > 0 || !m_have_prev_roi || attempt > 0)
+        {
+          m_roi_smoother.reset();
+          m_have_prev_roi = false;
+        }
       }
-      rect = detectionRect(role, dets.front(), in_tex.width, in_tex.height);
-      // Models without per-joint confidence (InstantHMR) report the score of
-      // the detection they were cropped from.
-      m_landmark_score = std::clamp(dets.front().score, 0.f, 1.f);
-      // Only reset the ROI smoother on a genuine RE-ACQUISITION (the previous
-      // frame was a dropout, m_lost_frames>0) so we don't blend across the gap.
-      // For a continuous top-down stream (which re-detects every frame, so
-      // from_tracking is always false) the smoother must stay WARM — otherwise
-      // smoothRoi restarts cold every frame, never actually smooths, and the
-      // per-frame crop jitter shows up as jumpy keypoints (rtmpose-coco).
-      if(m_lost_frames > 0 || !m_have_prev_roi)
-      {
-        m_roi_smoother.reset();
-        m_have_prev_roi = false;
-      }
-    }
 
-    // Stabilize the crop. Deadband first: if the tracked ROI barely changed,
-    // reuse the previous one verbatim so a static subject gives a static crop
-    // (kills the feedback shake); otherwise smooth toward the new ROI.
-    if(from_tracking && m_have_prev_roi && rectClose(rect, m_prev_roi))
-      rect = m_prev_roi;
-    else
-      rect = smoothRoi(rect);
-    m_prev_roi = rect;
-    m_have_prev_roi = true;
-    const Onnx::Affine M = Onnx::ROI::rectToAffine(rect, mw, mh);
-    runLandmark(role, draw, src, M, /*track_id=*/-1, /*crop_padded=*/true);
+      // Stabilize the crop. Deadband first: if the tracked ROI barely changed,
+      // reuse the previous one verbatim so a static subject gives a static crop
+      // (kills the feedback shake); otherwise smooth toward the new ROI.
+      // A hand's tracked ROI is used as is, like MediaPipe's: a hand moves fast,
+      // and a smoothed ROI trails it out of the crop (the keypoints are still
+      // smoothed downstream).
+      if(from_tracking && m_have_prev_roi && rectClose(rect, m_prev_roi))
+        rect = m_prev_roi;
+      else if(!(from_tracking && role.kind == Onnx::ModelKind::HandLandmark))
+        rect = smoothRoi(rect);
+      m_prev_roi = rect;
+      m_have_prev_roi = true;
+      const Onnx::Affine M = Onnx::ROI::rectToAffine(rect, mw, mh);
+      const bool retry = from_tracking && redetect_on_loss;
+      if(runLandmark(
+             role, draw, src, M, /*track_id=*/-1, /*crop_padded=*/true,
+             /*hold_on_miss=*/!retry)
+         || !retry)
+        break;
+    }
 
     // --- Tracking gate: keep tracking only if the landmark model is confident
     if(inputs.track_roi.value && outputs.detection.value
@@ -625,7 +646,7 @@ try
       else
       {
         const int ms = role.input_w > 0 ? role.input_w : 640;
-        const Onnx::Affine M = Onnx::ROI::wholeFrameAffine(
+        const Onnx::Affine M = Onnx::ROI::wholeFrameFitAffine(
             in_tex.width, in_tex.height, ms, ms);
         runYOLOPose(src, M);
       }
@@ -636,17 +657,22 @@ try
     {
       const int mw = role.input_w > 0 ? role.input_w : 256;
       const int mh = role.input_h > 0 ? role.input_h : 256;
+      if(role.kind == Onnx::ModelKind::MoveNetPose)
+      {
+        runMoveNet(role, draw, src, mw, mh);
+        break;
+      }
       m_landmark_score = 1.f;
       // InstantHMR crops a person box and is conditioned on where that box
       // sits in the frame: with no detector, the frame IS the box (upstream's
-      // square 1.2x crop of it, black outside), not the cover-crop the other
+      // square 1.2x crop of it, black outside), not the letterbox the other
       // landmark models get, so the crop and its CLIFF vector agree.
       const Onnx::Affine M
           = role.kind == Onnx::ModelKind::InstantHmr
                 ? Onnx::ROI::rectToAffine(
                       instantHmrFrameRect(in_tex.width, in_tex.height, mw, mh),
                       mw, mh)
-                : Onnx::ROI::wholeFrameAffine(in_tex.width, in_tex.height, mw, mh);
+                : Onnx::ROI::wholeFrameFitAffine(in_tex.width, in_tex.height, mw, mh);
       runLandmark(role, draw, src, M);
       break;
     }

@@ -303,11 +303,11 @@ Onnx::ROI::Rect PoseDetector::roiRectFromKeypoints(
     }
     case PoseWorkflow::MediaPipeHands:
     {
-      const Onnx::Vec2 wrist = kp(0), mcp = kp(9);
-      const float size = std::max(bw, bh) * 2.0f;
-      r.cx = bbox_cx; r.cy = bbox_cy; r.w = r.h = size;
-      r.angle = float(M_PI) / 2.0f
-                - std::atan2(-(mcp.y - wrist.y), mcp.x - wrist.x);
+      // MediaPipe's own landmarks -> ROI rule, which the hand landmark
+      // model's crops were trained on.
+      if(kps.size() != 21)
+        return r;
+      r = Onnx::ROI::handRectFromLandmarks(kp);
       break;
     }
     case PoseWorkflow::FaceMesh:
@@ -390,9 +390,21 @@ void PoseDetector::runMultiInstance(
   m_rois.clear();
   m_roi_scores.clear();
 
-  const bool use_track_rois = inputs.track_roi.value && roi_trackable
-                              && !m_tracker.tracks().empty()
-                              && m_frames_since_detect < detect_cadence;
+  // MediaPipe's multi-hand loop, for its hand landmark model with Track ROI:
+  // every live hand keeps its landmark-derived ROI every frame, and the
+  // detector (every Detector Cadence frames, or when no hand is tracked) only
+  // ADDS the hands no tracked ROI covers. The Detector Tiles are then scanned
+  // a few per detection pass instead of all at once: a found hand stays
+  // tracked, so the scan only has to find new ones. The other kinds keep the
+  // alternation below: tracked ROIs between detections, detections only on a
+  // detection frame.
+  const bool merge = inputs.track_roi.value
+                     && role.kind == Onnx::ModelKind::HandLandmark;
+
+  bool refine = false; // see refineHandRect
+  const bool use_track_rois
+      = inputs.track_roi.value && roi_trackable && !m_tracker.tracks().empty()
+        && (merge || m_frames_since_detect < detect_cadence);
   if(use_track_rois)
   {
     ++m_frames_since_detect;
@@ -406,7 +418,7 @@ void PoseDetector::runMultiInstance(
         m_kp_scratch.push_back({k.x, k.y, k.z, k.score});
       const Onnx::ROI::Rect r
           = roiRectFromKeypoints(draw, m_kp_scratch, W, H, mw, mh);
-      if(rectValid(r, W, H))
+      if(rectValid(r, W, H) && static_cast<int>(m_rois.size()) < max_inst)
       {
         m_rois.push_back(r);
         m_roi_scores.push_back(1.f); // a tracking ROI has no detector score
@@ -415,18 +427,27 @@ void PoseDetector::runMultiInstance(
     if(m_rois.empty())
       m_frames_since_detect = detect_cadence; // force re-detect next frame
   }
+  const int n_tracked = static_cast<int>(m_rois.size());
 
-  if(m_rois.empty())
+  const bool detect
+      = merge ? (n_tracked == 0 || m_frames_since_detect >= detect_cadence)
+              : m_rois.empty();
+  if(detect)
   {
     m_frames_since_detect = 0;
+    // Merging: the whole frame and the next tiles of the rolling scan.
+    m_tile_budget = merge ? kTilesPerPass : 0;
     m_dets = runDetector(m_detector_role, src, role.domain, detectorClass());
+    m_tile_budget = 0;
     // App-side NMS before the tracker: the end2end / PINTO / pre-decoded
     // detector branches assume the graph already deduplicated, but some exports
     // emit overlapping boxes for one subject. Two boxes -> two ROIs -> two
     // competing tracks -> per-frame ID churn. NMS here is idempotent for the
-    // branches that already ran it inside runDetector.
-    m_dets = Onnx::Detection::nms(std::move(m_dets), 0.45f, 0.8f);
-    if(m_dets.empty())
+    // branches that already ran it inside runDetector. People are not checked
+    // for nesting: in a crowd, one person's box often lies within another's.
+    m_dets = Onnx::Detection::nms(
+        std::move(m_dets), 0.45f, role.domain == Onnx::ModelDomain::Body ? 0.f : 0.8f);
+    if(m_dets.empty() && n_tracked == 0)
     {
       coastOrPassthrough(draw, src);
       return;
@@ -440,12 +461,20 @@ void PoseDetector::runMultiInstance(
     }
     for(const auto& d : m_dets)
     {
+      if(static_cast<int>(m_rois.size()) >= max_inst)
+        break;
       const Onnx::ROI::Rect r = detectionRect(role, d, W, H);
-      if(rectValid(r, W, H))
-      {
-        m_rois.push_back(r);
-        m_roi_scores.push_back(std::clamp(d.score, 0.f, 1.f));
-      }
+      if(!rectValid(r, W, H))
+        continue;
+      // A hand already tracked: its landmark ROI is the better crop.
+      const bool covered = std::any_of(
+          m_rois.begin(), m_rois.begin() + n_tracked,
+          [&](const Onnx::ROI::Rect& t) { return roiOverlap(r, t) > 0.3f; });
+      if(covered)
+        continue;
+      m_rois.push_back(r);
+      m_roi_scores.push_back(std::clamp(d.score, 0.f, 1.f));
+      refine = refine || refinesHandRoi(role, d);
     }
   }
 
@@ -457,12 +486,92 @@ void PoseDetector::runMultiInstance(
 
   runLandmarkBatch(role, draw, src, m_rois); // batched if the model allows
 
+  // Whole-hand boxes: a second batch on the rects the first pass's landmarks
+  // give (see refineHandRect), for the hands it found.
+  if(refine && !m_instances.empty())
+  {
+    m_rois.clear();
+    m_roi_scores.clear();
+    for(const auto& p : m_instances)
+    {
+      if(p.keypoints.size() != 21)
+        continue;
+      const auto r = Onnx::ROI::handRectFromLandmarks([&](int i) {
+        return Onnx::Vec2{p.keypoints[i].x * W, p.keypoints[i].y * H};
+      });
+      if(rectValid(r, W, H))
+      {
+        m_rois.push_back(r);
+        m_roi_scores.push_back(std::clamp(p.mean_confidence, 0.f, 1.f));
+      }
+    }
+    if(!m_rois.empty())
+      runLandmarkBatch(role, draw, src, m_rois);
+  }
+
+  if(gatesOnMeanConfidence(role))
+  {
+    const float thr = static_cast<float>(inputs.min_confidence);
+    std::erase_if(m_instances, [thr](const DetectedPose& p) {
+      return !(p.mean_confidence >= thr);
+    });
+  }
+
+  // One hand landmarked twice (a tracked ROI and a detection beside it, or two
+  // tiles' detections NMS kept apart): the landmarks coincide. Keep the more
+  // confident one, as MediaPipe does on its landmark-derived rects.
+  if(role.domain == Onnx::ModelDomain::Hand && m_instances.size() > 1)
+    dedupeInstances(0.5f);
+
   if(m_instances.empty())
   {
     coastOrPassthrough(draw, src);
     return;
   }
   emitInstances(draw, /*do_track=*/true);
+}
+
+void PoseDetector::dedupeInstances(float iou)
+{
+  auto bounds = [](const DetectedPose& p) {
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for(const auto& k : p.keypoints)
+    {
+      x0 = std::min(x0, k.x);
+      x1 = std::max(x1, k.x);
+      y0 = std::min(y0, k.y);
+      y1 = std::max(y1, k.y);
+    }
+    return std::array<float, 4>{x0, y0, x1, y1};
+  };
+  std::sort(m_instances.begin(), m_instances.end(), [](const auto& a, const auto& b) {
+    return a.mean_confidence > b.mean_confidence;
+  });
+  size_t kept = 0;
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    const auto b = bounds(m_instances[i]);
+    bool dup = false;
+    for(size_t j = 0; j < kept && !dup; ++j)
+    {
+      const auto c = bounds(m_instances[j]);
+      const float iw = std::min(b[2], c[2]) - std::max(b[0], c[0]);
+      const float ih = std::min(b[3], c[3]) - std::max(b[1], c[1]);
+      if(iw <= 0.f || ih <= 0.f)
+        continue;
+      const float inter = iw * ih;
+      const float uni
+          = (b[2] - b[0]) * (b[3] - b[1]) + (c[2] - c[0]) * (c[3] - c[1]) - inter;
+      dup = uni > 0.f && inter / uni > iou;
+    }
+    if(!dup)
+    {
+      if(kept != i)
+        m_instances[kept] = std::move(m_instances[i]);
+      ++kept;
+    }
+  }
+  m_instances.resize(kept);
 }
 
 // Track m_instances, assign ids + per-id smoothed keypoints + colors, draw all,

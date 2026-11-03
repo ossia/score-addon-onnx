@@ -398,11 +398,32 @@ inline bool rectValid(const Onnx::ROI::Rect& r, int W, int H)
   if(!std::isfinite(r.cx) || !std::isfinite(r.cy) || !std::isfinite(r.w)
      || !std::isfinite(r.h) || !std::isfinite(r.angle))
     return false;
-  if(r.w < 0.04f * W || r.h < 0.04f * H)
+  // Tiny = collapsed. Not relative to each side: a far hand's ROI (Detector
+  // Tiles find hands a few percent of the frame high) is a few percent of
+  // the frame width, and is real.
+  const float min_side = std::max(16.f, 0.015f * std::max(W, H));
+  if(r.w < min_side || r.h < min_side)
     return false;
   if(r.cx < 0 || r.cx > W || r.cy < 0 || r.cy > H)
     return false;
   return true;
+}
+// IoU of two ROIs' axis-aligned bounds (a rotated rect's bounding box): how
+// much two crops of the same subject overlap.
+inline float roiOverlap(const Onnx::ROI::Rect& a, const Onnx::ROI::Rect& b)
+{
+  auto half = [](const Onnx::ROI::Rect& r) {
+    const float c = std::fabs(std::cos(r.angle)), s = std::fabs(std::sin(r.angle));
+    return Onnx::Vec2{0.5f * (r.w * c + r.h * s), 0.5f * (r.w * s + r.h * c)};
+  };
+  const auto ha = half(a), hb = half(b);
+  const float iw = std::min(a.cx + ha.x, b.cx + hb.x) - std::max(a.cx - ha.x, b.cx - hb.x);
+  const float ih = std::min(a.cy + ha.y, b.cy + hb.y) - std::max(a.cy - ha.y, b.cy - hb.y);
+  if(iw <= 0.f || ih <= 0.f)
+    return 0.f;
+  const float inter = iw * ih;
+  const float uni = 4.f * (ha.x * ha.y + hb.x * hb.y) - inter;
+  return uni > 0.f ? inter / uni : 0.f;
 }
 // Reject a tracked ROI that teleported or changed size implausibly vs the
 // previous one (prevents drift/collapse from compounding — re-detect instead).

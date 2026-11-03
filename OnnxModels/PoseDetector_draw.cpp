@@ -752,12 +752,14 @@ sourceFor(PoseWorkflow wf, int num_kps)
     case PoseWorkflow::BlazePose: return S::BlazePose33;
     case PoseWorkflow::MediaPipeHands: return S::Hands21;
     case PoseWorkflow::FaceMesh: return S::FaceMesh468;
-    case PoseWorkflow::MobileFaceNet: return S::Dlib68;
+    case PoseWorkflow::MobileFaceNet: return (num_kps == 98) ? S::Wflw98 : S::Dlib68;
     case PoseWorkflow::RTMPose_COCO:
     case PoseWorkflow::RTMPose_Whole:
     case PoseWorkflow::ViTPose:
     case PoseWorkflow::YOLOPose:
-      return (num_kps == 21) ? S::Hands21 : S::Coco17;
+      return (num_kps == 21)    ? S::Hands21
+             : (num_kps == 133) ? S::Wholebody133
+                                : S::Coco17;
     case PoseWorkflow::InstantHMR:
       return S::Mhr70;
     default: return std::nullopt; // BlazeFace/RTMPoseFace/Animal/Box: no remap

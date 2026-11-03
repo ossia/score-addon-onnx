@@ -32,7 +32,9 @@ enum class SourceSkeleton
   FaceMesh468,
   Dlib68,
   Ap10k17,
-  Mhr70 // InstantHMR / SAM-3D-Body keypoints (appended: keep values stable)
+  Mhr70, // InstantHMR / SAM-3D-Body keypoints (appended: keep values stable)
+  Wflw98,       // WFLW face landmarks (Peppa-Pig)
+  Wholebody133  // COCO-WholeBody: body 17, feet 6, face 68, left / right hand 21
 };
 
 // Requested output layout (Native = no remap, handled by the caller).
@@ -404,6 +406,39 @@ inline constexpr Bone dlib68_bones[] = {
     {63, 64}, {64, 65}, {65, 66}, {66, 67}, {67, 60}};
 
 // Mapping table for a (source, target) pair, or empty span if unsupported.
+// ============================ face: WFLW-98 -> dlib-68 ============================
+// The usual correspondence: every other contour point, the upper eyebrow
+// arcs, the nose, the eye corners and lid points (WFLW has 8 per eye, dlib 6),
+// and the mouth, which match one to one.
+inline constexpr JointMap wflw98_to_dlib68[] = {
+    direct(0),  direct(2),  direct(4),  direct(6),  direct(8),  direct(10),
+    direct(12), direct(14), direct(16), direct(18), direct(20), direct(22),
+    direct(24), direct(26), direct(28), direct(30), direct(32), // jaw 0-16
+    direct(33), direct(34), direct(35), direct(36), direct(37), // R brow
+    direct(42), direct(43), direct(44), direct(45), direct(46), // L brow
+    direct(51), direct(52), direct(53), direct(54),             // nose bridge
+    direct(55), direct(56), direct(57), direct(58), direct(59), // lower nose
+    direct(60), direct(61), direct(63), direct(64), direct(65), direct(67), // R eye
+    direct(68), direct(69), direct(71), direct(72), direct(73), direct(75), // L eye
+    direct(76), direct(77), direct(78), direct(79), direct(80), direct(81),
+    direct(82), direct(83), direct(84), direct(85), direct(86), direct(87),
+    direct(88), direct(89), direct(90), direct(91), direct(92), direct(93),
+    direct(94), direct(95)}; // mouth 48-67
+
+// ======================= COCO-WholeBody-133 -> face / hand =======================
+// Its face is dlib-68 from joint 23, its right hand Hand21 from joint 112 (the
+// hand MHR-70 maps to Hand21 too); the body is COCO-17 (joints 0-16).
+template <int Offset, int N>
+constexpr std::array<JointMap, N> offsetMap()
+{
+  std::array<JointMap, N> m{};
+  for(int i = 0; i < N; i++)
+    m[i] = direct(Offset + i);
+  return m;
+}
+inline constexpr auto wholebody133_to_dlib68 = offsetMap<23, 68>();
+inline constexpr auto wholebody133_to_hand21 = offsetMap<112, 21>();
+
 inline std::span<const JointMap> mappingFor(SourceSkeleton s, TargetSkeleton t)
 {
   using S = SourceSkeleton;
@@ -434,6 +469,16 @@ inline std::span<const JointMap> mappingFor(SourceSkeleton s, TargetSkeleton t)
     case S::FaceMesh468:
       return t == T::Dlib68 ? std::span<const JointMap>(facemesh468_to_dlib68)
                             : std::span<const JointMap>{};
+    case S::Wflw98:
+      return t == T::Dlib68 ? std::span<const JointMap>(wflw98_to_dlib68)
+                            : std::span<const JointMap>{};
+    case S::Wholebody133:
+      switch(t)
+      {
+        case T::Dlib68: return wholebody133_to_dlib68;
+        case T::Hand21: return wholebody133_to_hand21;
+        default: return mappingFor(S::Coco17, t);
+      }
     case S::Hands21:
       return t == T::Hand21 ? std::span<const JointMap>(hands21_to_hand21)
                             : std::span<const JointMap>{};

@@ -33,6 +33,9 @@ struct Landmark
 struct HandResult
 {
   std::vector<Landmark> landmarks;
+  // hand_landmark_full's world landmarks: metres, origin at the hand's
+  // approximate geometric centre. Empty for models without them.
+  std::vector<Landmark> world;
   float handedness;   // 0 = left, 1 = right
   float hand_flag;    // Confidence that hand is present
   bool is_right_hand;
@@ -98,12 +101,15 @@ struct HandConnections
   }};
 };
 
-// Process MediaPipe Hand Landmark output
-// Model: 033_Hand_Detection_and_Tracking/01_float32/model_float32.onnx
-// Outputs (order may vary, identified by shape):
-//   - Identity:0 [1, 1, 1, 1] - hand_flag (presence confidence)
-//   - Identity_1:0 [1, 1, 1, 1] - handedness (left/right)
-//   - Identity_2:0 [1, 63] - 21 keypoints × 3 (x, y, z)
+// Process MediaPipe Hand Landmark output, identified by shape, in graph order:
+//   legacy 256 px hand_landmark (2020):
+//     Identity:0 [1,1,1,1] hand_flag, Identity_1:0 [1,1,1,1] handedness,
+//     Identity_2:0 [1,63] 21 keypoints x (x, y, z) in crop pixels
+//   hand_landmark_full 224 px (2021+, from hand_landmarker.task):
+//     Identity [1,63] screen landmarks, Identity_1 [1,1] presence,
+//     Identity_2 [1,1] handedness, Identity_3 [1,63] world landmarks (metres)
+// The screen landmarks are the first 63-value output, the world ones the
+// second; presence is the first scalar, handedness the second.
 inline bool processOutput(
     const ModelSpec& spec,
     std::span<Ort::Value> outputs,
@@ -127,6 +133,7 @@ inline bool processOutput(
 
   // Identify outputs by shape
   const float* landmark_data = nullptr;
+  const float* world_data = nullptr;
   const float* hand_flag_data = nullptr;
   const float* handedness_data = nullptr;
 
@@ -140,8 +147,11 @@ inline bool processOutput(
 
     if(total == NUM_LANDMARKS * 3)
     {
-      // Landmarks tensor [1, 63]
-      landmark_data = data;
+      // [1, 63]: the screen landmarks come first, the world ones after.
+      if(!landmark_data)
+        landmark_data = data;
+      else if(!world_data)
+        world_data = data;
     }
     else if(total == 1)
     {
@@ -198,8 +208,17 @@ inline bool processOutput(
     landmarks[i].z = landmark_data[i * 3 + 2] / model_size;  // Z is relative depth
   }
 
+  std::vector<Landmark> world;
+  if(world_data)
+  {
+    world.resize(NUM_LANDMARKS);
+    for(int i = 0; i < NUM_LANDMARKS; ++i)
+      world[i] = {world_data[i * 3], world_data[i * 3 + 1], world_data[i * 3 + 2]};
+  }
+
   result = HandResult{
       .landmarks = std::move(landmarks),
+      .world = std::move(world),
       .handedness = handedness,
       .hand_flag = hand_flag,
       .is_right_hand = is_right};
