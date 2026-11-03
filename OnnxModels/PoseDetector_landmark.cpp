@@ -11,6 +11,31 @@ struct LandmarkKp
   float x, y, z, conf;
 };
 
+// The Gaussian mmpose blurs a heatmap with before DARK refinement:
+// cv2.GaussianBlur's kernel for size 11, sigma 0 (= 2), normalized.
+constexpr int kDarkRadius = 5;
+constexpr std::array<float, 11> kDarkKernel = [] {
+  std::array<float, 11> k{};
+  float sum = 0.f;
+  for(int i = 0; i < 11; ++i)
+  {
+    const float d = float(i - kDarkRadius);
+    // constexpr exp: a few Taylor terms of exp(-d^2/8) are enough for d <= 5
+    const float x = -d * d / 8.f;
+    float term = 1.f, e = 1.f;
+    for(int n = 1; n < 40; ++n)
+    {
+      term *= x / n;
+      e += term;
+    }
+    k[i] = e;
+    sum += e;
+  }
+  for(auto& v : k)
+    v /= sum;
+  return k;
+}();
+
 // Upper bound on the landmark outputs fetched per inference (the Ort::Value
 // arrays below are fixed-size, no per-frame allocation). InstantHMR has 5
 // (mhr_params, shape_params, cam_trans, joints_2d, joints_3d); one spare.
@@ -93,7 +118,13 @@ NormSpec landmarkNorm(const Onnx::ModelRole& role)
 constexpr uint8_t kBlackBorder[3] = {0, 0, 0};
 const uint8_t* landmarkBorder(const Onnx::ModelRole& role)
 {
-  if(role.kind == Onnx::ModelKind::InstantHmr)
+  // MoveNet sees the whole frame letterboxed, zero-padded like upstream's
+  // tf.image.resize_with_pad; mmpose's top-down crops (RTMPose, ViTPose) and
+  // face-alignment's (2D-FAN) are zero-padded too.
+  if(role.kind == Onnx::ModelKind::InstantHmr
+     || role.kind == Onnx::ModelKind::MoveNetPose
+     || role.kind == Onnx::ModelKind::SimccPose
+     || role.kind == Onnx::ModelKind::HeatmapPose)
     return kBlackBorder;
   return nullptr;
 }
@@ -126,9 +157,11 @@ void decodeLandmark(
     const Onnx::ModelRole& role, const Onnx::ModelSpec& spec,
     std::span<Ort::Value> outspan, int mw, int mh, float min_conf,
     std::vector<LandmarkKp>& kps, std::vector<LandmarkKp>* world = nullptr,
-    bool crop_padded = false, const HmrSink& hmr = {})
+    bool crop_padded = false, const HmrSink& hmr = {}, float* instance_score = nullptr)
 {
   kps.clear();
+  if(instance_score)
+    *instance_score = -1.f;
   if(world)
     world->clear();
   if(hmr.translation)
@@ -163,14 +196,66 @@ void decodeLandmark(
         const int stride = (total % 5 == 0) ? 5 : 4; // x,y,z,vis[,pres]
         const int K = total / stride;
         const int body = std::min(K, 33); // first K are body, rest are aux
+        // The full / heavy models also emit a [1,64,64,K] heatmap and the pose
+        // presence flag [1,1] (already a probability). Below Min Confidence
+        // there is no pose, as for the hand and face models' presence.
+        const float* hm = nullptr;
+        int hm_h = 0, hm_w = 0;
+        float presence = -1.f;
+        for(size_t i = 0; i < outspan.size(); ++i)
+        {
+          auto info = outspan[i].GetTensorTypeAndShapeInfo();
+          if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            continue;
+          const auto sh = info.GetShape();
+          if(sh.size() == 4 && sh[3] == K && sh[1] > 0 && sh[2] > 0)
+          {
+            hm = outspan[i].GetTensorData<float>();
+            hm_h = static_cast<int>(sh[1]);
+            hm_w = static_cast<int>(sh[2]);
+          }
+          else if(info.GetElementCount() == 1)
+            presence = std::clamp(outspan[i].GetTensorData<float>()[0], 0.f, 1.f);
+        }
+        if(presence >= 0.f && presence < min_conf)
+          break;
+        if(instance_score)
+          *instance_score = presence;
         kps.reserve(body);
         for(int i = 0; i < body; ++i)
         {
           const float* kp = data + i * stride;
+          // MediaPipe's landmark visibility: in the frame and not occluded.
           const float vis = 1.0f / (1.0f + std::exp(-kp[3]));
-          const float pres
-              = (stride == 5) ? 1.0f / (1.0f + std::exp(-kp[4])) : vis;
-          kps.push_back({kp[0], kp[1], kp[2] / mw, pres});
+          float x = kp[0], y = kp[1];
+          // MediaPipe's RefineLandmarksFromHeatmap (kernel 7, min confidence
+          // 0.5): the confidence-weighted centre of the heatmap around the
+          // regressed point, which is sharper than the regression.
+          if(hm)
+          {
+            const int cc = static_cast<int>(x / mw * hm_w);
+            const int cr = static_cast<int>(y / mh * hm_h);
+            if(cc >= 0 && cc < hm_w && cr >= 0 && cr < hm_h)
+            {
+              float sum = 0.f, wc = 0.f, wr = 0.f, mx = 0.f;
+              for(int r = std::max(0, cr - 3); r < std::min(hm_h, cr + 4); ++r)
+                for(int c = std::max(0, cc - 3); c < std::min(hm_w, cc + 4); ++c)
+                {
+                  const float v = hm[(static_cast<size_t>(r) * hm_w + c) * K + i];
+                  const float conf = 1.0f / (1.0f + std::exp(-v));
+                  sum += conf;
+                  mx = std::max(mx, conf);
+                  wc += c * conf;
+                  wr += r * conf;
+                }
+              if(mx >= 0.5f && sum > 0.f)
+              {
+                x = wc / sum / hm_w * mw;
+                y = wr / sum / hm_h * mh;
+              }
+            }
+          }
+          kps.push_back({x, y, kp[2] / mw, vis});
         }
 
         // World-3D sidecar: a [1,117] (39*3) output of x,y,z in meters,
@@ -209,6 +294,12 @@ void decodeLandmark(
         kps.reserve(r->landmarks.size());
         for(const auto& lm : r->landmarks)
           kps.push_back({lm.x * mw, lm.y * mh, lm.z, r->hand_flag});
+        if(world)
+        {
+          world->reserve(r->world.size());
+          for(const auto& w : r->world)
+            world->push_back({w.x, w.y, w.z, r->hand_flag});
+        }
       }
       break;
     }
@@ -293,20 +384,45 @@ void decodeLandmark(
             const int hx = max_idx % hw;
             const int hy = max_idx / hw;
 
-            // DARK sub-pixel refinement (mmpose's heatmap decode).
+            // DARK sub-pixel refinement as mmpose does it: one Newton step on
+            // the log of the Gaussian-blurred heatmap (kernel 11, sigma 2,
+            // scaled back to the raw peak, clipped to [0.001, 50]). Only the
+            // 3x3 neighbourhood of the peak is needed, so only it is blurred.
             float ox = 0.f, oy = 0.f;
             if(hx >= 1 && hx < hw - 1 && hy >= 1 && hy < hh - 1)
             {
-              auto L = [&](int x, int y) {
-                return std::log(std::max(hm[y * hw + x], 1e-10f));
+              auto blurred = [&](int x, int y) {
+                float acc = 0.f;
+                for(int j = -kDarkRadius; j <= kDarkRadius; ++j)
+                {
+                  // cv2's default border: reflect without the edge pixel.
+                  int yy = y + j;
+                  yy = yy < 0 ? -yy : yy >= hh ? 2 * hh - 2 - yy : yy;
+                  float row = 0.f;
+                  for(int i = -kDarkRadius; i <= kDarkRadius; ++i)
+                  {
+                    int xx = x + i;
+                    xx = xx < 0 ? -xx : xx >= hw ? 2 * hw - 2 - xx : xx;
+                    row += kDarkKernel[i + kDarkRadius] * hm[yy * hw + xx];
+                  }
+                  acc += kDarkKernel[j + kDarkRadius] * row;
+                }
+                return acc;
               };
-              const float dx = 0.5f * (L(hx + 1, hy) - L(hx - 1, hy));
-              const float dy = 0.5f * (L(hx, hy + 1) - L(hx, hy - 1));
-              const float dxx = L(hx + 1, hy) - 2.f * L(hx, hy) + L(hx - 1, hy);
-              const float dyy = L(hx, hy + 1) - 2.f * L(hx, hy) + L(hx, hy - 1);
-              const float dxy = 0.25f
-                                * (L(hx + 1, hy + 1) - L(hx + 1, hy - 1)
-                                   - L(hx - 1, hy + 1) + L(hx - 1, hy - 1));
+              float L[3][3];
+              const float peak = blurred(hx, hy);
+              const float norm = peak > 1e-12f ? max_val / peak : 1.f;
+              for(int j = 0; j < 3; ++j)
+                for(int i = 0; i < 3; ++i)
+                  L[j][i] = std::log(std::clamp(
+                      i == 1 && j == 1 ? peak * norm
+                                       : blurred(hx + i - 1, hy + j - 1) * norm,
+                      0.001f, 50.f));
+              const float dx = 0.5f * (L[1][2] - L[1][0]);
+              const float dy = 0.5f * (L[2][1] - L[0][1]);
+              const float dxx = L[1][2] - 2.f * L[1][1] + L[1][0];
+              const float dyy = L[2][1] - 2.f * L[1][1] + L[0][1];
+              const float dxy = 0.25f * (L[2][2] - L[0][2] - L[2][0] + L[0][0]);
               const float det = dxx * dyy - dxy * dxy;
               if(std::fabs(det) > 1e-9f)
               {
@@ -314,8 +430,14 @@ void decodeLandmark(
                 oy = std::clamp(-(dxx * dy - dxy * dx) / det, -1.f, 1.f);
               }
             }
-            const float mx = (hx + ox + 0.5f) * mw / hw;
-            const float my = (hy + oy + 0.5f) * mh / hh;
+            // mmpose's heatmap models (ViTPose) are trained with UDP: heatmap
+            // cell 0 is the crop's first pixel and cell w-1 its last.
+            // face-alignment's 2D-FAN puts the cells at pixel centres.
+            const bool udp = role.domain != Onnx::ModelDomain::Face;
+            const float mx = udp ? (hx + ox) * mw / std::max(hw - 1, 1)
+                                 : (hx + ox + 0.5f) * mw / hw;
+            const float my = udp ? (hy + oy) * mh / std::max(hh - 1, 1)
+                                 : (hy + oy + 0.5f) * mh / hh;
             kps.push_back({mx, my, 0.0f, max_val});
           }
         }
@@ -624,10 +746,12 @@ float PoseDetector::landmarkKeypoints(
   // own scratch (which calls in here in its fallback loop) never aliases it.
   static thread_local std::vector<LandmarkKp> kps;
   static thread_local std::vector<LandmarkKp> wkps;
+  float instance_score = -1.f;
   decodeLandmark(
       role, spec, outspan, mw, mh, static_cast<float>(inputs.min_confidence),
       kps, out_world ? &wkps : nullptr, crop_padded,
-      HmrSink{&m_hmr_out, &m_trans_scratch, &m_params_scratch, &m_offset_scratch});
+      HmrSink{&m_hmr_out, &m_trans_scratch, &m_params_scratch, &m_offset_scratch},
+      &instance_score);
 
   std::swap(storage, t.storage);
 
@@ -659,6 +783,9 @@ float PoseDetector::landmarkKeypoints(
   }
   if(score_conf)
     return sum_conf > 0.f ? cs : -1.f; // every joint unusable: no pose
+  // A model's own instance score (BlazePose's pose presence) over the joints'.
+  if(instance_score >= 0.f)
+    return instance_score;
   return sum_conf / out.size();
 }
 
@@ -725,7 +852,8 @@ void PoseDetector::runLandmarkBatch(
   // Same mapping as landmarkKeypoints (keep the two in step).
   auto pushFromKps = [&](const std::vector<LandmarkKp>& kps,
                          const std::vector<LandmarkKp>& wkps,
-                         const Onnx::Affine& M, float det_score) {
+                         const Onnx::Affine& M, float det_score,
+                         float instance_score) {
     if(kps.empty())
       return;
     DetectedPose pose;
@@ -748,8 +876,9 @@ void PoseDetector::runLandmarkBatch(
     pose.translation = m_trans_scratch;
     pose.body_params = m_params_scratch;
     pose.rig_offset = m_offset_scratch;
-    pose.mean_confidence
-        = score_conf ? det_score : sum / pose.keypoints.size();
+    pose.mean_confidence = score_conf               ? det_score
+                           : instance_score >= 0.f ? instance_score
+                                                   : sum / pose.keypoints.size();
     m_instances.push_back(std::move(pose));
   };
 
@@ -973,28 +1102,35 @@ void PoseDetector::runLandmarkBatch(
           mem_info, o.data + (o.batched ? static_cast<size_t>(b) * o.per : 0) * o.esz,
           o.per * o.esz, o.shape.data(), o.shape.size(), o.type);
     }
+    float instance_score = -1.f;
     kps.clear();
     wkps.clear();
     decodeLandmark(
         role, spec, std::span<Ort::Value>(sl, n_out), mw, mh,
         static_cast<float>(inputs.min_confidence), kps, &wkps,
         /*crop_padded=*/true,
-        HmrSink{&m_hmr_out, &m_trans_scratch, &m_params_scratch, &m_offset_scratch});
-    pushFromKps(kps, wkps, Onnx::ROI::rectToAffine(rois[b], mw, mh), roiScore(b));
+        HmrSink{&m_hmr_out, &m_trans_scratch, &m_params_scratch, &m_offset_scratch},
+        &instance_score);
+    pushFromKps(
+        kps, wkps, Onnx::ROI::rectToAffine(rois[b], mw, mh), roiScore(b),
+        instance_score);
   }
 }
 
-void PoseDetector::runLandmark(
+bool PoseDetector::runLandmark(
     const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
-    const Onnx::Affine& M, int track_id, bool crop_padded)
+    const Onnx::Affine& M, int track_id, bool crop_padded, bool hold_on_miss)
 {
   const float mean_conf = landmarkKeypoints(
       role, src, M, m_kp_scratch, &m_world_scratch, crop_padded,
       m_landmark_score);
-  if(!finitef(mean_conf) || mean_conf < 0.f || m_kp_scratch.empty())
+  if(!finitef(mean_conf) || mean_conf < 0.f || m_kp_scratch.empty()
+     || (gatesOnMeanConfidence(role)
+         && mean_conf < static_cast<float>(inputs.min_confidence)))
   {
-    holdOrPassthrough(src);
-    return;
+    if(hold_on_miss)
+      holdOrPassthrough(src);
+    return false;
   }
 
   DetectedPose detected;
@@ -1012,6 +1148,45 @@ void PoseDetector::runLandmark(
   // so the tracking-ROI loop (which indexes native joints) sees native data.
   m_native_keypoints = outputs.detection.value->keypoints;
   finalizeSingle(draw);
+  return true;
+}
+
+void PoseDetector::runMoveNet(
+    const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
+    int mw, int mh)
+{
+  const int W = src.w, H = src.h;
+  auto cropFrom = [&](const std::vector<PoseKeypoint>& kps, Onnx::ROI::Rect& r) {
+    if(kps.size() < 17)
+      return false;
+    return Onnx::ROI::moveNetCropRect(
+        [&](int i) {
+          return Onnx::ROI::ScoredPoint{kps[i].x * W, kps[i].y * H, kps[i].confidence};
+        },
+        W, H, r);
+  };
+
+  m_landmark_score = 1.f;
+  Onnx::ROI::Rect r;
+  bool crop = inputs.track_roi.value && m_tracking && cropFrom(m_last_keypoints, r);
+  if(!crop)
+  {
+    // Locate the person in the whole frame first.
+    const Onnx::Affine M = Onnx::ROI::wholeFrameFitAffine(W, H, mw, mh);
+    const float mc = landmarkKeypoints(role, src, M, m_kp_scratch, nullptr, false);
+    crop = mc >= 0.f && cropFrom(m_kp_scratch, r);
+    if(!crop)
+    {
+      m_tracking = false;
+      runLandmark(role, draw, src, M);
+      return;
+    }
+  }
+  const bool found = runLandmark(role, draw, src, Onnx::ROI::rectToAffine(r, mw, mh));
+  Onnx::ROI::Rect next;
+  m_tracking = found && cropFrom(m_native_keypoints, next);
+  if(m_tracking)
+    m_last_keypoints = m_native_keypoints;
 }
 
 void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M)
@@ -1024,91 +1199,68 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
      && spec.inputs[0].shape[2] > 0) // dynamic dims are -1: keep the default
     model_size = static_cast<int>(spec.inputs[0].shape[2]);
 
-  // Cover-resize the whole frame through M (model px -> image px), the same
-  // affine the keypoint mapback below uses, so input and output geometry agree.
+  // The whole frame through M (model px -> image px), the same affine the
+  // keypoint mapback below uses, so input and output geometry agree; padded
+  // with Ultralytics' letterbox grey.
+  static constexpr uint8_t letterbox_grey[3] = {114, 114, 114};
   auto t = fusedAffineTensor(
       spec.inputs[0], src, M, model_size, model_size,
       normMeanStd(Onnx::TensorLayout::NchwRgb, {0.f, 0.f, 0.f}, {255.f, 255.f, 255.f}),
-      storage, Onnx::prof::WarpDet);
+      storage, Onnx::prof::WarpDet, letterbox_grey);
 
   Ort::Value ins[1] = {std::move(t.value)};
   Ort::Value outs[1]{Ort::Value{nullptr}};
   lctx.infer(spec, ins, outs);
 
-  static const Yolo::YOLO_pose yolo_pose;
-  std::vector<Yolo::YOLO_pose::pose_type> poses;
   // Floor the threshold like runRTMO does: at ~0 every one of the 8400 grid
-  // candidates survives and the helper's O(n^2) dedup blows up the frame time.
+  // candidates survives the score test and the NMS blows up the frame time.
   // K from the output shape (17 for COCO; a hand head has 21).
-  const int K = yolo_pose.processOutput(
-      spec, outs, poses, 100,
-      std::max(0.3f, static_cast<float>(inputs.min_confidence)), 0, 0,
-      model_size, model_size, model_size, model_size);
+  thread_local std::vector<Yolo::YOLO_pose::Decoded> poses;
+  const int K = Yolo::YOLO_pose::decode(
+      outs, poses, std::max(0.3f, static_cast<float>(inputs.min_confidence)));
+  std::swap(storage, t.storage);
 
   if(poses.empty())
   {
     holdOrPassthrough(src);
-    std::swap(storage, t.storage);
     return;
   }
 
   const float iw = src.w, ih = src.h;
+  auto toPose = [&](const Yolo::YOLO_pose::Decoded& d) {
+    DetectedPose dp;
+    dp.keypoints.reserve(K);
+    for(int k = 0; k < K; k++)
+    {
+      const float* kp = &d.keypoints[k * 3];
+      const Onnx::Vec2 p = Onnx::ROI::applyAffine(M, kp[0], kp[1]);
+      dp.keypoints.push_back({p.x / iw, p.y / ih, 0.0f, kp[2]});
+    }
+    const Onnx::Vec2 a = Onnx::ROI::applyAffine(M, d.box.x, d.box.y);
+    const Onnx::Vec2 b = Onnx::ROI::applyAffine(M, d.box.x + d.box.w, d.box.y + d.box.h);
+    dp.box = {a.x / iw, a.y / ih, (b.x - a.x) / iw, (b.y - a.y) / ih};
+    dp.mean_confidence = d.confidence;
+    return dp;
+  };
 
-  // Multi-instance: YOLO-pose is single-stage but already finds every person.
+  // Multi-instance: YOLO-pose is single-stage but already finds every person
+  // (decode returns them best first).
   if(inputs.track_ids.value)
   {
-    const int max_inst = std::clamp(
-        static_cast<int>(
-            inputs.max_instances.value),
-        1, 16);
-    if(static_cast<int>(poses.size()) > max_inst)
-      std::partial_sort(
-          poses.begin(), poses.begin() + max_inst, poses.end(),
-          [](const auto& a, const auto& b) { return a.confidence > b.confidence; });
+    const int max_inst = std::clamp(static_cast<int>(inputs.max_instances.value), 1, 16);
     const int np = std::min(static_cast<int>(poses.size()), max_inst);
     m_instances.clear();
     for(int pi = 0; pi < np; ++pi)
-    {
-      const auto& pp = poses[pi];
-      DetectedPose dp;
-      dp.keypoints.assign(K, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
-      for(const auto& kp : pp.keypoints)
-        if(kp.kp >= 0 && kp.kp < K)
-        {
-          const Onnx::Vec2 p = Onnx::ROI::applyAffine(M, kp.x, kp.y);
-          dp.keypoints[kp.kp] = {p.x / iw, p.y / ih, 0.0f, 1.0f};
-        }
-      dp.mean_confidence = pp.confidence;
-      m_instances.push_back(std::move(dp));
-    }
-    std::swap(storage, t.storage);
-    if(m_instances.empty())
-    {
-      coastOrPassthrough(PoseWorkflow::YOLOPose, src);
-      return;
-    }
+      m_instances.push_back(toPose(poses[pi]));
     emitInstances(PoseWorkflow::YOLOPose, /*do_track=*/true);
     return;
   }
 
-  const auto& pose = poses[0];
-  DetectedPose detected;
-  detected.keypoints.assign(K, PoseKeypoint{0.f, 0.f, 0.f, 0.f});
-  for(const auto& kp : pose.keypoints)
-  {
-    if(kp.kp >= 0 && kp.kp < K)
-    {
-      const Onnx::Vec2 p = Onnx::ROI::applyAffine(M, kp.x, kp.y);
-      detected.keypoints[kp.kp] = {p.x / iw, p.y / ih, 0.0f, 1.0f};
-    }
-  }
-  detected.mean_confidence = pose.confidence;
+  DetectedPose detected = toPose(poses[0]);
   applySmoothing(detected);
   fillBoxFromKeypoints(detected);
   outputs.detection.value = std::move(detected);
   finalizeSingle(PoseWorkflow::YOLOPose);
-
-  std::swap(storage, t.storage);
 }
 
 void PoseDetector::runRTMO(const Onnx::ImageView& src)

@@ -21,12 +21,30 @@ Onnx::ROI::Rect PoseDetector::detectionRect(
 {
   const int mw = role.input_w > 0 ? role.input_w : 256;
   const int mh = role.input_h > 0 ? role.input_h : 256;
+  // A palm detection (7 keypoints: wrist, MCPs, thumb) gives the hand's
+  // orientation; a whole-hand box (RTMDet-hand, body-head-hand YOLOX) none.
+  const bool palm = role.domain == Onnx::ModelDomain::Hand && det.keypoints.size() >= 3;
   switch(role.kind)
   {
     case Onnx::ModelKind::BlazePoseLandmark:
-      return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::poseParams());
+    {
+      if(det.keypoints.size() >= 2)
+        return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::poseParams());
+      // A person box (YOLOX...): no alignment points, so an upright square
+      // around it, with the margin the pose detector's ROI leaves.
+      const float side = std::max(det.w * W, det.h * H) * Onnx::ROI::kPoseBoxCropScale;
+      return Onnx::ROI::Rect{det.xc * W, det.yc * H, side, side, 0.f};
+    }
     case Onnx::ModelKind::HandLandmark:
-      return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::handParams());
+    {
+      if(palm)
+        return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::handParams());
+      // Upright square around the hand box; the caller refines it from the
+      // landmarks (see refinesHandRoi).
+      const float side
+          = std::max(det.w * W, det.h * H) * Onnx::ROI::kHandBoxCropScale;
+      return Onnx::ROI::Rect{det.xc * W, det.yc * H, side, side, 0.f};
+    }
     case Onnx::ModelKind::FaceMeshLandmark:
       return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::faceParams());
     case Onnx::ModelKind::MobileFaceNet:
@@ -42,21 +60,110 @@ Onnx::ROI::Rect PoseDetector::detectionRect(
     }
     default:
     {
+      // A top-down HAND pose (RTMPose-hand) behind a PALM detector only gets a
+      // palm-sized box; the fingers extend well beyond it. MediaPipe's rotated
+      // hand rect (2.6x, shifted toward the fingers) covers them, and the
+      // rotated crop is more accurate than an axis-aligned 3.2x box.
+      if(palm)
+        return Onnx::ROI::mediapipeRect(det, W, H, Onnx::ROI::handParams());
+      // 2D-FAN behind BlazeFace (6 keypoints): BlazeFace's box is far tighter
+      // than the S3FD box face-alignment crops around, so a larger square,
+      // raised toward the forehead (tuned on COCO-WholeBody faces).
+      if(role.kind == Onnx::ModelKind::HeatmapPose && role.domain == Onnx::ModelDomain::Face
+         && det.keypoints.size() == 6)
+      {
+        const float side = std::max(det.w * W, det.h * H) * 1.8f;
+        return Onnx::ROI::Rect{det.xc * W, det.yc * H - 0.1f * side, side, side, 0.f};
+      }
+      // A whole-hand or body box: mmpose's 1.25 padding.
       const Onnx::Rect box{
           det.box().x * W, det.box().y * H, det.w * W, det.h * H};
-      // A top-down HAND pose (e.g. RTMPose-hand) behind a PALM detector only
-      // gets a palm-sized box centered on the palm; the fingers extend well
-      // beyond it. A symmetric expansion must be large enough to reach the
-      // fingertips in every direction (MediaPipe uses ~2.6x AND shifts toward
-      // the fingers; we have no orientation here, so go a bit larger to be safe).
-      const float expand = (role.domain == Onnx::ModelDomain::Hand) ? 3.2f : 1.25f;
-      return Onnx::ROI::topdownRect(box, mw, mh, expand);
+      return Onnx::ROI::topdownRect(box, mw, mh, 1.25f);
     }
   }
 }
 
+Onnx::ROI::Rect PoseDetector::refineHandRect(
+    const Onnx::ModelRole& role, const Onnx::ImageView& src,
+    const Onnx::ROI::Rect& rect, int mw, int mh)
+{
+  const Onnx::Affine M = Onnx::ROI::rectToAffine(rect, mw, mh);
+  const float mc = landmarkKeypoints(
+      role, src, M, m_kp_scratch, nullptr, /*crop_padded=*/true);
+  if(mc < 0.f || m_kp_scratch.size() != 21)
+    return rect;
+  const float W = src.w, H = src.h;
+  const auto r = Onnx::ROI::handRectFromLandmarks([&](int i) {
+    return Onnx::Vec2{m_kp_scratch[i].x * W, m_kp_scratch[i].y * H};
+  });
+  return rectValid(r, src.w, src.h) ? r : rect;
+}
+
 std::vector<Onnx::Detection::Detection>
 PoseDetector::runDetector(
+    const Onnx::ModelRole& role, const Onnx::ImageView& src, Onnx::ModelDomain target,
+    int keep_class, Onnx::OnnxRunContext* ctx_override, float score_thr)
+{
+  auto dets = detectRegion(role, src, target, keep_class, ctx_override, score_thr);
+  const int rows = std::clamp(static_cast<int>(inputs.detector_tiles.value), 1, 4);
+  if(rows <= 1)
+    return dets;
+
+  // Detector Tiles: the whole frame finds the large subjects, then overlapping
+  // square tiles find the small ones. A hand a few percent of the frame high is
+  // a dozen pixels at a 128-192 px detector input once the whole frame is
+  // shrunk into it, below what the detectors were trained on; in a tile it is
+  // `rows` to 3x larger. Tiles overlap by a quarter so a subject cut by one tile
+  // edge is whole in its neighbour; the duplicates merge in the NMS below.
+  const int W = src.w, H = src.h;
+  constexpr float overlap = 0.25f;
+  const int T = std::max(
+      16, static_cast<int>(std::min(W, H) / (rows - (rows - 1) * overlap)));
+  auto count = [&](int len) {
+    return len <= T ? 1
+                    : 1 + static_cast<int>(std::ceil(
+                              float(len - T) / (T * (1.f - overlap))));
+  };
+  const int nx = count(W), ny = count(H);
+  const int nt = nx * ny;
+  const int rb = src.rowBytes();
+  // All tiles, or the next m_tile_budget of a rolling scan.
+  const int n_run = m_tile_budget > 0 ? std::min(m_tile_budget, nt) : nt;
+  const int first = m_tile_budget > 0 ? m_tile_cursor % nt : 0;
+  m_tile_cursor = (first + n_run) % nt;
+  for(int k = 0; k < n_run; ++k)
+  {
+    const int t = (first + k) % nt;
+    const int i = t % nx, j = t / nx;
+    const int x = nx == 1 ? 0 : (i * (W - std::min(T, W))) / (nx - 1);
+    const int y = ny == 1 ? 0 : (j * (H - std::min(T, H))) / (ny - 1);
+    const int tw = std::min(T, W), th = std::min(T, H);
+    const Onnx::ImageView tile{
+        src.data + static_cast<size_t>(y) * rb + static_cast<size_t>(x) * src.channels,
+        tw, th, src.channels, rb};
+    auto td = detectRegion(role, tile, target, keep_class, ctx_override, score_thr);
+    // Tile-normalized -> frame-normalized.
+    const float sx = float(tw) / W, sy = float(th) / H;
+    const float ox = float(x) / W, oy = float(y) / H;
+    for(auto& d : td)
+    {
+      d.xc = ox + d.xc * sx;
+      d.yc = oy + d.yc * sy;
+      d.w *= sx;
+      d.h *= sy;
+      for(auto& k : d.keypoints)
+        k = {ox + k.x * sx, oy + k.y * sy};
+      dets.push_back(std::move(d));
+    }
+  }
+  // IoU is invariant to the per-axis scaling of normalized coordinates, so the
+  // merge can run on them directly. Intersection-over-minimum also folds a
+  // tile's detection of part of a subject into the whole-frame one.
+  return Onnx::Detection::nms(std::move(dets), 0.3f, 0.6f);
+}
+
+std::vector<Onnx::Detection::Detection>
+PoseDetector::detectRegion(
     const Onnx::ModelRole& role, const Onnx::ImageView& src, Onnx::ModelDomain target,
     int keep_class, Onnx::OnnxRunContext* ctx_override, float score_thr)
 {
@@ -350,8 +457,11 @@ PoseDetector::runDetector(
      && role.kind != Onnx::ModelKind::BlazeFaceDetector)
     return {};
 
-  // Pixel mapping out = px*a + b: palm wants [0,1], the others [-1,1].
-  const bool unit_range = role.kind == Onnx::ModelKind::PalmDetector;
+  // Pixel mapping out = px*a + b: the palm detectors from 192 px up (full /
+  // lite, 2021+) want [0,1] (their tflite metadata: mean 0, std 255); the
+  // legacy 128 px palm (896 anchors, MediaPipe <= 0.8.5) and the others [-1,1].
+  const bool unit_range
+      = role.kind == Onnx::ModelKind::PalmDetector && model > 128;
   const float a = unit_range ? 1.f : 2.f;
   const float b = unit_range ? 0.f : -1.f;
 
@@ -419,7 +529,8 @@ PoseDetector::runDetector(
 
   auto dets = Onnx::Detection::decode(
       std::span<Ort::Value>(outs, n_out), m_ssd_anchors, model, useThr(0.5f));
-  dets = Onnx::Detection::nms(std::move(dets), 0.3f);
+  // MediaPipe's weighted NMS, then the nested-box pass of the plain one.
+  dets = Onnx::Detection::nms(Onnx::Detection::weightedNms(std::move(dets), 0.3f), 0.3f);
   removeLetterbox(dets, lb);
   return dets;
 }

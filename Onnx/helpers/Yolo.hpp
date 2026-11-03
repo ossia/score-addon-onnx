@@ -294,27 +294,6 @@ struct YOLO_pose
     std::vector<pos> keypoints;
   };
 
-  // FIXME use NMS instead
-  static bool similar(pose_type::rect lhs, pose_type::rect rhs) noexcept
-  {
-    const float epsilon = std::min(0.1 * lhs.w, 0.1 * lhs.h);
-    return std::abs(rhs.x - lhs.x) < epsilon
-           && std::abs(rhs.y - lhs.y) < epsilon
-           && std::abs(rhs.w - lhs.w) < epsilon
-           && std::abs(rhs.h - lhs.h) < epsilon;
-  }
-
-  static bool
-  hasSimilarRect(pose_type::rect r, std::span<pose_type> poses) noexcept
-  {
-    for (const auto& p : poses)
-    {
-      if (similar(r, p.geometry))
-        return true;
-    }
-    return false;
-  }
-
   // The layout of a pose head, from its output shape:
   //  - v8 / v11: channel-major [1, 5+3K, A] (cx,cy,w,h, conf, kpts) over A
   //    anchors (8400 at 640, 2100 at 320), or its transpose [1, A, 5+3K];
@@ -344,20 +323,23 @@ struct YOLO_pose
     return l;
   }
 
-  // Decodes every pose above min_confidence; returns the keypoint count K of
-  // the model (0 when the output is not a pose head).
-  int processOutput(
-      const Onnx::ModelSpec& spec,
-      std::span<Ort::Value> outputTensor,
-      std::vector<pose_type>& out,
-      int max_detect = 100,
-      float min_confidence = 0.75,
-      int image_x = 0,
-      int image_y = 0,
-      int image_w = 640,
-      int image_h = 640,
-      int model_w = 640,
-      int model_h = 640) const
+  // One decoded pose: its box (model px, top-left form), score, and every
+  // keypoint as x, y (model px) and confidence.
+  struct Decoded
+  {
+    pose_type::rect box;
+    float confidence{};
+    std::vector<float> keypoints; // K * {x, y, c}
+  };
+
+  // Decodes the poses above min_confidence, best first, at most max_detect.
+  // The anchor formats predict each person at several anchors: they go
+  // through a class-agnostic NMS at iou_threshold (Ultralytics' 0.7); yolo26
+  // is already deduplicated. Returns the keypoint count K of the model (0
+  // when the output is not a pose head).
+  static int decode(
+      std::span<Ort::Value> outputTensor, std::vector<Decoded>& out,
+      float min_confidence, int max_detect = 100, float iou_threshold = 0.7f)
   {
     out.clear();
     if (outputTensor.empty())
@@ -380,35 +362,54 @@ struct YOLO_pose
     for (int i = 0; i < l.count; i++)
       if (at(i, 4) > min_confidence)
         idx.push_back(i);
-    if (idx.empty())
-      return l.keypoints;
     std::stable_sort(idx.begin(), idx.end(), [&](int i1, int i2) {
       return at(i1, 4) > at(i2, 4);
     });
 
-    // 2. One pose each; the anchor formats overlap and are deduplicated.
+    // 2. Greedy NMS over them, then one pose per survivor.
     const int kp0 = l.corners ? 6 : 5;
     for (int j : idx)
     {
+      if (std::ssize(out) >= max_detect)
+        break;
       pose_type::rect rect;
       if (l.corners)
         rect = {at(j, 0), at(j, 1), at(j, 2) - at(j, 0), at(j, 3) - at(j, 1)};
       else
       {
         rect = {at(j, 0) - at(j, 2) / 2, at(j, 1) - at(j, 3) / 2, at(j, 2), at(j, 3)};
-        if (hasSimilarRect(rect, out))
+        if (std::any_of(out.begin(), out.end(), [&](const Decoded& d) {
+              return iou(d.box, rect) > iou_threshold;
+            }))
           continue;
       }
-      out.push_back(pose_type{.geometry = rect, .confidence = at(j, 4)});
-      auto& kps = out.back().keypoints;
-      for (int i = 0; i < l.keypoints; i++)
-      {
-        const float c = at(j, kp0 + i * 3 + 2);
-        if (c > min_confidence)
-          kps.push_back({i, at(j, kp0 + i * 3), at(j, kp0 + i * 3 + 1)});
-      }
+      auto& d = out.emplace_back(Decoded{.box = rect, .confidence = at(j, 4)});
+      d.keypoints.resize(l.keypoints * 3);
+      for (int i = 0; i < l.keypoints * 3; i++)
+        d.keypoints[i] = at(j, kp0 + i);
     }
     return l.keypoints;
+  }
+
+  // The poses above min_confidence, each with its keypoints above it too.
+  int processOutput(
+      const Onnx::ModelSpec& spec,
+      std::span<Ort::Value> outputTensor,
+      std::vector<pose_type>& out,
+      int max_detect = 100,
+      float min_confidence = 0.75) const
+  {
+    out.clear();
+    thread_local std::vector<Decoded> decoded;
+    const int K = decode(outputTensor, decoded, min_confidence, max_detect);
+    for (const auto& d : decoded)
+    {
+      auto& p = out.emplace_back(pose_type{.geometry = d.box, .confidence = d.confidence});
+      for (int i = 0; i < K; i++)
+        if (d.keypoints[i * 3 + 2] > min_confidence)
+          p.keypoints.push_back({i, d.keypoints[i * 3], d.keypoints[i * 3 + 1]});
+    }
+    return K;
   }
 };
 

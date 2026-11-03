@@ -13,6 +13,10 @@
 //                           (default: the libreonnx pack's test_images/)
 //   ONNX_TEST_AILIA         an ailia-models checkout (sample images, GANs)
 //   ONNX_TEST_POSE_PACKAGE  score's pose-detector package
+//   ONNX_TEST_HAND_IMAGES   hand photos: MediaPipe's test images (thumb_up.jpg,
+//                           victory.jpg, pointing_up.jpg, fist.jpg, from
+//                           storage.googleapis.com/mediapipe-assets)
+//   ONNX_TEST_HAND_SET      a hand benchmark set: gt.json + its frames
 //   ONNX_TEST_PINTO_ZOO     a PINTO_model_zoo checkout
 //   ONNX_TEST_GAN_MODELS    fbanime-gan/, MobileStyleGAN.pytorch/ exports
 //   ONNX_TEST_INSTANTHMR    InstantHMR's instanthmr.onnx (huggingface.co/
@@ -69,6 +73,10 @@ inline std::string ailia()
 inline std::string posePackage()
 {
   return env("ONNX_TEST_POSE_PACKAGE");
+}
+inline std::string handImages()
+{
+  return env("ONNX_TEST_HAND_IMAGES");
 }
 inline std::string pintoZoo()
 {

@@ -191,6 +191,68 @@ inline std::vector<Detection> decode(
   return decode(outputs, anchors, params.input_size, score_thr);
 }
 
+// MediaPipe's WEIGHTED non-maximum suppression (NonMaxSuppressionCalculator):
+// each kept detection is the score-weighted mean of every remaining one that
+// overlaps it by more than iou_threshold, box and keypoints alike, with the
+// best one's score. The SSD detectors fire on several neighbouring anchors
+// per subject; averaging them steadies the keypoints the ROI is derived from.
+inline std::vector<Detection>
+weightedNms(std::vector<Detection> dets, float iou_threshold = 0.3f)
+{
+  std::sort(dets.begin(), dets.end(), [](const auto& a, const auto& b) {
+    return a.score > b.score;
+  });
+  auto iou = [](const Detection& a, const Detection& b) {
+    const float x1 = std::max(a.xc - a.w * 0.5f, b.xc - b.w * 0.5f);
+    const float y1 = std::max(a.yc - a.h * 0.5f, b.yc - b.h * 0.5f);
+    const float x2 = std::min(a.xc + a.w * 0.5f, b.xc + b.w * 0.5f);
+    const float y2 = std::min(a.yc + a.h * 0.5f, b.yc + b.h * 0.5f);
+    const float inter = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
+    const float uni = a.w * a.h + b.w * b.h - inter;
+    return uni > 0.f ? inter / uni : 0.f;
+  };
+  std::vector<Detection> out;
+  std::vector<bool> used(dets.size(), false);
+  for(size_t i = 0; i < dets.size(); ++i)
+  {
+    if(used[i])
+      continue;
+    Detection m = dets[i];
+    float sw = 0.f, xc = 0.f, yc = 0.f, w = 0.f, h = 0.f;
+    std::vector<Onnx::Vec2> kps(m.keypoints.size(), Onnx::Vec2{0.f, 0.f});
+    for(size_t j = i; j < dets.size(); ++j)
+    {
+      if(used[j] || (j != i && iou(dets[i], dets[j]) <= iou_threshold))
+        continue;
+      used[j] = true;
+      const auto& d = dets[j];
+      const float s = d.score;
+      sw += s;
+      xc += s * d.xc;
+      yc += s * d.yc;
+      w += s * d.w;
+      h += s * d.h;
+      for(size_t k = 0; k < kps.size() && k < d.keypoints.size(); ++k)
+      {
+        kps[k].x += s * d.keypoints[k].x;
+        kps[k].y += s * d.keypoints[k].y;
+      }
+    }
+    if(sw > 0.f)
+    {
+      m.xc = xc / sw;
+      m.yc = yc / sw;
+      m.w = w / sw;
+      m.h = h / sw;
+      for(auto& k : kps)
+        k = {k.x / sw, k.y / sw};
+      m.keypoints = std::move(kps);
+    }
+    out.push_back(std::move(m));
+  }
+  return out;
+}
+
 // Greedy IoU non-maximum suppression. A box is also suppressed when it is
 // nested inside a higher-scoring keeper: plain IoU misses a small box fully
 // inside a large one (IoU = area_small/area_large drops below the threshold as

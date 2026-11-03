@@ -546,6 +546,18 @@ public:
       bool value = false;
     } draw_mesh;
 
+    // Appended last to keep existing presets' port indices stable (id 35).
+    struct : halp::spinbox_i32<"Detector Tiles", halp::range{1, 4, 1}>
+    {
+      halp_meta(
+          description,
+          "Also run the Detection Model on overlapping square tiles of the "
+          "frame, this many rows of them, to find small subjects (hands, faces "
+          "far from the camera) the whole-frame pass misses. 1 = whole frame "
+          "only. Each tile is one more detector run: pair with Track ROI and "
+          "a Detector Cadence above 1 to amortize it.");
+    } detector_tiles;
+
   } inputs;
 
   struct
@@ -605,6 +617,7 @@ public:
       halp_meta(layout, halp::layouts::vbox)
       halp::item<&ins::model> model;
       halp::item<&ins::det_model> det_model;
+      halp::item<&ins::detector_tiles> detector_tiles;
       halp::item<&ins::workflow> workflow;
       halp::item<&ins::detection_class> detection_class;
       halp::item<&ins::class_file> class_file;
@@ -715,8 +728,9 @@ public:
 
 private:
   // --- Two-stage building blocks ---
-  // Stage 1: run the detector on the full frame, return detections in
-  // image-normalized [0,1] coordinates (letterbox removed).
+  // Stage 1: run the detector on the full frame (and on the Detector Tiles),
+  // return detections in image-normalized [0,1] coordinates (letterbox
+  // removed).
   // keep_class: -2 = use the target-domain default class filter (person/animal),
   // -1 = keep all classes, >=0 = keep only that class id.
   // ctx_override runs the detector on a specific context instead of det_ctx
@@ -729,15 +743,24 @@ private:
       const Onnx::ModelRole& role, const Onnx::ImageView& src,
       Onnx::ModelDomain target = Onnx::ModelDomain::Body, int keep_class = -2,
       Onnx::OnnxRunContext* ctx_override = nullptr, float score_thr = -1.f);
+  // One detector pass over `src` (the whole frame or one tile): what
+  // runDetector runs once, or on the frame and each tile with Detector Tiles.
+  std::vector<Onnx::Detection::Detection> detectRegion(
+      const Onnx::ModelRole& role, const Onnx::ImageView& src,
+      Onnx::ModelDomain target, int keep_class,
+      Onnx::OnnxRunContext* ctx_override, float score_thr);
 
   // Stage 2: run the landmark/pose model on the crop defined by M
   // (crop-pixels -> image-pixels), then map keypoints back through M.
   // crop_padded: the ROI is a padded detector crop (two-stage / multi-instance),
   // so a keypoint pegged to the crop edge is a SimCC/heatmap decode artifact to
   // drop. False for whole-frame, where edge keypoints can be real.
-  void runLandmark(
+  // Returns whether it found a pose; on a miss, holds the last one or passes
+  // the frame through, unless !hold_on_miss (the caller tries another ROI).
+  bool runLandmark(
       const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
-      const Onnx::Affine& M, int track_id = -1, bool crop_padded = false);
+      const Onnx::Affine& M, int track_id = -1, bool crop_padded = false,
+      bool hold_on_miss = true);
 
   // Stage 2 core: run the landmark model on one crop and decode keypoints into
   // `out` (image-normalized [0,1]); no smoothing/drawing/output. Returns the
@@ -765,6 +788,9 @@ private:
   void runLandmarkBatch(
       const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
       const std::vector<Onnx::ROI::Rect>& rois);
+  // Drop every instance of m_instances whose keypoint bounds overlap a more
+  // confident one's by more than `iou` (the same subject landmarked twice).
+  void dedupeInstances(float iou);
   // Track m_instances, assign ids + per-id smoothed keypoints + colors, then
   // draw all and publish every output port.
   void emitInstances(PoseWorkflow draw, bool do_track);
@@ -871,6 +897,38 @@ private:
   Onnx::ROI::Rect
   detectionRect(const Onnx::ModelRole& role,
                 const Onnx::Detection::Detection& det, int W, int H);
+  // MoveNet, which finds one person in the whole frame: the letterboxed frame
+  // locates them, then a second pass runs on MoveNet's own crop around them
+  // (upstream's cropping algorithm). With Track ROI, the previous frame's
+  // keypoints give that crop directly.
+  void runMoveNet(
+      const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
+      int mw, int mh);
+  // A MediaPipe hand landmark model behind a whole-hand box (no palm
+  // keypoints, so no orientation): its crop from detectionRect is an upright
+  // square, refined by one landmark pass to the rotated rect MediaPipe derives
+  // from the landmarks (refineHandRect, or the second batch of
+  // runMultiInstance).
+  static bool refinesHandRoi(
+      const Onnx::ModelRole& role, const Onnx::Detection::Detection& det) noexcept
+  {
+    return role.kind == Onnx::ModelKind::HandLandmark && det.keypoints.size() < 3;
+  }
+  // That refinement for one crop; `rect` itself when the pass finds no hand.
+  Onnx::ROI::Rect refineHandRect(
+      const Onnx::ModelRole& role, const Onnx::ImageView& src,
+      const Onnx::ROI::Rect& rect, int mw, int mh);
+  // A top-down hand model (RTMPose-hand) has no presence output: a crop with
+  // no hand still decodes 21 points, at a low mean confidence. Those
+  // instances are dropped below Min Confidence (the MediaPipe hand model's
+  // presence score gets the same threshold in its decoder). Body models are
+  // not gated: a whole-body model's many low-confidence face and hand points
+  // pull a real person's mean down.
+  static bool gatesOnMeanConfidence(const Onnx::ModelRole& role) noexcept
+  {
+    return role.domain == Onnx::ModelDomain::Hand
+           && role.kind != Onnx::ModelKind::HandLandmark;
+  }
   // ROI rect derived from the previous frame's landmarks (tracking loop).
   Onnx::ROI::Rect roiRectFromKeypoints(
       PoseWorkflow draw, const std::vector<PoseKeypoint>& kps, int W, int H,
@@ -1020,6 +1078,11 @@ private:
   bool m_landmark_pad_batch{false};
   int m_landmark_batch_cap{0};
   int m_frames_since_detect{0};                   // detector-cadence counter
+  // Detector Tiles scanned per detection pass when they are scanned a few at
+  // a time (multi-hand Track ROI, see runMultiInstance); 0 = all of them.
+  static constexpr int kTilesPerPass = 2;
+  int m_tile_budget{0};
+  int m_tile_cursor{0}; // the next tile of the rolling scan
 
   // Detector anchor/prior caches: the geometry only depends on the model, so
   // regenerating it per frame would heap-allocate tens of KB at frame rate.
