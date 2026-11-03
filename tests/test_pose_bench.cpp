@@ -105,8 +105,11 @@ void applyPreset(
         in.skeleton_type.value = static_cast<decltype(in.skeleton_type.value)>(i);
         break;
       case 35:
-        if constexpr(requires { in.detector_tiles; })
-          in.detector_tiles.value = i;
+        // A generic lambda, so the bench still builds against older nodes.
+        [i](auto& ports) {
+          if constexpr(requires { ports.detector_tiles; })
+            ports.detector_tiles.value = i;
+        }(in);
         break;
       default:
         break;
