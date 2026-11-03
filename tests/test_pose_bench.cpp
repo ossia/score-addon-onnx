@@ -8,6 +8,7 @@
 //   ONNX_TEST_POSE_BENCH_MULTI   "1" turns Track IDs on: every instance out
 //   ONNX_TEST_POSE_BENCH_SKELETON  a Skeleton index to output instead
 //   ONNX_TEST_POSE_BENCH_SET     overrides, "<port>=<number>;...", e.g. "4=0.1;12=16"
+//   ONNX_TEST_POSE_BENCH_AS_IS   "1" keeps the preset's smoothing, hold and track memory
 //   ONNX_TEST_POSE_BENCH_REPEAT  frames per image (default 1): the output of
 //                                the last, so tracked ROIs come into play;
 //                                every frame is timed ("frame_ms")
@@ -104,6 +105,18 @@ void applyPreset(
       case 25:
         in.skeleton_type.value = static_cast<decltype(in.skeleton_type.value)>(i);
         break;
+      case 9:
+        in.smoothing.value = b;
+        break;
+      case 10:
+        in.smoothing_amount.value = f;
+        break;
+      case 27:
+        in.track_memory.value = i;
+        break;
+      case 30:
+        in.hold_frames.value = i;
+        break;
       case 35:
         // A generic lambda, so the bench still builds against older nodes.
         [i](auto& ports) {
@@ -181,10 +194,14 @@ TEST_CASE("Pose Detector preset replay over an image set", "[.bench][pose]")
     node.inputs.det_model.file.bytes = det.bytes;
     node.inputs.det_model.file.filename = det.name;
   }
-  // Stills: no temporal filtering, nothing held over to the next image.
-  node.inputs.smoothing.value = false;
-  node.inputs.hold_frames.value = 0;
-  node.inputs.track_memory.value = 1;
+  // Stills: no temporal filtering, nothing held over to the next image
+  // (unless ONNX_TEST_POSE_BENCH_AS_IS=1: the preset's own settings).
+  if(TestPaths::env("ONNX_TEST_POSE_BENCH_AS_IS") != "1")
+  {
+    node.inputs.smoothing.value = false;
+    node.inputs.hold_frames.value = 0;
+    node.inputs.track_memory.value = 1;
+  }
   inlineWorker(node);
 
   const QImage blank = [] {

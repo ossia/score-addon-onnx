@@ -323,6 +323,12 @@ Onnx::ROI::Rect PoseDetector::roiRectFromKeypoints(
     }
     default:
     {
+      // A top-down hand model: MediaPipe's hand rule, as for its own model.
+      if(kps.size() == 21)
+      {
+        r = Onnx::ROI::handRectFromLandmarks(kp);
+        break;
+      }
       // top-down (RTMPose/ViTPose/YOLO): axis-aligned bbox, aspect-fixed.
       // Recompute the bbox from only WELL-confident points: wholebody (133)
       // emits many low-confidence face/hand points that, if included, blow up
@@ -378,10 +384,14 @@ void PoseDetector::runMultiInstance(
 
   // Per-track ROI feedback (detector-skip) is only steady for the
   // MediaPipe-rotated landmark kinds; top-down (SimCC/heatmap) re-detects.
+  // A top-down hand model (RTMPose-hand) is steady on MediaPipe's rotated
+  // landmark ROI too: it gets the same crops behind the palm detector.
+  const bool hand_topdown = role.domain == Onnx::ModelDomain::Hand
+                            && role.kind != Onnx::ModelKind::HandLandmark;
   const bool roi_trackable
       = role.kind == Onnx::ModelKind::BlazePoseLandmark
         || role.kind == Onnx::ModelKind::HandLandmark
-        || role.kind == Onnx::ModelKind::FaceMeshLandmark;
+        || role.kind == Onnx::ModelKind::FaceMeshLandmark || hand_topdown;
   const int detect_cadence
       = std::max(1, static_cast<int>(inputs.detector_cadence.value));
 
@@ -390,7 +400,7 @@ void PoseDetector::runMultiInstance(
   m_rois.clear();
   m_roi_scores.clear();
 
-  // MediaPipe's multi-hand loop, for its hand landmark model with Track ROI:
+  // MediaPipe's multi-hand loop, for the hand models with Track ROI:
   // every live hand keeps its landmark-derived ROI every frame, and the
   // detector (every Detector Cadence frames, or when no hand is tracked) only
   // ADDS the hands no tracked ROI covers. The Detector Tiles are then scanned
@@ -399,7 +409,7 @@ void PoseDetector::runMultiInstance(
   // alternation below: tracked ROIs between detections, detections only on a
   // detection frame.
   const bool merge = inputs.track_roi.value
-                     && role.kind == Onnx::ModelKind::HandLandmark;
+                     && (role.kind == Onnx::ModelKind::HandLandmark || hand_topdown);
 
   bool refine = false; // see refineHandRect
   const bool use_track_rois
