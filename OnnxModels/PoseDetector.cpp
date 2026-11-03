@@ -554,7 +554,9 @@ try
             draw, m_last_keypoints, in_tex.width, in_tex.height, mw, mh);
         // Only trust it if it's well-formed and didn't teleport/shrink vs the
         // previous ROI — otherwise re-detect (prevents drift/center-collapse).
-        if(rectValid(cand, in_tex.width, in_tex.height)
+        if(rectValid(
+               cand, in_tex.width, in_tex.height,
+               role.domain == Onnx::ModelDomain::Hand)
            && (!m_have_prev_roi || rectPlausible(cand, m_prev_roi)))
         {
           rect = cand;
@@ -599,10 +601,15 @@ try
       // (kills the feedback shake); otherwise smooth toward the new ROI.
       // A hand's tracked ROI is used as is, like MediaPipe's: a hand moves fast,
       // and a smoothed ROI trails it out of the crop (the keypoints are still
-      // smoothed downstream).
+      // smoothed downstream). The smoother then holds nothing of it: reset, so
+      // a later detection starts from its own rect, not from the last one.
+      const bool raw_hand_roi
+          = from_tracking && role.kind == Onnx::ModelKind::HandLandmark;
+      if(raw_hand_roi)
+        m_roi_smoother.reset();
       if(from_tracking && m_have_prev_roi && rectClose(rect, m_prev_roi))
         rect = m_prev_roi;
-      else if(!(from_tracking && role.kind == Onnx::ModelKind::HandLandmark))
+      else if(!raw_hand_roi)
         rect = smoothRoi(rect);
       m_prev_roi = rect;
       m_have_prev_roi = true;

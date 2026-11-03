@@ -393,16 +393,21 @@ inline Onnx::FloatTensor fusedLetterboxTensor(
 }
 
 // A tracking ROI must be finite, non-tiny, and centered inside the frame.
-inline bool rectValid(const Onnx::ROI::Rect& r, int W, int H)
+// Tiny = collapsed: under 4% of the frame on either side. `small_subjects`
+// (hands) lowers that to 1.5% of the long side: a far hand found by the
+// Detector Tiles is a few percent of the frame width, and is real.
+inline bool rectValid(const Onnx::ROI::Rect& r, int W, int H, bool small_subjects = false)
 {
   if(!std::isfinite(r.cx) || !std::isfinite(r.cy) || !std::isfinite(r.w)
      || !std::isfinite(r.h) || !std::isfinite(r.angle))
     return false;
-  // Tiny = collapsed. Not relative to each side: a far hand's ROI (Detector
-  // Tiles find hands a few percent of the frame high) is a few percent of
-  // the frame width, and is real.
-  const float min_side = std::max(16.f, 0.015f * std::max(W, H));
-  if(r.w < min_side || r.h < min_side)
+  if(small_subjects)
+  {
+    const float min_side = std::max(16.f, 0.015f * std::max(W, H));
+    if(r.w < min_side || r.h < min_side)
+      return false;
+  }
+  else if(r.w < 0.04f * W || r.h < 0.04f * H)
     return false;
   if(r.cx < 0 || r.cx > W || r.cy < 0 || r.cy > H)
     return false;
