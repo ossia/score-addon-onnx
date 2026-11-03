@@ -191,6 +191,87 @@ inline std::vector<Detection> decode(
   return decode(outputs, anchors, params.input_size, score_thr);
 }
 
+// Whether keeper `a` suppresses `b`: IoU above iou_threshold, or b nested in
+// a (intersection over the smaller box) at contain_thresh or more (<= 0: off).
+inline bool suppresses(
+    const Detection& a, const Detection& b, float iou_threshold, float contain_thresh)
+{
+  const float x1 = std::max(a.xc - a.w * 0.5f, b.xc - b.w * 0.5f);
+  const float y1 = std::max(a.yc - a.h * 0.5f, b.yc - b.h * 0.5f);
+  const float x2 = std::min(a.xc + a.w * 0.5f, b.xc + b.w * 0.5f);
+  const float y2 = std::min(a.yc + a.h * 0.5f, b.yc + b.h * 0.5f);
+  const float inter = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
+  if(inter <= 0.0f)
+    return false;
+  const float aa = a.w * a.h, ab = b.w * b.h;
+  const float uni = aa + ab - inter;
+  if(uni > 0.0f && inter / uni > iou_threshold)
+    return true;
+  const float mn = std::min(aa, ab);
+  return contain_thresh > 0.0f && mn > 0.0f && inter / mn >= contain_thresh;
+}
+
+// One square-ish tile of the Detector Tiles grid, in frame pixels.
+struct Tile
+{
+  int x{}, y{}, w{}, h{};
+};
+
+// The Detector Tiles grid of a W x H frame for `rows` (>= 2) rows of tiles:
+// tiles of side min(W, H) / (rows - (rows - 1) / 4), overlapping by a quarter,
+// across the frame. At most rows * rows * 2 tiles (what a 16:9 frame needs):
+// a wider frame gets larger tiles rather than more of them.
+inline void tileGrid(int W, int H, int rows, std::vector<Tile>& out)
+{
+  out.clear();
+  if(rows <= 1 || W <= 0 || H <= 0)
+    return;
+  constexpr float overlap = 0.25f;
+  const int max_tiles = rows * rows * 2;
+  auto count = [&](int len, int t) {
+    return len <= t ? 1
+                    : 1 + static_cast<int>(std::ceil(float(len - t) / (t * (1.f - overlap))));
+  };
+  int T = std::max(16, static_cast<int>(std::min(W, H) / (rows - (rows - 1) * overlap)));
+  while(count(W, T) * count(H, T) > max_tiles && T < std::max(W, H))
+    T = std::min(std::max(W, H), T + std::max(1, T / 8));
+  const int tw = std::min(T, W), th = std::min(T, H);
+  const int nx = count(W, tw), ny = count(H, th);
+  for(int j = 0; j < ny; ++j)
+    for(int i = 0; i < nx; ++i)
+      out.push_back(
+          {nx == 1 ? 0 : (i * (W - tw)) / (nx - 1), ny == 1 ? 0 : (j * (H - th)) / (ny - 1),
+           tw, th});
+}
+
+// Merges the detections of the tiles into those of the whole frame. A tile
+// detection overlapping a kept one of its class (the whole frame's, or a
+// better tile's) is the same subject: the better scored of the two stays
+// (a subject small in the frame is seen better in a tile). Whole-frame
+// detections are never merged with each other. Containment folds a tile's
+// view of part of a subject cut by the tile edge into the whole one.
+inline std::vector<Detection> mergeTileDetections(
+    std::vector<Detection> frame, std::vector<Detection> tiles, float iou_threshold,
+    float contain_thresh)
+{
+  std::sort(tiles.begin(), tiles.end(), [](const auto& a, const auto& b) {
+    return a.score > b.score;
+  });
+  for(auto& t : tiles)
+  {
+    auto same = std::find_if(frame.begin(), frame.end(), [&](const Detection& k) {
+      return k.class_id == t.class_id
+             && (suppresses(k, t, iou_threshold, contain_thresh)
+                 || suppresses(t, k, iou_threshold, contain_thresh));
+    });
+    if(same == frame.end())
+      frame.push_back(std::move(t));
+    else if(t.score > same->score)
+      *same = std::move(t);
+  }
+  return frame;
+}
+
 // MediaPipe's WEIGHTED non-maximum suppression (NonMaxSuppressionCalculator):
 // each kept detection is the score-weighted mean of every remaining one that
 // overlaps it by more than iou_threshold, box and keypoints alike, with the
@@ -212,7 +293,8 @@ weightedNms(std::vector<Detection> dets, float iou_threshold = 0.3f)
     return uni > 0.f ? inter / uni : 0.f;
   };
   std::vector<Detection> out;
-  std::vector<bool> used(dets.size(), false);
+  thread_local std::vector<char> used; // per-frame scratch
+  used.assign(dets.size(), 0);
   for(size_t i = 0; i < dets.size(); ++i)
   {
     if(used[i])
@@ -269,24 +351,6 @@ nms(std::vector<Detection> dets, float iou_threshold = 0.3f,
     return a.score > b.score;
   });
 
-  // True if keeper a suppresses the lower-scoring box b.
-  auto suppresses = [iou_threshold, contain_thresh](
-                        const Detection& a, const Detection& b) -> bool {
-    const float x1 = std::max(a.xc - a.w * 0.5f, b.xc - b.w * 0.5f);
-    const float y1 = std::max(a.yc - a.h * 0.5f, b.yc - b.h * 0.5f);
-    const float x2 = std::min(a.xc + a.w * 0.5f, b.xc + b.w * 0.5f);
-    const float y2 = std::min(a.yc + a.h * 0.5f, b.yc + b.h * 0.5f);
-    const float inter = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
-    if(inter <= 0.0f)
-      return false;
-    const float aa = a.w * a.h, ab = b.w * b.h;
-    const float uni = aa + ab - inter;
-    if(uni > 0.0f && inter / uni > iou_threshold)
-      return true;
-    const float mn = std::min(aa, ab);
-    return contain_thresh > 0.0f && mn > 0.0f && inter / mn >= contain_thresh;
-  };
-
   std::vector<Detection> out;
   std::vector<bool> dead(dets.size(), false);
   for(size_t i = 0; i < dets.size(); ++i)
@@ -294,7 +358,7 @@ nms(std::vector<Detection> dets, float iou_threshold = 0.3f,
     if(dead[i])
       continue;
     for(size_t j = i + 1; j < dets.size(); ++j)
-      if(!dead[j] && suppresses(dets[i], dets[j]))
+      if(!dead[j] && suppresses(dets[i], dets[j], iou_threshold, contain_thresh))
         dead[j] = true;
     out.push_back(std::move(dets[i]));
   }

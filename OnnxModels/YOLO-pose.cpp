@@ -54,11 +54,20 @@ try
   ctx.infer(spec, tt, out_tt);
 
   static const Yolo::YOLO_pose pose;
-  pose.processOutput(
-      spec,
-      out_tt,
-      reinterpret_cast<std::vector<Yolo::YOLO_pose::pose_type>&>(
-          outputs.detection.value));
+  thread_local std::vector<Yolo::YOLO_pose::pose_type> poses;
+  pose.processOutput(spec, out_tt, poses);
+  auto& out = outputs.detection.value;
+  out.resize(poses.size());
+  for(std::size_t i = 0; i < poses.size(); i++)
+  {
+    const auto& p = poses[i];
+    out[i].name = p.name;
+    out[i].geometry = {p.geometry.x, p.geometry.y, p.geometry.w, p.geometry.h};
+    out[i].probability = p.confidence;
+    out[i].keypoints.resize(p.keypoints.size());
+    for(std::size_t k = 0; k < p.keypoints.size(); k++)
+      out[i].keypoints[k] = {p.keypoints[k].kp, p.keypoints[k].x, p.keypoints[k].y};
+  }
 
   auto img = Onnx::drawRects(
       inputs.image.texture.bytes,

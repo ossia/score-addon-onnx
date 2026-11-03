@@ -742,7 +742,8 @@ private:
   std::vector<Onnx::Detection::Detection> runDetector(
       const Onnx::ModelRole& role, const Onnx::ImageView& src,
       Onnx::ModelDomain target = Onnx::ModelDomain::Body, int keep_class = -2,
-      Onnx::OnnxRunContext* ctx_override = nullptr, float score_thr = -1.f);
+      Onnx::OnnxRunContext* ctx_override = nullptr, float score_thr = -1.f,
+      int tile_budget = 0);
   // One detector pass over `src` (the whole frame or one tile): what
   // runDetector runs once, or on the frame and each tile with Detector Tiles.
   std::vector<Onnx::Detection::Detection> detectRegion(
@@ -761,6 +762,11 @@ private:
       const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
       const Onnx::Affine& M, int track_id = -1, bool crop_padded = false,
       bool hold_on_miss = true);
+  // runLandmark's second half: publishes what landmarkKeypoints left in
+  // m_kp_scratch (and its world / mesh scratch), mean_conf its return value.
+  bool publishLandmark(
+      const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
+      float mean_conf, int track_id = -1, bool hold_on_miss = true);
 
   // Stage 2 core: run the landmark model on one crop and decode keypoints into
   // `out` (image-normalized [0,1]); no smoothing/drawing/output. Returns the
@@ -1055,6 +1061,13 @@ private:
 
   // --- Cached scratch reused every frame (zero steady-state allocation) ---
   std::vector<DetectedPose> m_instances;          // this frame's instances
+  std::vector<int> m_instance_roi; // the ROI of runLandmarkBatch each came from
+  // The multi-hand refinement pass (runMultiInstance): which ROIs want it,
+  // its ROIs, the first-pass instance each refines, the first-pass results.
+  std::vector<bool> m_roi_refine;
+  std::vector<Onnx::ROI::Rect> m_refine_rois;
+  std::vector<int> m_refine_of;
+  std::vector<DetectedPose> m_refine_first;
   std::vector<PoseKeypoint> m_kp_scratch;         // landmark decode -> keypoints
   std::vector<PoseKeypoint> m_world_scratch;      // landmark decode -> world 3D
   std::vector<Onnx::Track::Detection> m_track_in; // tracker input
@@ -1081,7 +1094,7 @@ private:
   // Detector Tiles scanned per detection pass when they are scanned a few at
   // a time (multi-hand Track ROI, see runMultiInstance); 0 = all of them.
   static constexpr int kTilesPerPass = 2;
-  int m_tile_budget{0};
+  std::vector<Onnx::Detection::Tile> m_tiles; // the Detector Tiles grid
   int m_tile_cursor{0}; // the next tile of the rolling scan
 
   // Detector anchor/prior caches: the geometry only depends on the model, so

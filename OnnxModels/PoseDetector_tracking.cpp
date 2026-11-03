@@ -274,25 +274,17 @@ Onnx::ROI::Rect PoseDetector::roiRectFromKeypoints(
   {
     case PoseWorkflow::BlazePose:
     {
-      // The hip/shoulder anchors drive the crop center, size and rotation. If
-      // they are not themselves confident, the rect is built on garbage joint
-      // positions (kp() of a low-confidence joint), which drags the crop toward
-      // the origin and shrinks it — the runaway inward collapse over a few ROI
-      // cycles the user saw. Bail to a re-detect instead of trusting them.
-      if(conf(23) < 0.3f || conf(24) < 0.3f || conf(11) < 0.3f
-         || conf(12) < 0.3f)
-        return r; // invalid -> caller re-detects with the BlazePose detector
-
       // Match the DETECTOR's alignment rect: hip-centered, size = 2 x radius to
       // the farthest body point, rotated so hips->shoulders points "up". Using
       // the keypoint bbox center/size instead re-frames the crop and makes the
-      // landmark model drift (and can collapse to image center).
+      // landmark model drift (and can collapse to image center). Every joint
+      // counts, visible or not: BlazePose places occluded joints too (their
+      // confidence is MediaPipe's visibility), and the pose itself passed its
+      // presence gate.
       const Onnx::Vec2 hip = mid(23, 24), sh = mid(11, 12);
       float R = 0.f;
-      for(int i = 0; i < (int)kps.size(); ++i)
-        if(conf(i) >= 0.2f)
-          R = std::max(
-              R, float(std::hypot(kp(i).x - hip.x, kp(i).y - hip.y)));
+      for(int i = 0; i < std::min<int>(33, kps.size()); ++i)
+        R = std::max(R, float(std::hypot(kp(i).x - hip.x, kp(i).y - hip.y)));
       const float size = 2.0f * R * 1.15f;
       const float target = float(M_PI) / 2.0f;
       r.cx = hip.x;
@@ -323,10 +315,20 @@ Onnx::ROI::Rect PoseDetector::roiRectFromKeypoints(
     }
     default:
     {
-      // A top-down hand model: MediaPipe's hand rule, as for its own model.
+      // A top-down hand model (RTMPose-hand): the box of all its joints,
+      // padded like the hand-detector boxes it was trained on.
       if(kps.size() == 21)
       {
-        r = Onnx::ROI::handRectFromLandmarks(kp);
+        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+        for(int i = 0; i < 21; ++i)
+        {
+          x0 = std::min(x0, kp(i).x);
+          x1 = std::max(x1, kp(i).x);
+          y0 = std::min(y0, kp(i).y);
+          y1 = std::max(y1, kp(i).y);
+        }
+        r = Onnx::ROI::topdownRect(
+            Onnx::Rect{x0, y0, x1 - x0, y1 - y0}, model_w, model_h, 1.25f);
         break;
       }
       // top-down (RTMPose/ViTPose/YOLO): axis-aligned bbox, aspect-fixed.
@@ -384,10 +386,10 @@ void PoseDetector::runMultiInstance(
 
   // Per-track ROI feedback (detector-skip) is only steady for the
   // MediaPipe-rotated landmark kinds; top-down (SimCC/heatmap) re-detects.
-  // A top-down hand model (RTMPose-hand) is steady on MediaPipe's rotated
-  // landmark ROI too: it gets the same crops behind the palm detector.
-  const bool hand_topdown = role.domain == Onnx::ModelDomain::Hand
-                            && role.kind != Onnx::ModelKind::HandLandmark;
+  // A top-down hand model (RTMPose-hand) is steady on the box of its own
+  // landmarks, the crop a hand detector gives it.
+  const bool hands = role.domain == Onnx::ModelDomain::Hand;
+  const bool hand_topdown = hands && role.kind != Onnx::ModelKind::HandLandmark;
   const bool roi_trackable
       = role.kind == Onnx::ModelKind::BlazePoseLandmark
         || role.kind == Onnx::ModelKind::HandLandmark
@@ -399,6 +401,7 @@ void PoseDetector::runMultiInstance(
   // m_roi_scores parallels m_rois (not m_dets: an invalid rect is skipped).
   m_rois.clear();
   m_roi_scores.clear();
+  m_roi_refine.clear();
 
   // MediaPipe's multi-hand loop, for the hand models with Track ROI:
   // every live hand keeps its landmark-derived ROI every frame, and the
@@ -428,10 +431,11 @@ void PoseDetector::runMultiInstance(
         m_kp_scratch.push_back({k.x, k.y, k.z, k.score});
       const Onnx::ROI::Rect r
           = roiRectFromKeypoints(draw, m_kp_scratch, W, H, mw, mh);
-      if(rectValid(r, W, H) && static_cast<int>(m_rois.size()) < max_inst)
+      if(rectValid(r, W, H, hands) && static_cast<int>(m_rois.size()) < max_inst)
       {
         m_rois.push_back(r);
         m_roi_scores.push_back(1.f); // a tracking ROI has no detector score
+        m_roi_refine.push_back(false);
       }
     }
     if(m_rois.empty())
@@ -446,9 +450,9 @@ void PoseDetector::runMultiInstance(
   {
     m_frames_since_detect = 0;
     // Merging: the whole frame and the next tiles of the rolling scan.
-    m_tile_budget = merge ? kTilesPerPass : 0;
-    m_dets = runDetector(m_detector_role, src, role.domain, detectorClass());
-    m_tile_budget = 0;
+    m_dets = runDetector(
+        m_detector_role, src, role.domain, detectorClass(), nullptr, -1.f,
+        merge ? kTilesPerPass : 0);
     // App-side NMS before the tracker: the end2end / PINTO / pre-decoded
     // detector branches assume the graph already deduplicated, but some exports
     // emit overlapping boxes for one subject. Two boxes -> two ROIs -> two
@@ -474,7 +478,7 @@ void PoseDetector::runMultiInstance(
       if(static_cast<int>(m_rois.size()) >= max_inst)
         break;
       const Onnx::ROI::Rect r = detectionRect(role, d, W, H);
-      if(!rectValid(r, W, H))
+      if(!rectValid(r, W, H, hands))
         continue;
       // A hand already tracked: its landmark ROI is the better crop.
       const bool covered = std::any_of(
@@ -484,7 +488,8 @@ void PoseDetector::runMultiInstance(
         continue;
       m_rois.push_back(r);
       m_roi_scores.push_back(std::clamp(d.score, 0.f, 1.f));
-      refine = refine || refinesHandRoi(role, d);
+      m_roi_refine.push_back(refinesHandRoi(role, d));
+      refine = refine || m_roi_refine.back();
     }
   }
 
@@ -497,26 +502,36 @@ void PoseDetector::runMultiInstance(
   runLandmarkBatch(role, draw, src, m_rois); // batched if the model allows
 
   // Whole-hand boxes: a second batch on the rects the first pass's landmarks
-  // give (see refineHandRect), for the hands it found.
+  // give (see refineHandRect), for the hands detected from such a box. Each
+  // replaces its first-pass result, which stays when the second crop misses.
   if(refine && !m_instances.empty())
   {
-    m_rois.clear();
+    m_refine_rois.clear();
+    m_refine_of.clear();
     m_roi_scores.clear();
-    for(const auto& p : m_instances)
+    for(size_t i = 0; i < m_instances.size(); ++i)
     {
-      if(p.keypoints.size() != 21)
+      const auto& p = m_instances[i];
+      if(!m_roi_refine[m_instance_roi[i]] || p.keypoints.size() != 21)
         continue;
-      const auto r = Onnx::ROI::handRectFromLandmarks([&](int i) {
-        return Onnx::Vec2{p.keypoints[i].x * W, p.keypoints[i].y * H};
+      const auto r = Onnx::ROI::handRectFromLandmarks([&](int k) {
+        return Onnx::Vec2{p.keypoints[k].x * W, p.keypoints[k].y * H};
       });
-      if(rectValid(r, W, H))
+      if(rectValid(r, W, H, hands))
       {
-        m_rois.push_back(r);
+        m_refine_rois.push_back(r);
+        m_refine_of.push_back(static_cast<int>(i));
         m_roi_scores.push_back(std::clamp(p.mean_confidence, 0.f, 1.f));
       }
     }
-    if(!m_rois.empty())
-      runLandmarkBatch(role, draw, src, m_rois);
+    if(!m_refine_rois.empty())
+    {
+      std::swap(m_instances, m_refine_first);
+      runLandmarkBatch(role, draw, src, m_refine_rois);
+      for(size_t k = 0; k < m_instances.size(); ++k)
+        m_refine_first[m_refine_of[m_instance_roi[k]]] = std::move(m_instances[k]);
+      std::swap(m_instances, m_refine_first);
+    }
   }
 
   if(gatesOnMeanConfidence(role))
@@ -532,6 +547,10 @@ void PoseDetector::runMultiInstance(
   // confident one, as MediaPipe does on its landmark-derived rects.
   if(role.domain == Onnx::ModelDomain::Hand && m_instances.size() > 1)
     dedupeInstances(0.5f);
+
+  // A tracked subject lost on a frame without detection: detect on the next.
+  if(!detect && m_instances.size() < static_cast<size_t>(n_tracked))
+    m_frames_since_detect = detect_cadence;
 
   if(m_instances.empty())
   {

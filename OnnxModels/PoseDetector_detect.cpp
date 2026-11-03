@@ -96,17 +96,20 @@ Onnx::ROI::Rect PoseDetector::refineHandRect(
   const auto r = Onnx::ROI::handRectFromLandmarks([&](int i) {
     return Onnx::Vec2{m_kp_scratch[i].x * W, m_kp_scratch[i].y * H};
   });
-  return rectValid(r, src.w, src.h) ? r : rect;
+  return rectValid(r, src.w, src.h, /*small_subjects=*/true) ? r : rect;
 }
 
-std::vector<Onnx::Detection::Detection>
-PoseDetector::runDetector(
+std::vector<Onnx::Detection::Detection> PoseDetector::runDetector(
     const Onnx::ModelRole& role, const Onnx::ImageView& src, Onnx::ModelDomain target,
-    int keep_class, Onnx::OnnxRunContext* ctx_override, float score_thr)
+    int keep_class, Onnx::OnnxRunContext* ctx_override, float score_thr, int tile_budget)
 {
   auto dets = detectRegion(role, src, target, keep_class, ctx_override, score_thr);
   const int rows = std::clamp(static_cast<int>(inputs.detector_tiles.value), 1, 4);
-  if(rows <= 1)
+  // A YOLOX grid whose input range is still undecided probes it with up to
+  // three inferences per pass: only on the whole frame, never per tile.
+  if(rows <= 1
+     || (role.kind == Onnx::ModelKind::YoloxDetector
+         && m_yolox_range == YoloxRange::Unknown))
     return dets;
 
   // Detector Tiles: the whole frame finds the large subjects, then overlapping
@@ -114,52 +117,43 @@ PoseDetector::runDetector(
   // a dozen pixels at a 128-192 px detector input once the whole frame is
   // shrunk into it, below what the detectors were trained on; in a tile it is
   // `rows` to 3x larger. Tiles overlap by a quarter so a subject cut by one tile
-  // edge is whole in its neighbour; the duplicates merge in the NMS below.
+  // edge is whole in its neighbour; the duplicates merge below.
+  Onnx::Detection::tileGrid(src.w, src.h, rows, m_tiles);
+  const int nt = static_cast<int>(m_tiles.size());
   const int W = src.w, H = src.h;
-  constexpr float overlap = 0.25f;
-  const int T = std::max(
-      16, static_cast<int>(std::min(W, H) / (rows - (rows - 1) * overlap)));
-  auto count = [&](int len) {
-    return len <= T ? 1
-                    : 1 + static_cast<int>(std::ceil(
-                              float(len - T) / (T * (1.f - overlap))));
-  };
-  const int nx = count(W), ny = count(H);
-  const int nt = nx * ny;
   const int rb = src.rowBytes();
-  // All tiles, or the next m_tile_budget of a rolling scan.
-  const int n_run = m_tile_budget > 0 ? std::min(m_tile_budget, nt) : nt;
-  const int first = m_tile_budget > 0 ? m_tile_cursor % nt : 0;
+  // All tiles, or the next tile_budget of a rolling scan.
+  const int n_run = tile_budget > 0 ? std::min(tile_budget, nt) : nt;
+  const int first = tile_budget > 0 ? m_tile_cursor % nt : 0;
   m_tile_cursor = (first + n_run) % nt;
+  std::vector<Onnx::Detection::Detection> tiled;
   for(int k = 0; k < n_run; ++k)
   {
-    const int t = (first + k) % nt;
-    const int i = t % nx, j = t / nx;
-    const int x = nx == 1 ? 0 : (i * (W - std::min(T, W))) / (nx - 1);
-    const int y = ny == 1 ? 0 : (j * (H - std::min(T, H))) / (ny - 1);
-    const int tw = std::min(T, W), th = std::min(T, H);
+    const auto& t = m_tiles[(first + k) % nt];
     const Onnx::ImageView tile{
-        src.data + static_cast<size_t>(y) * rb + static_cast<size_t>(x) * src.channels,
-        tw, th, src.channels, rb};
+        src.data + static_cast<size_t>(t.y) * rb + static_cast<size_t>(t.x) * src.channels,
+        t.w, t.h, src.channels, rb};
     auto td = detectRegion(role, tile, target, keep_class, ctx_override, score_thr);
     // Tile-normalized -> frame-normalized.
-    const float sx = float(tw) / W, sy = float(th) / H;
-    const float ox = float(x) / W, oy = float(y) / H;
+    const float sx = float(t.w) / W, sy = float(t.h) / H;
+    const float ox = float(t.x) / W, oy = float(t.y) / H;
     for(auto& d : td)
     {
       d.xc = ox + d.xc * sx;
       d.yc = oy + d.yc * sy;
       d.w *= sx;
       d.h *= sy;
-      for(auto& k : d.keypoints)
-        k = {ox + k.x * sx, oy + k.y * sy};
-      dets.push_back(std::move(d));
+      for(auto& kp : d.keypoints)
+        kp = {ox + kp.x * sx, oy + kp.y * sy};
+      tiled.push_back(std::move(d));
     }
   }
   // IoU is invariant to the per-axis scaling of normalized coordinates, so the
-  // merge can run on them directly. Intersection-over-minimum also folds a
-  // tile's detection of part of a subject into the whole-frame one.
-  return Onnx::Detection::nms(std::move(dets), 0.3f, 0.6f);
+  // merge runs on them directly. People overlap in crowds: a looser overlap,
+  // and only a tile's view of a body cut by its edge is folded in.
+  const bool body = target == Onnx::ModelDomain::Body;
+  return Onnx::Detection::mergeTileDetections(
+      std::move(dets), std::move(tiled), body ? 0.45f : 0.3f, body ? 0.8f : 0.6f);
 }
 
 std::vector<Onnx::Detection::Detection>

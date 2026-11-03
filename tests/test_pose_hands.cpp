@@ -349,10 +349,13 @@ TEST_CASE("Detector Tiles find small hands anywhere in the frame", "[onnx][pose]
         h.run(s.frame); // a track is emitted once confirmed
         CHECK(handsFound(s, h.poses()) <= 1);
       }
+      // With Track ROI, each detection pass scans 2 of the 18 tiles: a full
+      // scan takes 9 passes, detecting every frame while nothing is tracked.
       c.tiles = 3;
       Harness h{c};
-      h.run(s.frame);
-      h.run(s.frame);
+      h.node.inputs.detector_cadence.value = 1;
+      for(int f = 0; f < 11; f++)
+        h.run(s.frame);
       const auto poses = h.poses();
       CHECK(handsFound(s, poses) >= min_small);
       // No hand made up in the background.
@@ -374,7 +377,8 @@ TEST_CASE("Multi-hand tracking: the rolling tile scan finds and keeps every hand
       h.node.inputs.track_roi.value = true;
       h.node.inputs.detector_cadence.value = 1;
       h.node.inputs.smoothing.value = true;
-      h.node.inputs.hold_frames.value = 6;
+      // No hold: every hand counted below was found on its own frame.
+      h.node.inputs.hold_frames.value = 0;
       h.node.inputs.track_memory.value = 30;
 
       // Four small hands drifting across the frame.
@@ -417,7 +421,8 @@ TEST_CASE("Multi-hand tracking: the rolling tile scan finds and keeps every hand
       for(const auto& f : ids)
         CHECK(f == ids.front());
 
-      // The cost: all tiles every frame instead.
+      // The cost: without Track ROI, the detector scans the whole frame and
+      // every tile on every frame.
       Config all = c;
       all.tiles = 3;
       Harness a{all};
@@ -434,6 +439,44 @@ TEST_CASE("Multi-hand tracking: the rolling tile scan finds and keeps every hand
       std::printf(
           "%s: rolling scan %.1f ms/frame, every tile every frame %.1f ms/frame\n",
           c.det.c_str(), ms / 30, ms_all / 10);
+      // 1 + 2 detector passes against 1 + 18: far cheaper, even counting the
+      // landmark crops it runs on top.
+      CHECK(ms / 30 < ms_all / 10);
+    }
+  }
+}
+
+// A whole-hand detector (RTMDet) with Track ROI: the MediaPipe hand model
+// refines each new hand's upright crop with a second pass, and keeps a hand
+// whose second crop misses; RTMPose-hand tracks from its own landmarks. Both
+// keep both hands, frame after frame.
+TEST_CASE("Multi-hand tracking from whole-hand boxes keeps every hand", "[onnx][pose][hand][model]")
+{
+  for(Config c : {rtmdet_full, rtmdet_rtmpose})
+  {
+    DYNAMIC_SECTION(c.lm)
+    {
+      if(!haveHands() || !TestPaths::haveAll({c.det, c.lm}))
+        SKIP("models or images not found");
+      c.min_conf = 0.4f;
+      Harness h{c};
+      h.node.inputs.track_roi.value = true;
+      h.node.inputs.detector_cadence.value = 3;
+      h.node.inputs.track_memory.value = 30;
+      for(int f = 0; f < 16; f++)
+      {
+        const double d = 0.004 * f;
+        // Two hands RTMDet finds on the whole frame (it misses smaller ones).
+        const auto s = makeScene(
+            {{"thumb_up.jpg", tile(0.08 + d, 0.25 + d, 0.5)},
+             {"victory.jpg", tile(0.55 - d, 0.25, 0.5)}});
+        h.run(s.frame);
+        if(f >= 2)
+        {
+          INFO("frame " << f);
+          CHECK(handsFound(s, h.poses()) == 2);
+        }
+      }
     }
   }
 }

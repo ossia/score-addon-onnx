@@ -1,5 +1,7 @@
 #include "PoseDetector_internal.hpp"
 
+#include <Onnx/helpers/Heatmap.hpp>
+
 namespace OnnxModels
 {
 
@@ -10,31 +12,6 @@ struct LandmarkKp
 {
   float x, y, z, conf;
 };
-
-// The Gaussian mmpose blurs a heatmap with before DARK refinement:
-// cv2.GaussianBlur's kernel for size 11, sigma 0 (= 2), normalized.
-constexpr int kDarkRadius = 5;
-constexpr std::array<float, 11> kDarkKernel = [] {
-  std::array<float, 11> k{};
-  float sum = 0.f;
-  for(int i = 0; i < 11; ++i)
-  {
-    const float d = float(i - kDarkRadius);
-    // constexpr exp: a few Taylor terms of exp(-d^2/8) are enough for d <= 5
-    const float x = -d * d / 8.f;
-    float term = 1.f, e = 1.f;
-    for(int n = 1; n < 40; ++n)
-    {
-      term *= x / n;
-      e += term;
-    }
-    k[i] = e;
-    sum += e;
-  }
-  for(auto& v : k)
-    v /= sum;
-  return k;
-}();
 
 // Upper bound on the landmark outputs fetched per inference (the Ort::Value
 // arrays below are fixed-size, no per-frame allocation). InstantHMR has 5
@@ -208,7 +185,8 @@ void decodeLandmark(
           if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
             continue;
           const auto sh = info.GetShape();
-          if(sh.size() == 4 && sh[3] == K && sh[1] > 0 && sh[2] > 0)
+          if(sh.size() == 4 && sh[3] == K && sh[1] > 0 && sh[2] > 0
+             && info.GetElementCount() >= sh[1] * sh[2] * K)
           {
             hm = outspan[i].GetTensorData<float>();
             hm_h = static_cast<int>(sh[1]);
@@ -228,31 +206,14 @@ void decodeLandmark(
           // MediaPipe's landmark visibility: in the frame and not occluded.
           const float vis = 1.0f / (1.0f + std::exp(-kp[3]));
           float x = kp[0], y = kp[1];
-          // MediaPipe's RefineLandmarksFromHeatmap (kernel 7, min confidence
-          // 0.5): the confidence-weighted centre of the heatmap around the
-          // regressed point, which is sharper than the regression.
+          // MediaPipe's RefineLandmarksFromHeatmap: sharper than the regression.
           if(hm)
           {
-            const int cc = static_cast<int>(x / mw * hm_w);
-            const int cr = static_cast<int>(y / mh * hm_h);
-            if(cc >= 0 && cc < hm_w && cr >= 0 && cr < hm_h)
+            float u = x / mw, v = y / mh;
+            if(Onnx::Heatmap::refineFromHeatmap(hm, hm_h, hm_w, K, i, u, v))
             {
-              float sum = 0.f, wc = 0.f, wr = 0.f, mx = 0.f;
-              for(int r = std::max(0, cr - 3); r < std::min(hm_h, cr + 4); ++r)
-                for(int c = std::max(0, cc - 3); c < std::min(hm_w, cc + 4); ++c)
-                {
-                  const float v = hm[(static_cast<size_t>(r) * hm_w + c) * K + i];
-                  const float conf = 1.0f / (1.0f + std::exp(-v));
-                  sum += conf;
-                  mx = std::max(mx, conf);
-                  wc += c * conf;
-                  wr += r * conf;
-                }
-              if(mx >= 0.5f && sum > 0.f)
-              {
-                x = wc / sum / hm_w * mw;
-                y = wr / sum / hm_h * mh;
-              }
+              x = u * mw;
+              y = v * mh;
             }
           }
           kps.push_back({x, y, kp[2] / mw, vis});
@@ -384,52 +345,8 @@ void decodeLandmark(
             const int hx = max_idx % hw;
             const int hy = max_idx / hw;
 
-            // DARK sub-pixel refinement as mmpose does it: one Newton step on
-            // the log of the Gaussian-blurred heatmap (kernel 11, sigma 2,
-            // scaled back to the raw peak, clipped to [0.001, 50]). Only the
-            // 3x3 neighbourhood of the peak is needed, so only it is blurred.
-            float ox = 0.f, oy = 0.f;
-            if(hx >= 1 && hx < hw - 1 && hy >= 1 && hy < hh - 1)
-            {
-              auto blurred = [&](int x, int y) {
-                float acc = 0.f;
-                for(int j = -kDarkRadius; j <= kDarkRadius; ++j)
-                {
-                  // cv2's default border: reflect without the edge pixel.
-                  int yy = y + j;
-                  yy = yy < 0 ? -yy : yy >= hh ? 2 * hh - 2 - yy : yy;
-                  float row = 0.f;
-                  for(int i = -kDarkRadius; i <= kDarkRadius; ++i)
-                  {
-                    int xx = x + i;
-                    xx = xx < 0 ? -xx : xx >= hw ? 2 * hw - 2 - xx : xx;
-                    row += kDarkKernel[i + kDarkRadius] * hm[yy * hw + xx];
-                  }
-                  acc += kDarkKernel[j + kDarkRadius] * row;
-                }
-                return acc;
-              };
-              float L[3][3];
-              const float peak = blurred(hx, hy);
-              const float norm = peak > 1e-12f ? max_val / peak : 1.f;
-              for(int j = 0; j < 3; ++j)
-                for(int i = 0; i < 3; ++i)
-                  L[j][i] = std::log(std::clamp(
-                      i == 1 && j == 1 ? peak * norm
-                                       : blurred(hx + i - 1, hy + j - 1) * norm,
-                      0.001f, 50.f));
-              const float dx = 0.5f * (L[1][2] - L[1][0]);
-              const float dy = 0.5f * (L[2][1] - L[0][1]);
-              const float dxx = L[1][2] - 2.f * L[1][1] + L[1][0];
-              const float dyy = L[2][1] - 2.f * L[1][1] + L[0][1];
-              const float dxy = 0.25f * (L[2][2] - L[0][2] - L[2][0] + L[0][0]);
-              const float det = dxx * dyy - dxy * dxy;
-              if(std::fabs(det) > 1e-9f)
-              {
-                ox = std::clamp(-(dyy * dx - dxy * dy) / det, -1.f, 1.f);
-                oy = std::clamp(-(dxx * dy - dxy * dx) / det, -1.f, 1.f);
-              }
-            }
+            // mmpose's DARK sub-pixel refinement.
+            const auto [ox, oy] = Onnx::Heatmap::darkOffset(hm, hw, hh, hx, hy, max_val);
             // mmpose's heatmap models (ViTPose) are trained with UDP: heatmap
             // cell 0 is the crop's first pixel and cell w-1 its last.
             // face-alignment's 2D-FAN puts the cells at pixel centres.
@@ -799,6 +716,7 @@ void PoseDetector::runLandmarkBatch(
 {
   (void)draw;
   m_instances.clear();
+  m_instance_roi.clear();
   if(rois.empty())
     return;
   auto& lctx = *this->ctx;
@@ -853,7 +771,7 @@ void PoseDetector::runLandmarkBatch(
   auto pushFromKps = [&](const std::vector<LandmarkKp>& kps,
                          const std::vector<LandmarkKp>& wkps,
                          const Onnx::Affine& M, float det_score,
-                         float instance_score) {
+                         float instance_score, int roi) {
     if(kps.empty())
       return;
     DetectedPose pose;
@@ -880,11 +798,13 @@ void PoseDetector::runLandmarkBatch(
                            : instance_score >= 0.f ? instance_score
                                                    : sum / pose.keypoints.size();
     m_instances.push_back(std::move(pose));
+    m_instance_roi.push_back(roi);
   };
 
   // Fallback: one inference per ROI (fixed batch dim, or single instance).
   auto perCrop = [&] {
     m_instances.clear();
+    m_instance_roi.clear();
     for(size_t i = 0; i < rois.size(); ++i)
     {
       const Onnx::Affine M = Onnx::ROI::rectToAffine(rois[i], mw, mh);
@@ -901,6 +821,7 @@ void PoseDetector::runLandmarkBatch(
       pose.rig_offset = m_offset_scratch;
       pose.mean_confidence = mc;
       m_instances.push_back(std::move(pose));
+      m_instance_roi.push_back(static_cast<int>(i));
     }
   };
   if(!can_batch)
@@ -1113,7 +1034,7 @@ void PoseDetector::runLandmarkBatch(
         &instance_score);
     pushFromKps(
         kps, wkps, Onnx::ROI::rectToAffine(rois[b], mw, mh), roiScore(b),
-        instance_score);
+        instance_score, static_cast<int>(b));
   }
 }
 
@@ -1124,6 +1045,13 @@ bool PoseDetector::runLandmark(
   const float mean_conf = landmarkKeypoints(
       role, src, M, m_kp_scratch, &m_world_scratch, crop_padded,
       m_landmark_score);
+  return publishLandmark(role, draw, src, mean_conf, track_id, hold_on_miss);
+}
+
+bool PoseDetector::publishLandmark(
+    const Onnx::ModelRole& role, PoseWorkflow draw, const Onnx::ImageView& src,
+    float mean_conf, int track_id, bool hold_on_miss)
+{
   if(!finitef(mean_conf) || mean_conf < 0.f || m_kp_scratch.empty()
      || (gatesOnMeanConfidence(role)
          && mean_conf < static_cast<float>(inputs.min_confidence)))
@@ -1173,12 +1101,14 @@ void PoseDetector::runMoveNet(
   {
     // Locate the person in the whole frame first.
     const Onnx::Affine M = Onnx::ROI::wholeFrameFitAffine(W, H, mw, mh);
-    const float mc = landmarkKeypoints(role, src, M, m_kp_scratch, nullptr, false);
+    const float mc
+        = landmarkKeypoints(role, src, M, m_kp_scratch, &m_world_scratch, false);
     crop = mc >= 0.f && cropFrom(m_kp_scratch, r);
     if(!crop)
     {
+      // No torso to crop around: this whole-frame pass is the answer.
       m_tracking = false;
-      runLandmark(role, draw, src, M);
+      publishLandmark(role, draw, src, mc);
       return;
     }
   }

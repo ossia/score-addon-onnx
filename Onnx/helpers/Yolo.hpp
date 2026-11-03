@@ -337,18 +337,25 @@ struct YOLO_pose
   // through a class-agnostic NMS at iou_threshold (Ultralytics' 0.7); yolo26
   // is already deduplicated. Returns the keypoint count K of the model (0
   // when the output is not a pose head).
+  // `out` is resized, not cleared: the keypoint buffers of the poses it
+  // already holds are reused frame to frame.
   static int decode(
       std::span<Ort::Value> outputTensor, std::vector<Decoded>& out,
       float min_confidence, int max_detect = 100, float iou_threshold = 0.7f)
   {
-    out.clear();
     if (outputTensor.empty())
+    {
+      out.clear();
       return 0;
+    }
     const auto info = outputTensor.front().GetTensorTypeAndShapeInfo();
     const Layout l = layoutOf(info.GetShape());
     if (l.keypoints <= 0
         || (int64_t)l.count * l.features != (int64_t)info.GetElementCount())
+    {
+      out.clear();
       return 0;
+    }
 
     const float* data = outputTensor.front().GetTensorData<float>();
     auto at = [&](int det, int f) {
@@ -367,10 +374,11 @@ struct YOLO_pose
     });
 
     // 2. Greedy NMS over them, then one pose per survivor.
+    std::size_t n = 0;
     const int kp0 = l.corners ? 6 : 5;
     for (int j : idx)
     {
-      if (std::ssize(out) >= max_detect)
+      if (static_cast<int>(n) >= max_detect)
         break;
       pose_type::rect rect;
       if (l.corners)
@@ -378,16 +386,21 @@ struct YOLO_pose
       else
       {
         rect = {at(j, 0) - at(j, 2) / 2, at(j, 1) - at(j, 3) / 2, at(j, 2), at(j, 3)};
-        if (std::any_of(out.begin(), out.end(), [&](const Decoded& d) {
+        if (std::any_of(out.begin(), out.begin() + n, [&](const Decoded& d) {
               return iou(d.box, rect) > iou_threshold;
             }))
           continue;
       }
-      auto& d = out.emplace_back(Decoded{.box = rect, .confidence = at(j, 4)});
+      if (n == out.size())
+        out.emplace_back();
+      auto& d = out[n++];
+      d.box = rect;
+      d.confidence = at(j, 4);
       d.keypoints.resize(l.keypoints * 3);
       for (int i = 0; i < l.keypoints * 3; i++)
         d.keypoints[i] = at(j, kp0 + i);
     }
+    out.resize(n);
     return l.keypoints;
   }
 
