@@ -9,7 +9,8 @@
 //   ONNX_TEST_POSE_BENCH_SKELETON  a Skeleton index to output instead
 //   ONNX_TEST_POSE_BENCH_SET     overrides, "<port>=<number>;...", e.g. "4=0.1;12=16"
 //   ONNX_TEST_POSE_BENCH_REPEAT  frames per image (default 1): the output of
-//                                the last, so tracked ROIs come into play
+//                                the last, so tracked ROIs come into play;
+//                                every frame is timed ("frame_ms")
 // Each image is an independent frame: the node forgets it before the next.
 #include <tests/TestPaths.hpp>
 #include <tests/TestWorker.hpp>
@@ -104,7 +105,8 @@ void applyPreset(
         in.skeleton_type.value = static_cast<decltype(in.skeleton_type.value)>(i);
         break;
       case 35:
-        in.detector_tiles.value = i;
+        if constexpr(requires { in.detector_tiles; })
+          in.detector_tiles.value = i;
         break;
       default:
         break;
@@ -194,6 +196,7 @@ TEST_CASE("Pose Detector preset replay over an image set", "[.bench][pose]")
   std::string line;
   double ms = 0;
   int frames = 0;
+  QJsonArray frame_ms;
   while(std::getline(in, line))
   {
     std::istringstream ls{line};
@@ -207,12 +210,17 @@ TEST_CASE("Pose Detector preset replay over an image set", "[.bench][pose]")
       continue;
     for(int k = 0; k < 2; k++)
       feed(node, blank);
-    for(int k = 1; k < repeat; k++)
+    for(int k = 0; k < repeat; k++)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
       feed(node, img);
-    const auto t0 = std::chrono::steady_clock::now();
-    feed(node, img);
-    ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-              .count();
+      const double t
+          = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
+      frame_ms.append(t);
+      if(k == repeat - 1)
+        ms += t;
+    }
     frames++;
 
     std::vector<OnnxModels::DetectedPose> poses = node.outputs.poses.value;
@@ -238,6 +246,7 @@ TEST_CASE("Pose Detector preset replay over an image set", "[.bench][pose]")
   QJsonObject doc;
   doc["results"] = results;
   doc["ms_per_frame"] = frames ? ms / frames : 0.;
+  doc["frame_ms"] = frame_ms;
   QFile out{QString::fromStdString(out_path)};
   REQUIRE(out.open(QIODevice::WriteOnly));
   out.write(QJsonDocument(doc).toJson(QJsonDocument::Compact));
