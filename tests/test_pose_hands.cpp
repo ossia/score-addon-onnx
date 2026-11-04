@@ -298,6 +298,8 @@ TEST_CASE("The legacy 128 palm detector gets [-1,1] input", "[onnx][pose][hand][
   Config c = palm128_legacy;
   Harness h{c};
   h.node.inputs.workflow.value = OnnxModels::PoseWorkflow::BoxDetection;
+  // A new scene every frame: the raw detections, not tracks to confirm.
+  h.node.inputs.track_ids.value = false;
   int found = 0;
   for(const char* f : {"thumb_up.jpg", "victory.jpg", "pointing_up.jpg", "fist.jpg"})
   {

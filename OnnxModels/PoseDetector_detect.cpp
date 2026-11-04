@@ -304,6 +304,51 @@ PoseDetector::detectRegion(
     return dets;
   }
 
+  // --- PINTO DEIMv2 (label_xyxy_score): RGB, stretched to the input as its
+  // demo does (no letterbox), so its normalized boxes are the frame's. ---
+  if(role.kind == Onnx::ModelKind::DetrDetector)
+  {
+    const int mw = role.input_w > 0 ? role.input_w : 640;
+    const int mh = role.input_h > 0 ? role.input_h : 640;
+    // The DINOv3 backbones (S..X) take ImageNet mean/std; the HGNetv2 ones
+    // (Atto..N) raw [0,1]. The graph does not say which: the package's
+    // exports carry a "normalize" metadata entry, other files are told
+    // apart by name as PINTO's demo does.
+    const auto norm = dctx.metadataValue("normalize");
+    const bool imagenet
+        = norm.empty() ? !icontains(inputs.det_model.file.filename, "hgnetv2")
+                       : norm == "imagenet";
+    const NormSpec ns
+        = imagenet ? normMeanStd(
+                         Onnx::TensorLayout::NchwRgb, {123.675f, 116.28f, 103.53f},
+                         {58.395f, 57.12f, 57.375f})
+                   : normMeanStd(Onnx::TensorLayout::NchwRgb, {0, 0, 0}, {255, 255, 255});
+    const Onnx::Affine M{float(src.w) / mw, 0.f, 0.f, 0.f, float(src.h) / mh, 0.f};
+    Ort::Value input_value{nullptr};
+    {
+      auto t = fusedAffineTensor(spec.inputs[0], src, M, mw, mh, ns, det_storage);
+      input_value = std::move(t.value);
+      std::swap(det_storage, t.storage);
+    }
+    Ort::Value ins[1] = {std::move(input_value)};
+    Ort::Value outs[1]{Ort::Value{nullptr}};
+    dctx.infer(spec, ins, std::span<Ort::Value>(outs, 1));
+
+    // -2 (domain default): Wholebody34/40/49 label body 0, face 16, hand 32
+    // (and hand_left 33 / hand_right 34, the same boxes split by side).
+    int keep = keep_class;
+    if(keep_class == -2)
+    {
+      keep = 0;
+      if(target == Onnx::ModelDomain::Hand)
+        keep = 32;
+      else if(target == Onnx::ModelDomain::Face)
+        keep = 16;
+    }
+    return Onnx::Detection::decodeLabelXyxyScore(
+        std::span<Ort::Value>(outs, 1), keep, useThr(0.3f));
+  }
+
   // --- Raw YOLOX COCO grid: BGR no-norm, top-left letterbox, class filter.
   // person=0 for body; COCO animals 14..23 for animal pose. ---
   if(role.kind == Onnx::ModelKind::YoloxDetector)

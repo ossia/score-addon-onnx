@@ -62,6 +62,10 @@ enum class ModelKind : uint8_t
   // by the raw value, so existing values must not shift.
   InstantHmr, // NCHW 224 + cliff_cond [N,3] -> joints_2d [N,K,2], joints_3d
               // [N,K,3], cam_trans, mhr_params, shape_params (MHR70, K=70)
+
+  // Stage-1, appended for the same reason.
+  DetrDetector, // PINTO DEIMv2: label_xyxy_score [1,N,6], label, normalized
+                // x1,y1,x2,y2, score (Wholebody34/40/49)
 };
 
 struct ModelRole
@@ -467,6 +471,14 @@ inline ModelRole classify(const ModelIO& spec)
         ModelKind::MultiClassDetector, ModelStage::Detector,
         ModelDomain::Body, 0);
 
+  // --- A1c) PINTO DEIMv2 detector: label_xyxy_score [1,N,6] -----------------
+  // Matched by name: YOLO26 object detectors are [1,N,6] too, ordered
+  // x1,y1,x2,y2,score,class.
+  if(num_outputs == 1 && outs[0].rank == 3 && outs[0].last == 6
+     && detail::nameContains(outs[0].port->name, "label_xyxy_score"))
+    return setKind(
+        ModelKind::DetrDetector, ModelStage::Detector, ModelDomain::Body, 0);
+
   // --- A2) End2end person/object detector: dets [1,N,5] + labels [1,N] ------
   {
     bool has_dets = false, has_labels = false;
@@ -614,10 +626,11 @@ inline ModelRole classify(const ModelIO& spec)
         nk = (d - 5) / 3;
       else if(d >= 8 && (d - 6) % 3 == 0)
         nk = (d - 6) / 3;
+      // 21 keypoints: a hand pose head (Ultralytics hand-keypoints).
       if(nk >= 5 && nk <= 60)
         return setKind(
-            ModelKind::YoloPose, ModelStage::SingleStage, ModelDomain::Body,
-            nk);
+            ModelKind::YoloPose, ModelStage::SingleStage,
+            nk == 21 ? ModelDomain::Hand : ModelDomain::Body, nk);
     }
     // Not a pose head: a big-grid [1,A,5+C] is a raw YOLOX object detector
     // (e.g. COCO 85 = 4+1+80). Used as a person/animal detector.
