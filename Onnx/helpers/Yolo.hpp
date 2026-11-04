@@ -298,7 +298,10 @@ struct YOLO_pose
   //  - v8 / v11: channel-major [1, 5+3K, A] (cx,cy,w,h, conf, kpts) over A
   //    anchors (8400 at 640, 2100 at 320), or its transpose [1, A, 5+3K];
   //  - yolo26: row-major [1, N, 6+3K] (x1,y1,x2,y2, conf, class, kpts), N
-  //    detections already deduplicated.
+  //    detections already deduplicated;
+  //  - a v8 / v11 head with C classes (WiLoR's left / right hands):
+  //    channel-major [1, 4+C+3K, A], a score per class. The shape alone can't
+  //    tell C from K: it takes K from the model's kpt_shape metadata.
   // 5+3K and 6+3K differ modulo 3, so a feature count is one or the other.
   struct Layout
   {
@@ -307,14 +310,18 @@ struct YOLO_pose
     int keypoints = 0;
     bool row_major = false;
     bool corners = false; // yolo26: x1,y1,x2,y2 and a class column
+    int classes = 1;      // score channels of a v8 / v11 head
   };
-  static Layout layoutOf(const std::vector<int64_t>& shape) noexcept
+  // kpt_hint: the keypoint count from the model's metadata, 0 if unknown.
+  static Layout layoutOf(const std::vector<int64_t>& shape, int kpt_hint = 0) noexcept
   {
     Layout l;
     if (shape.size() != 3 || shape[1] <= 0 || shape[2] <= 0)
       return l;
     const int a = (int)shape[1], b = (int)shape[2];
-    if (a < b && a > 5 && (a - 5) % 3 == 0)
+    if (a < b && kpt_hint > 0 && a - 4 - 3 * kpt_hint > 1)
+      l = {b, a, kpt_hint, false, false, a - 4 - 3 * kpt_hint};
+    else if (a < b && a > 5 && (a - 5) % 3 == 0)
       l = {b, a, (a - 5) / 3, false, false};
     else if (b > 6 && (b - 6) % 3 == 0)
       l = {a, b, (b - 6) / 3, true, true};
@@ -341,7 +348,8 @@ struct YOLO_pose
   // already holds are reused frame to frame.
   static int decode(
       std::span<Ort::Value> outputTensor, std::vector<Decoded>& out,
-      float min_confidence, int max_detect = 100, float iou_threshold = 0.7f)
+      float min_confidence, int max_detect = 100, float iou_threshold = 0.7f,
+      int kpt_hint = 0)
   {
     if (outputTensor.empty())
     {
@@ -349,7 +357,7 @@ struct YOLO_pose
       return 0;
     }
     const auto info = outputTensor.front().GetTensorTypeAndShapeInfo();
-    const Layout l = layoutOf(info.GetShape());
+    const Layout l = layoutOf(info.GetShape(), kpt_hint);
     if (l.keypoints <= 0
         || (int64_t)l.count * l.features != (int64_t)info.GetElementCount())
     {
@@ -362,20 +370,27 @@ struct YOLO_pose
       return l.row_major ? data[(std::size_t)det * l.features + f]
                          : data[(std::size_t)f * l.count + det];
     };
+    // A multi-class head scores an anchor with its best class.
+    auto score = [&](int det) {
+      float s = at(det, 4);
+      for (int c = 1; c < l.classes; c++)
+        s = std::max(s, at(det, 4 + c));
+      return s;
+    };
 
     // 1. The candidates above the threshold, best first.
     thread_local boost::container::vector<int> idx;
     idx.clear();
     for (int i = 0; i < l.count; i++)
-      if (at(i, 4) > min_confidence)
+      if (score(i) > min_confidence)
         idx.push_back(i);
     std::stable_sort(idx.begin(), idx.end(), [&](int i1, int i2) {
-      return at(i1, 4) > at(i2, 4);
+      return score(i1) > score(i2);
     });
 
     // 2. Greedy NMS over them, then one pose per survivor.
     std::size_t n = 0;
-    const int kp0 = l.corners ? 6 : 5;
+    const int kp0 = l.corners ? 6 : 4 + l.classes;
     for (int j : idx)
     {
       if (static_cast<int>(n) >= max_detect)
@@ -395,7 +410,7 @@ struct YOLO_pose
         out.emplace_back();
       auto& d = out[n++];
       d.box = rect;
-      d.confidence = at(j, 4);
+      d.confidence = score(j);
       d.keypoints.resize(l.keypoints * 3);
       for (int i = 0; i < l.keypoints * 3; i++)
         d.keypoints[i] = at(j, kp0 + i);

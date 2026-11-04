@@ -568,6 +568,15 @@ public:
           "far in the background, and collapsed keypoints. 0 = off.");
     } min_size;
 
+    // Appended last to keep existing presets' port indices stable (id 37).
+    struct : halp::hslider_f32<"Line Width", halp::range{0.25, 8., 1.}>
+    {
+      halp_meta(
+          description,
+          "Thickness of the preview's skeleton lines, boxes and keypoint dots, "
+          "as a multiple of their default size.");
+    } line_width;
+
   } inputs;
 
   struct
@@ -706,6 +715,7 @@ public:
       halp_meta(layout, halp::layouts::vbox)
       halp::item<&ins::output_mode> output_mode;
       halp::item<&ins::draw_skeleton> draw_skeleton;
+      halp::item<&ins::line_width> line_width;
       halp::item<&ins::draw_landmarks> draw_landmarks;
       halp::item<&ins::draw_boxes> draw_boxes;
       halp::item<&ins::draw_mesh> draw_mesh;

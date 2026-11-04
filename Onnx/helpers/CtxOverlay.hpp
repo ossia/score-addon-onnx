@@ -12,6 +12,8 @@ namespace OnnxModels
 struct Overlay
 {
   void* c{};
+  // Multiplies every line width and dot radius (a node's line thickness).
+  float scale{1.f};
 
   Overlay(unsigned char* pixels, int w, int h)
       : c(onnx_overlay_new(pixels, w, h, w * 4))
@@ -22,14 +24,14 @@ struct Overlay
   Overlay& operator=(const Overlay&) = delete;
 
   void color(Onnx::Rgba q) { onnx_overlay_color(c, q.r, q.g, q.b, q.a); }
-  void lineWidth(float w) { onnx_overlay_line_width(c, w); }
+  void lineWidth(float w) { onnx_overlay_line_width(c, w * scale); }
   void line(Onnx::Vec2 a, Onnx::Vec2 b)
   {
     onnx_overlay_line(c, a.x, a.y, b.x, b.y);
   }
   void fillCircle(Onnx::Vec2 p, float r)
   {
-    onnx_overlay_fill_circle(c, p.x, p.y, r);
+    onnx_overlay_fill_circle(c, p.x, p.y, r * scale);
   }
   void strokeRect(Onnx::Rect r)
   {

@@ -2,6 +2,8 @@
 
 #include <Onnx/helpers/Heatmap.hpp>
 
+#include <charconv>
+
 namespace OnnxModels
 {
 
@@ -1144,10 +1146,20 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
 
   // Floor the threshold like runRTMO does: at ~0 every one of the 8400 grid
   // candidates survives the score test and the NMS blows up the frame time.
-  // K from the output shape (17 for COCO; a hand head has 21).
+  // K from the output shape (17 for COCO; a hand head has 21), or from the
+  // Ultralytics export's kpt_shape metadata ("[21, 3]"), which a head with
+  // several classes needs (WiLoR's left / right hands).
+  int kpt_hint = 0;
+  if(const auto ks = lctx.metadataValue("kpt_shape"); !ks.empty())
+  {
+    const auto first = ks.find_first_of("0123456789");
+    if(first != ks.npos)
+      std::from_chars(ks.data() + first, ks.data() + ks.size(), kpt_hint);
+  }
   thread_local std::vector<Yolo::YOLO_pose::Decoded> poses;
   const int K = Yolo::YOLO_pose::decode(
-      outs, poses, std::max(0.3f, static_cast<float>(inputs.min_confidence)));
+      outs, poses, std::max(0.3f, static_cast<float>(inputs.min_confidence)), 100,
+      0.7f, kpt_hint);
   std::swap(storage, t.storage);
 
   if(poses.empty())

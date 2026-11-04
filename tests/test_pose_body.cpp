@@ -195,6 +195,33 @@ TEST_CASE("YOLO-pose decode: NMS over the anchors, every keypoint kept", "[pose]
   CHECK(poses[0].box.x == Catch::Approx(75));
 }
 
+TEST_CASE("YOLO-pose decode: a head with several classes (WiLoR's hands)", "[pose]")
+{
+  // A v8 head [1, 4+C+3K, A] with C = 2 (left, right), K = 2: the anchor's
+  // score is its best class, its keypoints come after both class channels.
+  constexpr int K = 2, C = 2, A = 16, F = 4 + C + 3 * K;
+  float data[F * A]{};
+  auto set = [&](int a, std::initializer_list<float> v) {
+    int f = 0;
+    for(float x : v)
+      data[f++ * A + a] = x;
+  };
+  set(0, {100, 100, 50, 100, 0.1f, 0.9f, 90, 60, 0.95f, 110, 140, 0.4f});
+  set(1, {400, 300, 60, 120, 0.7f, 0.2f, 400, 250, 0.8f, 400, 350, 0.6f});
+  const int64_t shape[3] = {1, F, A};
+  REQUIRE(OnnxModels::initOnnxRuntime());
+  auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  Ort::Value out[1] = {Ort::Value::CreateTensor<float>(mem, data, F * A, shape, 3)};
+
+  std::vector<OnnxModels::Yolo::YOLO_pose::Decoded> poses;
+  REQUIRE(OnnxModels::Yolo::YOLO_pose::decode(out, poses, 0.3f, 100, 0.7f, K) == K);
+  REQUIRE(poses.size() == 2);
+  CHECK(poses[0].confidence == Catch::Approx(0.9f));
+  CHECK(poses[1].confidence == Catch::Approx(0.7f));
+  CHECK(poses[0].keypoints[0] == Catch::Approx(90));
+  CHECK(poses[0].keypoints[5] == Catch::Approx(0.4f));
+}
+
 TEST_CASE("DEIMv2 decode: one class, normalized boxes, no NMS", "[pose]")
 {
   // label_xyxy_score [1, 4, 6]: two hands (class 32), a body (0), and a hand
@@ -479,6 +506,29 @@ TEST_CASE("MoveNet follows a person across the frame", "[onnx][pose][model]")
       followed++;
   }
   CHECK(followed == 20);
+}
+
+TEST_CASE("Line Width thickens the drawn skeleton", "[onnx][pose][model]")
+{
+  const auto m = ss("ss-movenet-thunder.onnx");
+  if(!TestPaths::haveAll({m, body_jpg}))
+    SKIP("model or image not found");
+  const QImage frame = paste(body_jpg, 640, 360, QRectF{100, 20, 440, 320});
+  // The pixels the overlay drew over the frame, at a line width.
+  auto drawn = [&](float width) {
+    Harness h{"", m};
+    h.node.inputs.line_width.value = width;
+    h.run(frame);
+    const auto& out = h.node.outputs.image.texture;
+    REQUIRE(out.width == h.image.width());
+    int n = 0;
+    for(int i = 0; i < out.width * out.height * 4; i++)
+      n += out.bytes[i] != h.image.constBits()[i];
+    return n;
+  };
+  const int thin = drawn(1.f), thick = drawn(4.f);
+  CHECK(thin > 0);
+  CHECK(thick > 2 * thin);
 }
 
 // BlazePose's joints carry MediaPipe's visibility; the pose its presence.
