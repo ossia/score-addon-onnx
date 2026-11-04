@@ -316,12 +316,26 @@ Onnx::ROI::Rect PoseDetector::roiRectFromKeypoints(
     default:
     {
       // A top-down hand model (RTMPose-hand): the box of all its joints,
-      // padded like the hand-detector boxes it was trained on.
+      // padded like the hand-detector boxes it was trained on. With two hands
+      // close together, some joints can land on the other hand: their box
+      // then covers both, the next crop's joints spread over both again, and
+      // the crop never recovers. So the joints must stay within reach of the
+      // palm (no fingertip is 1.6 palm lengths from the palm's centre, the
+      // palm length being wrist to middle MCP, which a stray finger does not
+      // move); a hand with joints beyond it is re-detected instead.
       if(kps.size() == 21)
       {
+        const float palm = std::hypot(kp(9).x - kp(0).x, kp(9).y - kp(0).y);
+        const Onnx::Vec2 c{
+            (kp(0).x + kp(5).x + kp(9).x + kp(13).x + kp(17).x) / 5.f,
+            (kp(0).y + kp(5).y + kp(9).y + kp(13).y + kp(17).y) / 5.f};
+        if(!(palm > 1.f))
+          return r;
         float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
         for(int i = 0; i < 21; ++i)
         {
+          if(std::hypot(kp(i).x - c.x, kp(i).y - c.y) > 2.f * palm)
+            return r;
           x0 = std::min(x0, kp(i).x);
           x1 = std::max(x1, kp(i).x);
           y0 = std::min(y0, kp(i).y);
@@ -542,6 +556,11 @@ void PoseDetector::runMultiInstance(
     });
   }
 
+  if(const float min_size = inputs.min_size.value; min_size > 0.f)
+    std::erase_if(m_instances, [&](const DetectedPose& p) {
+      return !(poseSize(p, W, H) >= min_size);
+    });
+
   // One hand landmarked twice (a tracked ROI and a detection beside it, or two
   // tiles' detections NMS kept apart): the landmarks coincide. Keep the more
   // confident one, as MediaPipe does on its landmark-derived rects.
@@ -654,6 +673,12 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
     // feeds ByteTrack's second association, so continuity isn't lost.
     cfg.new_track
         = std::clamp(static_cast<float>(inputs.min_confidence.value), 0.05f, 0.95f);
+    // Only first-stage (high-score) detections can birth a track, so the
+    // high-score cut follows a Min Confidence below its 0.5 default: models
+    // that score their real subjects lower (top-down hand models, ~0.4-0.6)
+    // must still start tracks, now that only confirmed tracks are shown.
+    cfg.track_high = std::min(0.5f, cfg.new_track);
+    cfg.track_low = std::min(0.1f, 0.5f * cfg.track_high);
     // Per-id 3D payload smoothing, same real-unit tuning as the single path.
     {
       const Smoothing3D p3
@@ -784,6 +809,13 @@ void PoseDetector::emitInstances(PoseWorkflow draw, bool do_track)
         break;
       }
     }
+
+    // Only confirmed tracks are shown, as the coasted ones are: an instance
+    // without an id is a tentative track (seen fewer than min_hits frames) or
+    // a detection the tracker dropped, most often a one-frame false
+    // detection. It still fed the tracker above, so a real subject appears
+    // once its track is confirmed.
+    std::erase_if(m_instances, [](const DetectedPose& p) { return p.track_id < 0; });
   }
 
   // Body meshes, from the smoothed per-id parameters (a coasted instance's

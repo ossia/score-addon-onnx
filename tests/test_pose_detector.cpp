@@ -298,7 +298,9 @@ TEST_CASE("YOLO-pose presets find the players", "[onnx][pose][model]")
       Harness h{body_jpg, "", m};
       h.node.inputs.track_ids.value = true;
       h.node.inputs.max_instances.value = 8;
-      h.run();
+      // With Track IDs, a person shows once its track is confirmed (3 frames).
+      for(int i = 0; i < 3; i++)
+        h.run();
       const auto& poses = h.node.outputs.poses.value;
       CHECK(poses.size() >= 2);
       for(const auto& p : poses)

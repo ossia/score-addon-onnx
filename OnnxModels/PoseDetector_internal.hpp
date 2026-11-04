@@ -178,6 +178,7 @@ inline PoseWorkflow workflowForRole(const Onnx::ModelRole& r)
       return PoseWorkflow::BlazeFace;
     case K::PersonDetector:
     case K::MultiClassDetector:
+    case K::DetrDetector:
     case K::YoloxDetector:
       return PoseWorkflow::BoxDetection;
     case K::InstantHmr:
@@ -390,6 +391,24 @@ inline Onnx::FloatTensor fusedLetterboxTensor(
       ns.invstd.data(), storage.data());
   return finalizeTensor(
       port, storage, mw, mh, ns.layout == Onnx::TensorLayout::NhwcRgb);
+}
+
+// An instance's size for Min Size: the square root of its keypoints' box area
+// (image px), as a fraction of the frame height. 0 for keypoints collapsed on a
+// line or a point; non-finite coordinates are ignored.
+inline float poseSize(const DetectedPose& p, int W, int H)
+{
+  if(p.keypoints.empty() || H <= 0)
+    return 0.f;
+  float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+  for(const auto& k : p.keypoints)
+  {
+    x0 = std::min(x0, k.x);
+    x1 = std::max(x1, k.x);
+    y0 = std::min(y0, k.y);
+    y1 = std::max(y1, k.y);
+  }
+  return std::sqrt((x1 - x0) * W * (y1 - y0) * H) / H;
 }
 
 // A tracking ROI must be finite, non-tiny, and centered inside the frame.

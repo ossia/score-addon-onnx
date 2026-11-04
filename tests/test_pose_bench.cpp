@@ -12,7 +12,10 @@
 //   ONNX_TEST_POSE_BENCH_REPEAT  frames per image (default 1): the output of
 //                                the last, so tracked ROIs come into play;
 //                                every frame is timed ("frame_ms")
-// Each image is an independent frame: the node forgets it before the next.
+//   ONNX_TEST_POSE_BENCH_SEQUENCE  "1": the images are the frames of one video,
+//                                  each image's output recorded
+// Each image is an independent frame: the node forgets it before the next
+// (unless ONNX_TEST_POSE_BENCH_SEQUENCE=1).
 #include <tests/TestPaths.hpp>
 #include <tests/TestWorker.hpp>
 #include <OnnxModels/PoseDetector_internal.hpp>
@@ -124,6 +127,12 @@ void applyPreset(
             ports.detector_tiles.value = i;
         }(in);
         break;
+      case 36:
+        [f](auto& ports) {
+          if constexpr(requires { ports.min_size; })
+            ports.min_size.value = f;
+        }(in);
+        break;
       default:
         break;
     }
@@ -211,6 +220,7 @@ TEST_CASE("Pose Detector preset replay over an image set", "[.bench][pose]")
   }();
 
   const int repeat = std::max(1, std::atoi(TestPaths::env("ONNX_TEST_POSE_BENCH_REPEAT").c_str()));
+  const bool sequence = TestPaths::env("ONNX_TEST_POSE_BENCH_SEQUENCE") == "1";
   QJsonArray results;
   std::ifstream in{list};
   std::string line;
@@ -228,8 +238,9 @@ TEST_CASE("Pose Detector preset replay over an image set", "[.bench][pose]")
         = QImage(QString::fromStdString(path)).convertToFormat(QImage::Format_RGBA8888);
     if(img.isNull())
       continue;
-    for(int k = 0; k < 2; k++)
-      feed(node, blank);
+    if(!sequence)
+      for(int k = 0; k < 2; k++)
+        feed(node, blank);
     for(int k = 0; k < repeat; k++)
     {
       const auto t0 = std::chrono::steady_clock::now();

@@ -59,21 +59,23 @@ static constexpr std::array<std::pair<int, int>, 19> wholebody_body = {{
     {0, 5}, {0, 6}, {5, 6},
 }};
 
-// Hand connections (21 keypoints)
+// Hand connections (21 keypoints), MediaPipe's HAND_CONNECTIONS: the fingers
+// and the palm's outline (wrist, the finger bases, back to the wrist). The
+// OpenPose fan (wrist to each finger) is the OpenPoseHand21 skeleton.
 // 0:wrist, 1-4:thumb, 5-8:index, 9-12:middle, 13-16:ring, 17-20:pinky
-static constexpr std::array<std::pair<int, int>, 20> hands = {{
+static constexpr std::array<std::pair<int, int>, 21> hands = {{
     // Thumb
     {0, 1}, {1, 2}, {2, 3}, {3, 4},
     // Index
     {0, 5}, {5, 6}, {6, 7}, {7, 8},
     // Middle
-    {0, 9}, {9, 10}, {10, 11}, {11, 12},
+    {5, 9}, {9, 10}, {10, 11}, {11, 12},
     // Ring
-    {0, 13}, {13, 14}, {14, 15}, {15, 16},
+    {9, 13}, {13, 14}, {14, 15}, {15, 16},
     // Pinky
-    {0, 17}, {17, 18}, {18, 19}, {19, 20},
+    {13, 17}, {17, 18}, {18, 19}, {19, 20},
     // Palm
-    //{5, 9},
+    {0, 17},
 }};
 
 // BlazeFace connections (6 keypoints: right_eye, left_eye, nose, mouth, right_ear, left_ear)

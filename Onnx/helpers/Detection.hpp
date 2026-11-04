@@ -531,6 +531,41 @@ inline std::vector<Detection> decodeMultiClass(
   return out;
 }
 
+// PINTO DEIMv2 decode: one [1,N,6] output, rows (label, x1, y1, x2, y2,
+// score) with the box normalized to the (stretched) input and the score a
+// probability. A DETR head predicts each object once, so no NMS.
+inline std::vector<Detection> decodeLabelXyxyScore(
+    std::span<Ort::Value> outputs, int keep_class, float score_thr)
+{
+  std::vector<Detection> out;
+  if(outputs.empty() || !outputs.front().IsTensor())
+    return out;
+  auto info = outputs.front().GetTensorTypeAndShapeInfo();
+  const auto sh = info.GetShape();
+  if(info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || sh.size() != 3
+     || sh[2] != 6 || sh[1] <= 0)
+    return out;
+  const float* d = outputs.front().GetTensorData<float>();
+  const int n = static_cast<int>(sh[1]);
+  for(int i = 0; i < n; ++i)
+  {
+    const float* r = d + static_cast<size_t>(i) * 6;
+    const int label = static_cast<int>(r[0] + 0.5f);
+    if(!(r[5] >= score_thr) || (keep_class >= 0 && label != keep_class))
+      continue;
+    Detection det;
+    det.score = r[5];
+    det.class_id = label;
+    det.xc = (r[1] + r[3]) * 0.5f;
+    det.yc = (r[2] + r[4]) * 0.5f;
+    det.w = r[3] - r[1];
+    det.h = r[4] - r[2];
+    if(det.w > 0.f && det.h > 0.f)
+      out.push_back(std::move(det));
+  }
+  return out;
+}
+
 // Raw YOLOX grid decode (COCO): single [1,A,5+C] output (cx,cy,w,h,obj,classes)
 // with NO NMS baked. Anchors are the concatenated strides 8/16/32 grids. Boxes
 // are grid/exp-decoded to input-pixel space, returned normalized (in_w,in_h),

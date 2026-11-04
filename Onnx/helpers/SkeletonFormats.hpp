@@ -48,7 +48,12 @@ enum class TargetSkeleton
   Mpii16,
   H36m17,
   Dlib68,
-  Hand21
+  Hand21, // MediaPipe / OpenPose / COCO-WholeBody order, MediaPipe's bones
+  // Appended: presets store the value.
+  OpenPoseHand21, // the same joints, OpenPose's bones (wrist to each finger)
+  InterHand21,    // InterHand2.6M: each finger tip to base, thumb first, wrist last
+  Mano16,         // MANO's joints (smplx order), no fingertips
+  Mano21          // MANO's joints + the 5 fingertips (smplx order)
 };
 
 // A target joint = sum of up to 4 weighted source joints. n==0 => unmappable.
@@ -392,6 +397,37 @@ inline constexpr Bone hand21_bones[] = {
     {0, 1}, {1, 2}, {2, 3}, {3, 4}, {0, 5}, {5, 6}, {6, 7}, {7, 8}, {5, 9},
     {9, 10}, {10, 11}, {11, 12}, {9, 13}, {13, 14}, {14, 15}, {15, 16}, {13, 17},
     {0, 17}, {17, 18}, {18, 19}, {19, 20}};
+// OpenPose draws the same joints with a bone from the wrist to each finger.
+inline constexpr Bone openpose_hand21_bones[] = {
+    {0, 1},  {1, 2},   {2, 3},   {3, 4},   {0, 5},   {5, 6},   {6, 7},
+    {7, 8},  {0, 9},   {9, 10},  {10, 11}, {11, 12}, {0, 13}, {13, 14},
+    {14, 15}, {15, 16}, {0, 17}, {17, 18}, {18, 19}, {19, 20}};
+
+// InterHand2.6M: per finger tip (4) to base (1), thumb..pinky, then the wrist.
+inline constexpr const char* interhand21_names[] = {
+    "THUMB_4", "THUMB_3", "THUMB_2", "THUMB_1", "INDEX_4", "INDEX_3", "INDEX_2",
+    "INDEX_1", "MIDDLE_4", "MIDDLE_3", "MIDDLE_2", "MIDDLE_1", "RING_4", "RING_3",
+    "RING_2", "RING_1", "PINKY_4", "PINKY_3", "PINKY_2", "PINKY_1", "WRIST"};
+inline constexpr Bone interhand21_bones[] = {
+    {20, 3},  {3, 2},   {2, 1},   {1, 0},   {20, 7},  {7, 6},   {6, 5},
+    {5, 4},   {20, 11}, {11, 10}, {10, 9},  {9, 8},   {20, 15}, {15, 14},
+    {14, 13}, {13, 12}, {20, 19}, {19, 18}, {18, 17}, {17, 16}};
+
+// MANO's 16 joints in smplx order (index, middle, pinky, ring, thumb; joint 1
+// is the finger's root: the MCP, the thumb's CMC), its kinematic tree, and
+// smplx's 5 fingertips (thumb..pinky) appended for MANO-21.
+inline constexpr const char* mano21_names[] = {
+    "WRIST",   "INDEX1",  "INDEX2", "INDEX3", "MIDDLE1", "MIDDLE2", "MIDDLE3",
+    "PINKY1",  "PINKY2",  "PINKY3", "RING1",  "RING2",   "RING3",   "THUMB1",
+    "THUMB2",  "THUMB3",  "THUMB_TIP", "INDEX_TIP", "MIDDLE_TIP", "RING_TIP",
+    "PINKY_TIP"};
+inline constexpr Bone mano16_bones[] = {
+    {0, 1},  {1, 2}, {2, 3},   {0, 4},   {4, 5},   {5, 6},  {0, 7}, {7, 8},
+    {8, 9},  {0, 10}, {10, 11}, {11, 12}, {0, 13}, {13, 14}, {14, 15}};
+inline constexpr Bone mano21_bones[] = {
+    {0, 1},  {1, 2},   {2, 3},   {0, 4},   {4, 5},   {5, 6},   {0, 7},
+    {7, 8},  {8, 9},   {0, 10},  {10, 11}, {11, 12}, {0, 13},  {13, 14},
+    {14, 15}, {15, 16}, {3, 17}, {6, 18},  {12, 19}, {9, 20}};
 
 // dlib-68 face contour edges (jaw, brows, nose, eyes [closed], mouth [closed]).
 inline constexpr Bone dlib68_bones[] = {
@@ -436,8 +472,57 @@ constexpr std::array<JointMap, N> offsetMap()
     m[i] = direct(Offset + i);
   return m;
 }
+inline constexpr auto wholebody133_to_coco17 = offsetMap<0, 17>();
 inline constexpr auto wholebody133_to_dlib68 = offsetMap<23, 68>();
 inline constexpr auto wholebody133_to_hand21 = offsetMap<112, 21>();
+
+// ======================= hand-21 -> the other hand layouts =======================
+// Each is a reordering (or subset) of the hand-21 joints, composed with every
+// source's own hand-21 table.
+inline constexpr int interhand21_from_hand21[21]
+    = {4, 3, 2, 1, 8, 7, 6, 5, 12, 11, 10, 9, 16, 15, 14, 13, 20, 19, 18, 17, 0};
+inline constexpr int mano21_from_hand21[21]
+    = {0, 5, 6, 7, 9, 10, 11, 17, 18, 19, 13, 14, 15, 1, 2, 3, 4, 8, 12, 16, 20};
+template <int N, typename Src>
+constexpr std::array<JointMap, N> reorderHand(const Src& hand21, const int (&order)[21])
+{
+  std::array<JointMap, N> m{};
+  for(int i = 0; i < N; i++)
+    m[i] = hand21[order[i]];
+  return m;
+}
+template <typename Src>
+struct HandLayouts
+{
+  std::array<JointMap, 21> interhand21, mano21;
+  std::array<JointMap, 16> mano16;
+  constexpr explicit HandLayouts(const Src& hand21)
+      : interhand21{reorderHand<21>(hand21, interhand21_from_hand21)}
+      , mano21{reorderHand<21>(hand21, mano21_from_hand21)}
+      , mano16{reorderHand<16>(hand21, mano21_from_hand21)}
+  {
+  }
+};
+inline constexpr HandLayouts hands21_layouts{hands21_to_hand21};
+inline constexpr HandLayouts wholebody133_layouts{wholebody133_to_hand21};
+inline constexpr HandLayouts mhr70_layouts{mhr70_to_hand21};
+
+// A hand target from a source's hand-21 table and its reorderings; empty when
+// `t` is not a hand layout.
+template <typename Src>
+inline std::span<const JointMap> handMapping(
+    TargetSkeleton t, const Src& hand21, const HandLayouts<Src>& l)
+{
+  switch(t)
+  {
+    case TargetSkeleton::Hand21:
+    case TargetSkeleton::OpenPoseHand21: return hand21;
+    case TargetSkeleton::InterHand21: return l.interhand21;
+    case TargetSkeleton::Mano16: return l.mano16;
+    case TargetSkeleton::Mano21: return l.mano21;
+    default: return {};
+  }
+}
 
 inline std::span<const JointMap> mappingFor(SourceSkeleton s, TargetSkeleton t)
 {
@@ -475,13 +560,18 @@ inline std::span<const JointMap> mappingFor(SourceSkeleton s, TargetSkeleton t)
     case S::Wholebody133:
       switch(t)
       {
+        // COCO-17 itself is not in the COCO-17 table (no remap needed there),
+        // so the whole body's first 17 joints are taken explicitly.
+        case T::Coco17: return wholebody133_to_coco17;
         case T::Dlib68: return wholebody133_to_dlib68;
-        case T::Hand21: return wholebody133_to_hand21;
-        default: return mappingFor(S::Coco17, t);
+        default:
+          if(auto h = handMapping(t, wholebody133_to_hand21, wholebody133_layouts);
+             !h.empty())
+            return h; // right hand
+          return mappingFor(S::Coco17, t);
       }
     case S::Hands21:
-      return t == T::Hand21 ? std::span<const JointMap>(hands21_to_hand21)
-                            : std::span<const JointMap>{};
+      return handMapping(t, hands21_to_hand21, hands21_layouts);
     case S::Mhr70:
       switch(t)
       {
@@ -491,8 +581,7 @@ inline std::span<const JointMap> mappingFor(SourceSkeleton s, TargetSkeleton t)
         case T::Halpe26: return mhr70_to_halpe26;
         case T::Mpii16: return mhr70_to_mpii16;
         case T::H36m17: return mhr70_to_h36m17;
-        case T::Hand21: return mhr70_to_hand21; // right hand
-        default: return {};
+        default: return handMapping(t, mhr70_to_hand21, mhr70_layouts); // right hand
       }
     default: return {};
   }
@@ -511,6 +600,10 @@ inline std::span<const Bone> edgesFor(TargetSkeleton t)
     case TargetSkeleton::H36m17: return h36m17_bones;
     case TargetSkeleton::Dlib68: return dlib68_bones;
     case TargetSkeleton::Hand21: return hand21_bones;
+    case TargetSkeleton::OpenPoseHand21: return openpose_hand21_bones;
+    case TargetSkeleton::InterHand21: return interhand21_bones;
+    case TargetSkeleton::Mano16: return mano16_bones;
+    case TargetSkeleton::Mano21: return mano21_bones;
     default: return {};
   }
 }
@@ -526,7 +619,11 @@ inline std::span<const char* const> namesFor(TargetSkeleton t)
     case TargetSkeleton::Halpe26: return halpe26_names;
     case TargetSkeleton::Mpii16: return mpii16_names;
     case TargetSkeleton::H36m17: return h36m17_names;
-    case TargetSkeleton::Hand21: return hand21_names;
+    case TargetSkeleton::Hand21:
+    case TargetSkeleton::OpenPoseHand21: return hand21_names;
+    case TargetSkeleton::InterHand21: return interhand21_names;
+    case TargetSkeleton::Mano16: return std::span(mano21_names).first(16);
+    case TargetSkeleton::Mano21: return mano21_names;
     default: return {};
   }
 }

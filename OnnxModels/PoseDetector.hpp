@@ -558,6 +558,16 @@ public:
           "a Detector Cadence above 1 to amortize it.");
     } detector_tiles;
 
+    // Appended last to keep existing presets' port indices stable (id 36).
+    struct : halp::hslider_f32<"Min Size", halp::range{0., 0.2, 0.}>
+    {
+      halp_meta(
+          description,
+          "Drop instances smaller than this, the square root of their keypoints' "
+          "box area as a fraction of the frame height: tiny false detections "
+          "far in the background, and collapsed keypoints. 0 = off.");
+    } min_size;
+
   } inputs;
 
   struct
@@ -638,6 +648,7 @@ public:
         // Min Confidence belongs with tracking: it is the detection-acceptance
         // threshold that gates which instances are tracked.
         halp::item<&ins::min_confidence> min_confidence;
+        halp::item<&ins::min_size> min_size;
         halp::item<&ins::track_ids> track_ids;
         halp::item<&ins::max_instances> max_instances;
         halp::item<&ins::track_memory> track_memory;

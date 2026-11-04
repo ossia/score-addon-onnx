@@ -195,6 +195,31 @@ TEST_CASE("YOLO-pose decode: NMS over the anchors, every keypoint kept", "[pose]
   CHECK(poses[0].box.x == Catch::Approx(75));
 }
 
+TEST_CASE("DEIMv2 decode: one class, normalized boxes, no NMS", "[pose]")
+{
+  // label_xyxy_score [1, 4, 6]: two hands (class 32), a body (0), and a hand
+  // under the threshold.
+  float data[4 * 6] = {
+      32, 0.10f, 0.20f, 0.30f, 0.60f, 0.9f, //
+      32, 0.12f, 0.22f, 0.32f, 0.62f, 0.5f, //
+      0,  0.00f, 0.00f, 0.50f, 1.00f, 0.95f, //
+      32, 0.70f, 0.70f, 0.80f, 0.80f, 0.1f};
+  const int64_t shape[3] = {1, 4, 6};
+  REQUIRE(OnnxModels::initOnnxRuntime());
+  auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  Ort::Value out[1] = {Ort::Value::CreateTensor<float>(mem, data, 4 * 6, shape, 3)};
+
+  const auto hands = Onnx::Detection::decodeLabelXyxyScore(out, 32, 0.3f);
+  // A DETR head predicts each object once: overlapping boxes both stay.
+  REQUIRE(hands.size() == 2);
+  CHECK(hands[0].class_id == 32);
+  CHECK(hands[0].xc == Catch::Approx(0.2f));
+  CHECK(hands[0].yc == Catch::Approx(0.4f));
+  CHECK(hands[0].w == Catch::Approx(0.2f));
+  CHECK(hands[0].h == Catch::Approx(0.4f));
+  CHECK(Onnx::Detection::decodeLabelXyxyScore(out, -1, 0.3f).size() == 3);
+}
+
 TEST_CASE("WFLW-98 and COCO-WholeBody faces and hands remap", "[pose]")
 {
   using namespace Onnx::Skel;
@@ -212,10 +237,76 @@ TEST_CASE("WFLW-98 and COCO-WholeBody faces and hands remap", "[pose]")
   const auto hand = mappingFor(SourceSkeleton::Wholebody133, TargetSkeleton::Hand21);
   REQUIRE(hand.size() == 21);
   CHECK(hand[0].idx[0] == 112);
-  // The body goes through the COCO-17 tables.
+  // COCO-17 is the body's first 17 joints.
+  const auto coco17 = mappingFor(SourceSkeleton::Wholebody133, TargetSkeleton::Coco17);
+  REQUIRE(coco17.size() == 17);
+  CHECK(coco17[0].idx[0] == 0);
+  CHECK(coco17[16].idx[0] == 16);
+  // The other hand layouts, from the whole body's right hand.
+  const auto inter = mappingFor(SourceSkeleton::Wholebody133, TargetSkeleton::InterHand21);
+  REQUIRE(inter.size() == 21);
+  CHECK(inter[0].idx[0] == 112 + 4);  // thumb tip first
+  CHECK(inter[20].idx[0] == 112);     // wrist last
+  // Other bodies go through the COCO-17 tables.
   const auto body = mappingFor(SourceSkeleton::Wholebody133, TargetSkeleton::Halpe26);
   const auto coco = mappingFor(SourceSkeleton::Coco17, TargetSkeleton::Halpe26);
   CHECK(body.data() == coco.data());
+}
+
+TEST_CASE("Min Size measures the keypoints' box against the frame height", "[pose]")
+{
+  OnnxModels::DetectedPose p;
+  // A 0.1 x 0.2 (normalized) box in a 1280 x 720 frame: 128 x 144 px.
+  p.keypoints = {{0.4f, 0.3f, 0.f, 1.f}, {0.5f, 0.5f, 0.f, 1.f}, {0.45f, 0.4f, 0.f, 1.f}};
+  CHECK(OnnxModels::poseSize(p, 1280, 720) == Catch::Approx(std::sqrt(128. * 144.) / 720.));
+  // Keypoints collapsed on a vertical line: no area, however tall.
+  for(auto& k : p.keypoints)
+    k.x = 0.4f;
+  CHECK(OnnxModels::poseSize(p, 1280, 720) == 0.f);
+  CHECK(OnnxModels::poseSize(OnnxModels::DetectedPose{}, 1280, 720) == 0.f);
+}
+
+TEST_CASE("Hand layouts: MediaPipe, OpenPose, InterHand2.6M and MANO", "[pose]")
+{
+  using namespace Onnx::Skel;
+  struct Layout
+  {
+    TargetSkeleton t;
+    size_t n;
+  };
+  for(auto [t, n] : {Layout{TargetSkeleton::Hand21, 21}, {TargetSkeleton::OpenPoseHand21, 21},
+                     {TargetSkeleton::InterHand21, 21}, {TargetSkeleton::Mano16, 16},
+                     {TargetSkeleton::Mano21, 21}})
+  {
+    // Every hand-capable source maps to every hand layout.
+    for(auto s : {SourceSkeleton::Hands21, SourceSkeleton::Wholebody133, SourceSkeleton::Mhr70})
+      CHECK(mappingFor(s, t).size() == n);
+    CHECK(namesFor(t).size() == n);
+    for(const auto& b : edgesFor(t))
+    {
+      CHECK(b.a >= 0);
+      CHECK(b.b < static_cast<int>(n));
+    }
+  }
+
+  const auto mano = mappingFor(SourceSkeleton::Hands21, TargetSkeleton::Mano21);
+  CHECK(mano[0].idx[0] == 0);   // wrist
+  CHECK(mano[1].idx[0] == 5);   // index MCP
+  CHECK(mano[7].idx[0] == 17);  // pinky before ring, as in smplx
+  CHECK(mano[13].idx[0] == 1);  // thumb CMC
+  CHECK(mano[16].idx[0] == 4);  // fingertips appended, thumb first
+  CHECK(mano[20].idx[0] == 20);
+  CHECK(std::string_view{namesFor(TargetSkeleton::Mano16)[15]} == "THUMB3");
+
+  // MediaPipe draws the palm's outline, OpenPose a bone to each finger.
+  auto has = [](std::span<const Bone> bones, int a, int b) {
+    return std::any_of(bones.begin(), bones.end(), [&](const Bone& x) {
+      return (x.a == a && x.b == b) || (x.a == b && x.b == a);
+    });
+  };
+  CHECK(has(edgesFor(TargetSkeleton::Hand21), 5, 9));
+  CHECK_FALSE(has(edgesFor(TargetSkeleton::Hand21), 0, 9));
+  CHECK(has(edgesFor(TargetSkeleton::OpenPoseHand21), 0, 9));
 }
 
 TEST_CASE("DARK finds a heatmap peak between the cells", "[pose]")
@@ -351,7 +442,10 @@ TEST_CASE("Single-stage models see people at the frame's edges", "[onnx][pose][m
       const QImage photo(QString::fromStdString(body_jpg));
       // Right of the frame's centre 480x480 square, which ends at x = 1040.
       const double pw = 560, ph = photo.height() * pw / photo.width();
-      h.run(paste(body_jpg, 1600, 480, QRectF{1040, (480 - ph) / 2, pw, ph}));
+      // With Track IDs, a person shows once its track is confirmed (3 frames).
+      const QImage frame = paste(body_jpg, 1600, 480, QRectF{1040, (480 - ph) / 2, pw, ph});
+      for(int i = 0; i < 3; i++)
+        h.run(frame);
       const auto poses = h.poses();
       REQUIRE(!poses.empty());
       for(const auto& p : poses)
@@ -448,7 +542,9 @@ TEST_CASE("Multi-face FaceMesh finds every face", "[onnx][pose][model]")
     for(int i = 0; i < 3; i++)
       p.drawImage(QRectF{40. + i * 420, 160, 380, 380 * face.height() / double(face.width())}, face);
   }
-  h.run(frame);
+  // A face shows once its track is confirmed (3 frames).
+  for(int i = 0; i < 3; i++)
+    h.run(frame);
   const auto poses = h.poses();
   CHECK(poses.size() == 3);
   std::vector<double> xs;
