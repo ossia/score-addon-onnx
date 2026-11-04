@@ -863,6 +863,7 @@ void PoseDetector::drawSkeleton(
     drawMeshes(dst, w, h, std::span<const int>(&mesh_slot, 1));
   {
     Overlay ov(dst, w, h);
+    ov.scale = inputs.line_width.value;
     drawOnePose(ov, pose, workflow, w, h);
   } // Overlay dtor rasterizes the queued drawing into dst
   outputs.image.texture.changed = true;
@@ -884,6 +885,7 @@ void PoseDetector::drawAllSkeletons(PoseWorkflow workflow)
   drawMeshes(dst, w, h, m_inst_mesh);
   {
     Overlay ov(dst, w, h);
+    ov.scale = inputs.line_width.value;
     for(const auto& pose : m_instances)
       drawOnePose(ov, pose, workflow, w, h);
   }
