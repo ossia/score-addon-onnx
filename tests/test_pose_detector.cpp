@@ -22,6 +22,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <set>
 #include <vector>
 
 namespace
@@ -452,6 +453,67 @@ TEST_CASE("smoothParams unwraps angle entries", "[pose][smoothing]")
   float w[2] = {3.1f, 0.f};
   Onnx::smoothParams(angles, w, mask, Onnx::kNominalFrameDt);
   CHECK(std::abs(w[0]) > 3.0f);
+}
+
+// Buffered IoU: a box that moves more than its own width each frame never
+// overlaps its track's prediction (the Kalman velocity starts at zero and is
+// only learned from matches), so without the buffer it is born again under a
+// new id every frame.
+TEST_CASE("Tracker keeps the id of a fast-moving subject", "[pose][track]")
+{
+  auto ids = [](Onnx::Track::Config cfg) {
+    cfg.min_hits = 1;
+    Onnx::Track::PoseTracker tr;
+    tr.configure(cfg);
+    std::set<int> seen;
+    for(int f = 0; f < 10; f++)
+    {
+      // 0.09 per frame for a box 0.08 wide: no plain overlap frame to frame.
+      const float x = 0.05f + 0.09f * f;
+      const std::vector<Onnx::Track::Detection> d{{{x, 0.5f, 0.08f, 0.16f}, 0.9f, {}, {}}};
+      tr.update(d);
+      for(const auto& t : tr.tracks()) // every id the tracker created
+        seen.insert(t.id);
+    }
+    return seen.size();
+  };
+  Onnx::Track::Config plain;
+  plain.biou_buffer = plain.biou_grow = 0.f;
+  plain.recover_lost = false;
+  CHECK(ids(plain) > 1);
+  CHECK(ids(Onnx::Track::Config{}) == 1);
+}
+
+// Observation-centric recovery: a subject that stopped while undetected is
+// found again where it was last seen, not where its velocity carried the
+// prediction, and keeps its id.
+TEST_CASE("Tracker recovers a lost subject at its last observation", "[pose][track]")
+{
+  auto lastId = [](bool recover) {
+    Onnx::Track::Config cfg;
+    cfg.min_hits = 1;
+    cfg.recover_lost = recover;
+    cfg.biou_buffer = cfg.biou_grow = 0.f;
+    Onnx::Track::PoseTracker tr;
+    tr.configure(cfg);
+    auto det = [](float x) {
+      return std::vector<Onnx::Track::Detection>{{{x, 0.5f, 0.1f, 0.2f}, 0.9f, {}, {}}};
+    };
+    int first = -1;
+    for(int f = 0; f < 6; f++) // moving right, 0.04 per frame
+      if(const int id = tr.update(det(0.2f + 0.04f * f)).front(); id >= 0)
+        first = id;
+    for(int f = 0; f < 4; f++) // lost: the prediction keeps going
+      tr.update({});
+    int id = -1;
+    for(int f = 0; f < 3; f++) // back, standing where it was last seen
+      id = tr.update(det(0.4f)).front();
+    return std::pair{first, id};
+  };
+  const auto [first, recovered] = lastId(true);
+  CHECK(recovered == first);
+  const auto [first2, reborn] = lastId(false);
+  CHECK(reborn != first2);
 }
 
 // The tracker carries world / translation / params per id: smoothed on
