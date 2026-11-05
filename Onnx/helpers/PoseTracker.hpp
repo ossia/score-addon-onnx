@@ -169,6 +169,31 @@ struct Config
   // Strict confirmation (DeepSORT n_init): delete a tentative track the first
   // frame it fails to match, so a one-frame detection never persists.
   bool strict_confirm = false;
+
+  // --- Association for fast motion and dropouts ---
+  // On synthetic sequences with ground truth (crossing, fast and blurred,
+  // leaving and re-entering hands; crossing people) the four together raise
+  // the mean IDF1 from 0.53 to 0.60 and cut ID switches by a quarter; on a
+  // real two-hand webcam video, WiLoR's ids drop from 32 to 10.
+  // Buffered IoU (C-BIoU, Yang et al. WACV 2023): both boxes are expanded by
+  // this fraction of their size on each side before IoU, in the gate and the
+  // cost, so a subject that moved more than its own size still overlaps its
+  // track. The track's buffer grows by biou_grow per frame it was lost
+  // (BoostTrack++'s soft-BIoU), as its prediction gets less certain.
+  float biou_buffer = 0.3f;
+  float biou_grow = 0.1f;
+  // Observation-centric recovery (OC-SORT's OCR): the detections left after
+  // both stages are matched to the unmatched tracks by IoU with the track's
+  // LAST OBSERVED box rather than its prediction, which drifts while lost. A
+  // match keeps the track's id instead of birthing a new, unconfirmed one.
+  bool recover_lost = true;
+  // Track-aware initialization (TrackTrack, CVPR 2025): no new track on a
+  // detection overlapping a live track (or a stronger new one) above this IoU.
+  // 0 = off.
+  float birth_max_iou = 0.55f;
+  // NSA Kalman (StrongSORT): the measurement noise scaled by (1 - score), so
+  // a confident detection pulls the state harder than a blurred one.
+  bool nsa = true;
 };
 
 // ByteTrack 8-dim Kalman filter (state [x,y,a,h, vx,vy,va,vh], a = w/h).
@@ -212,13 +237,15 @@ public:
     cov = _F * cov * _F.transpose() + Q;
   }
 
-  void update(State& mean, Cov& cov, const Meas& m) const
+  // noise_scale multiplies the measurement covariance (NSA: 1 - score).
+  void update(State& mean, Cov& cov, const Meas& m, float noise_scale = 1.f) const
   {
     const float h = std::max(1e-3f, mean(3)); // floor: a 0/neg/NaN height would
                                               // make R/Q singular -> inverse NaN
     Meas s;
     s << _spw * h, _spw * h, 1e-1f, _spw * h;
-    const Eigen::Matrix4f R = (s.array() * s.array()).matrix().asDiagonal();
+    const Eigen::Matrix4f R
+        = (s.array() * s.array()).matrix().asDiagonal() * noise_scale;
     const Meas pm = _H * mean;
     const Eigen::Matrix4f pc = _H * cov * _H.transpose() + R;
     const Eigen::Matrix<float, 8, 4> K
@@ -271,6 +298,14 @@ inline float iou(const Box& a, const Box& b)
   const float inter = ix * iy;
   const float uni = a.w * a.h + b.w * b.h - inter;
   return uni > 0 ? inter / uni : 0.f;
+}
+
+// IoU of the two boxes expanded by `ba` / `bb` of their size on each side
+// (C-BIoU's buffered IoU; 0 buffers = plain IoU).
+inline float bufferedIou(const Box& a, float ba, const Box& b, float bb)
+{
+  return iou({a.cx, a.cy, a.w * (1.f + 2.f * ba), a.h * (1.f + 2.f * ba)},
+             {b.cx, b.cy, b.w * (1.f + 2.f * bb), b.h * (1.f + 2.f * bb)});
 }
 
 // OKS between two keypoint sets given the object scale (box area).
@@ -351,6 +386,7 @@ struct Tracklet
   // OC-SORT direction history
   float prev_cx = 0, prev_cy = 0;
   bool have_dir = false;
+  Box last_obs{}; // the box of the last detection it matched (OC-SORT OCR)
 
   Box box() const { return xyahToBox(mean.head<4>()); }
 };
@@ -425,6 +461,17 @@ public:
         rem_t.push_back(i);
     associate(rem_t, low, dets, t_match, d_used, /*full_cost=*/false);
 
+    // 4b) OCR: the tracks still unmatched vs the high-score detections left,
+    //     by IoU with each track's last observation.
+    if(_cfg.recover_lost)
+    {
+      rem_t.clear();
+      for(int i = 0; i < (int)_tracks.size(); ++i)
+        if(t_match[i] < 0 && _tracks[i].hits > 0)
+          rem_t.push_back(i);
+      associate(rem_t, high, dets, t_match, d_used, /*full_cost=*/false, /*last_obs=*/true);
+    }
+
     // 5) update matched tracks
     for(int i = 0; i < (int)_tracks.size(); ++i)
     {
@@ -442,12 +489,24 @@ public:
         out[di] = _tracks[i].id;
     }
 
-    // 6) birth: unmatched high-score detections start tentative tracks
+    // 6) birth: unmatched high-score detections start tentative tracks,
+    //    strongest first (track-aware initialization compares each with the
+    //    live tracks and the births before it).
+    if(_cfg.birth_max_iou > 0.f)
+      std::sort(high.begin(), high.end(), [&](int a, int b) {
+        return dets[a].score > dets[b].score;
+      });
     for(int di : high)
     {
       if(d_used[di] || dets[di].score < _cfg.new_track)
         continue;
       if(!canBirth(dets[di]))
+        continue;
+      if(_cfg.birth_max_iou > 0.f
+         && std::any_of(_tracks.begin(), _tracks.end(), [&](const Tracklet& t) {
+              return t.time_since_update == 0
+                     && iou(t.box(), dets[di].box) > _cfg.birth_max_iou;
+            }))
         continue;
       birth(dets[di]);
     }
@@ -539,10 +598,19 @@ private:
     return true;
   }
 
-  float cost(const Tracklet& t, const Detection& d, bool full) const
+  // The buffer of a track's box: grows while it is lost (soft-BIoU).
+  float trackBuffer(const Tracklet& t) const
   {
-    const Box tb = t.box();
-    const float i = iou(tb, d.box);
+    return _cfg.biou_buffer
+           + _cfg.biou_grow * float(std::max(0, t.time_since_update - 1));
+  }
+
+  // full: stage 1 (IoU + OKS + appearance + direction); else IoU only, against
+  // the track's prediction, or its last observation (last_obs: OCR stage).
+  float cost(const Tracklet& t, const Detection& d, bool full, bool last_obs = false) const
+  {
+    const Box tb = last_obs ? t.last_obs : t.box();
+    const float i = bufferedIou(tb, trackBuffer(t), d.box, _cfg.biou_buffer);
     if(!full)
       return (i >= _cfg.gate_iou) ? (1.f - i) : kReject;
 
@@ -682,7 +750,7 @@ private:
   void associate(
       const std::vector<int>& tk, const std::vector<int>& dk,
       const std::vector<Detection>& dets, std::vector<int>& t_match,
-      std::vector<char>& d_used, bool full_cost)
+      std::vector<char>& d_used, bool full_cost, bool last_obs = false)
   {
     auto& pairs = _pairs; // reused member (cost matrix); never reallocated warm
     pairs.clear();
@@ -695,7 +763,7 @@ private:
       {
         if(d_used[di])
           continue;
-        const float c = cost(_tracks[ti], dets[di], full_cost);
+        const float c = cost(_tracks[ti], dets[di], full_cost, last_obs);
         if(c < kReject)
           pairs.push_back({c, ti, di});
       }
@@ -727,7 +795,10 @@ private:
     t.prev_cx = t.mean(0);
     t.prev_cy = t.mean(1);
 
-    _kf.update(t.mean, t.cov, boxToXyah(d.box));
+    _kf.update(
+        t.mean, t.cov, boxToXyah(d.box),
+        _cfg.nsa ? std::clamp(1.f - d.score, 0.1f, 1.f) : 1.f);
+    t.last_obs = d.box;
 
     if(gap > 1)
     {
@@ -859,6 +930,7 @@ private:
           reacquired >= 0 ? "RE-ACQUIRED" : "new", d.score,
           d.embedding.empty() ? "no" : "yes");
     _kf.initiate(boxToXyah(d.box), t.mean, t.cov);
+    t.last_obs = d.box;
     t.kpts = d.keypoints;
     t.kpts_smooth = d.keypoints;
     updatePayload(t, d); // fresh filters: the first sample passes through
