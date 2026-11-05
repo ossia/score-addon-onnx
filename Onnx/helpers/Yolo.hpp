@@ -337,6 +337,7 @@ struct YOLO_pose
     pose_type::rect box;
     float confidence{};
     std::vector<float> keypoints; // K * {x, y, c}
+    int class_id = -1;            // the best class of a multi-class head, else -1
   };
 
   // Decodes the poses above min_confidence, best first, at most max_detect.
@@ -411,6 +412,13 @@ struct YOLO_pose
       auto& d = out[n++];
       d.box = rect;
       d.confidence = score(j);
+      d.class_id = -1;
+      for (int c = 0; l.classes > 1 && c < l.classes; c++)
+        if (at(j, 4 + c) == d.confidence)
+        {
+          d.class_id = c;
+          break;
+        }
       d.keypoints.resize(l.keypoints * 3);
       for (int i = 0; i < l.keypoints * 3; i++)
         d.keypoints[i] = at(j, kp0 + i);

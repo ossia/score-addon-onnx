@@ -220,6 +220,9 @@ TEST_CASE("YOLO-pose decode: a head with several classes (WiLoR's hands)", "[pos
   CHECK(poses[1].confidence == Catch::Approx(0.7f));
   CHECK(poses[0].keypoints[0] == Catch::Approx(90));
   CHECK(poses[0].keypoints[5] == Catch::Approx(0.4f));
+  // The winning class: WiLoR's left (0) / right (1) hand.
+  CHECK(poses[0].class_id == 1);
+  CHECK(poses[1].class_id == 0);
 }
 
 TEST_CASE("DEIMv2 decode: one class, normalized boxes, no NMS", "[pose]")

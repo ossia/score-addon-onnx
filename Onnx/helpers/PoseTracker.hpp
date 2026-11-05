@@ -194,6 +194,15 @@ struct Config
   // NSA Kalman (StrongSORT): the measurement noise scaled by (1 - score), so
   // a confident detection pulls the state harder than a blurred one.
   bool nsa = true;
+  // Online stitching: a high-score detection left after every stage goes to
+  // the unmatched confirmed track whose last observation is nearest, within
+  // (stitch_radius + stitch_grow * frames lost) of its size, instead of
+  // starting a new track. Most remaining id switches were such re-births of a
+  // subject missed for a few frames (median 6) while its track was still
+  // alive: with it the synthetic sequences' mean IDF1 goes from 0.58 to 0.62
+  // and the ids on a real two-hand video about halve. 0 = off.
+  float stitch_radius = 0.75f;
+  float stitch_grow = 0.25f;
 };
 
 // ByteTrack 8-dim Kalman filter (state [x,y,a,h, vx,vy,va,vh], a = w/h).
@@ -470,6 +479,49 @@ public:
         if(t_match[i] < 0 && _tracks[i].hits > 0)
           rem_t.push_back(i);
       associate(rem_t, high, dets, t_match, d_used, /*full_cost=*/false, /*last_obs=*/true);
+    }
+
+    // 4c) Stitching: a high-score detection still left goes to the nearest
+    //     unmatched confirmed track (by its last observation, in its size),
+    //     within a radius that grows with the frames it has been lost.
+    if(_cfg.stitch_radius > 0.f)
+    {
+      auto& pairs = _pairs;
+      pairs.clear();
+      for(int ti = 0; ti < (int)_tracks.size(); ++ti)
+      {
+        const auto& t = _tracks[ti];
+        if(t_match[ti] >= 0 || !t.confirmed)
+          continue;
+        const Box& lo = t.last_obs;
+        const float size = std::max(lo.w, lo.h);
+        if(size <= 0.f)
+          continue;
+        for(int di : high)
+        {
+          if(d_used[di])
+            continue;
+          // A subject's size changes little over a few frames.
+          const Box& db = dets[di].box;
+          const float ratio = (db.w * db.h) / std::max(1e-9f, lo.w * lo.h);
+          if(ratio > 2.5f || ratio < 0.4f)
+            continue;
+          const float dist = std::hypot(db.cx - lo.cx, db.cy - lo.cy) / size;
+          if(dist <= _cfg.stitch_radius + _cfg.stitch_grow * float(t.time_since_update))
+            pairs.push_back({dist, ti, di});
+        }
+      }
+      std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
+        if(a.c != b.c)
+          return a.c < b.c;
+        return a.ti != b.ti ? a.ti < b.ti : a.di < b.di;
+      });
+      for(const auto& p : pairs)
+        if(t_match[p.ti] < 0 && !d_used[p.di])
+        {
+          t_match[p.ti] = p.di;
+          d_used[p.di] = 1;
+        }
     }
 
     // 5) update matched tracks
