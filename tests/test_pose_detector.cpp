@@ -478,7 +478,7 @@ TEST_CASE("Tracker keeps the id of a fast-moving subject", "[pose][track]")
     return seen.size();
   };
   Onnx::Track::Config plain;
-  plain.biou_buffer = plain.biou_grow = 0.f;
+  plain.biou_buffer = plain.biou_grow = plain.stitch_radius = 0.f;
   plain.recover_lost = false;
   CHECK(ids(plain) > 1);
   CHECK(ids(Onnx::Track::Config{}) == 1);
@@ -493,7 +493,7 @@ TEST_CASE("Tracker recovers a lost subject at its last observation", "[pose][tra
     Onnx::Track::Config cfg;
     cfg.min_hits = 1;
     cfg.recover_lost = recover;
-    cfg.biou_buffer = cfg.biou_grow = 0.f;
+    cfg.biou_buffer = cfg.biou_grow = cfg.stitch_radius = 0.f;
     Onnx::Track::PoseTracker tr;
     tr.configure(cfg);
     auto det = [](float x) {
@@ -514,6 +514,38 @@ TEST_CASE("Tracker recovers a lost subject at its last observation", "[pose][tra
   CHECK(recovered == first);
   const auto [first2, reborn] = lastId(false);
   CHECK(reborn != first2);
+}
+
+// Stitching: a subject missed for a few frames comes back too far from where
+// it was last seen for any overlap, and still gets its id back.
+TEST_CASE("Tracker stitches a subject found again after a dropout", "[pose][track]")
+{
+  auto ids = [](float stitch) {
+    Onnx::Track::Config cfg;
+    cfg.min_hits = 1;
+    cfg.stitch_radius = stitch;
+    Onnx::Track::PoseTracker tr;
+    tr.configure(cfg);
+    auto det = [](float x) {
+      return std::vector<Onnx::Track::Detection>{{{x, 0.5f, 0.1f, 0.1f}, 0.9f, {}, {}}};
+    };
+    for(int f = 0; f < 5; f++) // still
+      tr.update(det(0.3f));
+    for(int f = 0; f < 3; f++) // missed
+      tr.update({});
+    std::set<int> seen;
+    // Back, 1.6 of its size to the right: even the buffered boxes overlap
+    // below the IoU gate, within the stitching radius (0.75 + 0.25 * 4).
+    for(int f = 0; f < 3; f++)
+    {
+      tr.update(det(0.46f));
+      for(const auto& t : tr.tracks())
+        seen.insert(t.id);
+    }
+    return seen;
+  };
+  CHECK(ids(0.75f) == std::set<int>{1});
+  CHECK(ids(0.f).size() > 1);
 }
 
 // The tracker carries world / translation / params per id: smoothed on

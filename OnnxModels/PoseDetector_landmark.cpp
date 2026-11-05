@@ -1182,6 +1182,7 @@ void PoseDetector::runYOLOPose(const Onnx::ImageView& src, const Onnx::Affine& M
     const Onnx::Vec2 b = Onnx::ROI::applyAffine(M, d.box.x + d.box.w, d.box.y + d.box.h);
     dp.box = {a.x / iw, a.y / ih, (b.x - a.x) / iw, (b.y - a.y) / ih};
     dp.mean_confidence = d.confidence;
+    dp.class_id = d.class_id; // WiLoR: 0 = left hand, 1 = right
     return dp;
   };
 
