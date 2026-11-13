@@ -71,13 +71,12 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rapidlib.cmake")
 
 # onnxruntime-extensions provides the BPE tokenizer the LLM/VLM objects (QwenLLM,
 # FastVLM) need to turn text into token ids; nothing else in the addon touches it. The
-# token_api_only preset wired below points the subbuild at the prebuilt onnxruntime
-# package via ONNXRUNTIME_PKG_DIR (set from onnxruntime_SOURCE_DIR by
-# cmake/onnxruntime.cmake), so it configures and builds standalone exactly as it does
-# inside a score tree -- verified to produce the fastvlm/qwenllm objects on the
-# standalone lanes. Default it ON so those two objects build everywhere the tokenizer
-# compiles; the rest of the addon (YOLO*, Pose*, Depth*, Resnet, ENet, GAN, rapidlib
-# regressor/classifier) only needs plain onnxruntime and is unaffected by this switch.
+# token_api_only preset wired below reuses the runtime resolved by
+# cmake/onnxruntime.cmake: system include/library directories when available, or
+# ONNXRUNTIME_PKG_DIR for a downloaded prebuilt package. Default it ON so the two
+# objects build everywhere the tokenizer compiles; the rest of the addon
+# (YOLO*, Pose*, Depth*, Resnet, ENet, GAN, rapidlib regressor/classifier) only
+# needs plain onnxruntime and is unaffected by this switch.
 #
 # Windows was previously force-disabled: the upstream extensions did not compile with
 # clang + libc++ (the ossia Windows toolchain), as base/file_sys.h built a std::ifstream
@@ -89,10 +88,10 @@ option(SCORE_ONNX_ENABLE_EXTENSIONS
   "Build onnxruntime-extensions (tokenizers) and the LLM/VLM objects that need them"
   ON)
 
-# The extensions subbuild expects a prebuilt onnxruntime package laid out as a
-# shared library plus headers (ONNXRUNTIME_PKG_DIR); the wasm package is a static
-# archive only, and the LLM/VLM objects it enables are the two objects a browser
-# tab has the least business running anyway.
+# Downloaded packages supply shared libraries plus headers through
+# ONNXRUNTIME_PKG_DIR; system packages supply their discovered directories
+# directly. The wasm package is a static archive only, and the LLM/VLM objects
+# it enables are the two objects a browser tab has the least business running.
 if(EMSCRIPTEN)
   set(SCORE_ONNX_ENABLE_EXTENSIONS 0)
 endif()
@@ -111,7 +110,14 @@ if(SCORE_ONNX_ENABLE_EXTENSIONS)
   if(LINUX OR WIN32)
     set(OCOS_USE_CUDA 0)
   endif()
-  set(ONNXRUNTIME_PKG_DIR "${onnxruntime_SOURCE_DIR}")
+  if(OSSIA_USE_SYSTEM_LIBRARIES)
+    # ONNXRUNTIME_INCLUDE_DIR was already resolved by onnxruntime.cmake.
+    # Providing it skips the extensions' ext_ortlib downloader; do not assume
+    # distro packages use the prebuilt archive's include/lib directory layout.
+    get_filename_component(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_LIBRARY}" DIRECTORY)
+  else()
+    set(ONNXRUNTIME_PKG_DIR "${onnxruntime_SOURCE_DIR}")
+  endif()
   block()
     set(CMAKE_UNITY_BUILD 0)
     # Clang emits weak copies of standard-exception RTTI under -fno-rtti.
