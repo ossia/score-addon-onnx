@@ -149,7 +149,7 @@ if(COMMAND score_register_license)
   score_register_license(libsvm URL "https://www.csie.ntu.edu.tw/~cjlin/libsvm" FILES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/RapidLib/dependencies/libsvm/license.md")
   if(SCORE_ONNX_ENABLE_EXTENSIONS)
     include(FetchContent)
-    score_register_license("ONNX Runtime Extensions" URL "https://github.com/microsoft/onnxruntime-extensions"
+    score_register_license("ONNX Runtime Extensions" URL "https://github.com/ossia/onnxruntime-extensions"
       FILES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/onnxruntime-extensions/LICENSE")
     FetchContent_GetProperties(gsl SOURCE_DIR _onnx_gsl_dir)
     if(_onnx_gsl_dir)
