@@ -15,9 +15,6 @@
 #endif
 
 #include <onnxruntime_cxx_api.h>
-#if __APPLE__
-#include <coreml_provider_factory.h>
-#endif
 
 #include <boost/container/vector.hpp>
 
